@@ -84,6 +84,7 @@ REACTION_EMOJIS = ["🔥", "👑", "👀"]
 # Anti-spam tracking dictionaries
 user_message_times = defaultdict(list)
 user_last_messages = defaultdict(list)
+user_warn_counts = {}          # Tracks how many spam warnings each user has received
 
 # Configure bot intents
 intents = discord.Intents.default()
@@ -170,30 +171,102 @@ async def on_message(message: discord.Message):
                 spam_reason = f"Repeated Message Spam (repeated '{message.content[:30]}' 3 times)"
                 user_last_messages[uid].clear()
 
-        # If spam condition met, issue automatic warning card!
+        # If spam condition met, issue automatic warning card + track warning count!
         if spam_detected:
-            warning_embed = discord.Embed(
-                title="⚠️ AUTOMATIC SPAM WARNING CARD",
-                description=f"**{message.author.mention}, you have triggered Anti-Spam protection!**\n"
-                            f"Please stop spamming to maintain chat quality.",
-                color=discord.Color.red()
-            )
-            warning_embed.set_thumbnail(url=message.author.display_avatar.url)
-            warning_embed.add_field(name="Member", value=f"{message.author.name} (`{message.author.id}`)", inline=True)
-            warning_embed.add_field(name="Channel", value=message.channel.mention, inline=True)
-            warning_embed.add_field(name="Violation Detected", value=spam_reason, inline=False)
-            warning_embed.set_footer(text="Automated Anti-Spam Moderation System")
+            # Increment warning count for this user
+            user_warn_counts[uid] = user_warn_counts.get(uid, 0) + 1
+            current_warn = user_warn_counts[uid]
+            TIMEOUT_AFTER_WARNS = 3         # Timeout after 3 warnings
+            TIMEOUT_DURATION_MINS = 5       # Timeout for 5 minutes
 
+            # Try to delete the spam message first
             try:
-                # Attempt to delete the spam message if bot has Manage Messages permission
-                try:
-                    await message.delete()
-                except (discord.Forbidden, discord.NotFound):
-                    pass
+                await message.delete()
+            except (discord.Forbidden, discord.NotFound):
+                pass
 
-                await message.channel.send(content=message.author.mention, embed=warning_embed)
-            except discord.HTTPException as e:
-                print(f"Failed to send automatic spam warning card: {e}", flush=True)
+            # ---- CASE: 3rd warning → Apply Timeout + Send DM ----
+            if current_warn >= TIMEOUT_AFTER_WARNS:
+                user_warn_counts[uid] = 0   # Reset count after timeout
+
+                timeout_duration = discord.utils.utcnow() + __import__('datetime').timedelta(minutes=TIMEOUT_DURATION_MINS)
+
+                # Apply timeout (requires Moderate Members permission)
+                timeout_applied = False
+                try:
+                    await message.author.timeout(timeout_duration, reason=f"Anti-Spam: {spam_reason}")
+                    timeout_applied = True
+                except (discord.Forbidden, discord.HTTPException) as e:
+                    print(f"Could not apply timeout: {e}", flush=True)
+
+                # Send timeout warning embed in channel
+                timeout_embed = discord.Embed(
+                    title="🚫 TIMEOUT ISSUED — 3 Spam Warnings Reached",
+                    description=f"{message.author.mention} has been **timed out for {TIMEOUT_DURATION_MINS} minutes** after receiving 3 spam warnings.",
+                    color=discord.Color.dark_red()
+                )
+                timeout_embed.set_thumbnail(url=message.author.display_avatar.url)
+                timeout_embed.add_field(name="Member", value=f"{message.author.name} (`{message.author.id}`)", inline=True)
+                timeout_embed.add_field(name="Timeout Duration", value=f"{TIMEOUT_DURATION_MINS} minutes", inline=True)
+                timeout_embed.add_field(name="Final Violation", value=spam_reason, inline=False)
+                timeout_embed.add_field(name="Status", value="✅ Timeout Applied" if timeout_applied else "❌ Could not apply timeout (check bot permissions)", inline=False)
+                timeout_embed.set_footer(text="Automated Anti-Spam Moderation — Warning limit reached")
+
+                try:
+                    await message.channel.send(content=message.author.mention, embed=timeout_embed)
+                except discord.HTTPException as e:
+                    print(f"Failed to send timeout embed: {e}", flush=True)
+
+                # Send DM to the timed-out member
+                try:
+                    dm_embed = discord.Embed(
+                        title="🚫 You have been Timed Out",
+                        description=(
+                            f"You have been **timed out for {TIMEOUT_DURATION_MINS} minutes** "
+                            f"in **{message.guild.name}** for repeated spamming."
+                        ),
+                        color=discord.Color.dark_red()
+                    )
+                    dm_embed.add_field(name="Server", value=message.guild.name, inline=True)
+                    dm_embed.add_field(name="Duration", value=f"{TIMEOUT_DURATION_MINS} minutes", inline=True)
+                    dm_embed.add_field(name="Reason", value=f"You received 3 spam warnings.\nFinal violation: {spam_reason}", inline=False)
+                    dm_embed.add_field(
+                        name="What happens now?",
+                        value=(
+                            f"You cannot send messages or join voice channels for {TIMEOUT_DURATION_MINS} minutes.\n"
+                            f"After the timeout expires, please follow the server rules to avoid permanent action."
+                        ),
+                        inline=False
+                    )
+                    dm_embed.set_footer(text="This is an automated message from the server moderation bot.")
+                    await message.author.send(embed=dm_embed)
+                except discord.Forbidden:
+                    # User has DMs disabled — silently skip
+                    pass
+                except discord.HTTPException as e:
+                    print(f"Failed to send timeout DM: {e}", flush=True)
+
+            # ---- CASE: Warning 1 or 2 → Show standard warning card ----
+            else:
+                warns_remaining = TIMEOUT_AFTER_WARNS - current_warn
+                warning_embed = discord.Embed(
+                    title=f"⚠️ SPAM WARNING ({current_warn}/{TIMEOUT_AFTER_WARNS})",
+                    description=f"**{message.author.mention}, you have triggered Anti-Spam protection!**\n"
+                                f"Please stop spamming to maintain chat quality.\n\n"
+                                f"⚠️ **{warns_remaining} more warning(s) before you are timed out for {TIMEOUT_DURATION_MINS} minutes!**",
+                    color=discord.Color.orange() if current_warn == 1 else discord.Color.red()
+                )
+                warning_embed.set_thumbnail(url=message.author.display_avatar.url)
+                warning_embed.add_field(name="Member", value=f"{message.author.name} (`{message.author.id}`)", inline=True)
+                warning_embed.add_field(name="Channel", value=message.channel.mention, inline=True)
+                warning_embed.add_field(name="Warnings", value=f"{current_warn}/{TIMEOUT_AFTER_WARNS}", inline=True)
+                warning_embed.add_field(name="Violation Detected", value=spam_reason, inline=False)
+                warning_embed.set_footer(text="Automated Anti-Spam Moderation System")
+
+                try:
+                    await message.channel.send(content=message.author.mention, embed=warning_embed)
+                except discord.HTTPException as e:
+                    print(f"Failed to send spam warning card: {e}", flush=True)
 
     # Check if any mentioned user is in our target_ids for auto-reactions
     target_ids = get_target_user_ids()
@@ -208,6 +281,7 @@ async def on_message(message: discord.Message):
                 print(f"Failed to add reaction: {e}", flush=True)
 
     await bot.process_commands(message)
+
 
 # ==============================================================================
 # 2. ADMIN ACCESS MANAGEMENT COMMANDS (/admin add, /admin remove, /admin list)
