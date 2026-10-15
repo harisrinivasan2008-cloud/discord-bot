@@ -8,14 +8,14 @@ from discord import app_commands
 from dotenv import load_dotenv
 from aiohttp import web
 
-# Force unbuffered stdout/stderr so logs appear immediately in Render
+# Force unbuffered stdout/stderr so logs appear immediately
 try:
     sys.stdout.reconfigure(line_buffering=True)
     sys.stderr.reconfigure(line_buffering=True)
 except Exception:
     pass
 
-# Load credentials from .env file (if running locally) or system environment (if running on Render)
+# Load credentials from .env file
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 
@@ -34,14 +34,15 @@ REACTION_EMOJIS = ["🔥", "👑", "👀"]
 # Configure bot intents
 intents = discord.Intents.default()
 intents.message_content = True  # Required to read mentions in messages
-intents.members = True          # Required for roles inspection and nickname management
+intents.members = True          # Required for roles inspection, join dates, and member management
+intents.voice_states = True     # Required for voice channel management (mute, deafen, move)
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Web server for Render.com health check
+# Optional Web server for cloud health checks
 async def start_web_server():
     async def handle_ping(request):
-        return web.Response(text="Discord Bot is active and running 24/7!")
+        return web.Response(text="Discord Bot is active and running!")
 
     app = web.Application()
     app.router.add_get("/", handle_ping)
@@ -62,7 +63,7 @@ async def on_ready():
     if target_ids:
         print(f"Tracking {len(target_ids)} target user(s) for auto-reaction: {list(target_ids)}", flush=True)
     else:
-        print("[Notice] No TARGET_USER_IDS configured yet in environment", flush=True)
+        print("[Notice] No TARGET_USER_IDS configured yet in .env", flush=True)
     print("=" * 45, flush=True)
 
     # Sync slash commands globally across Discord
@@ -109,7 +110,6 @@ async def changenick(
     member: discord.Member,
     new_nickname: str = None
 ):
-    # Check if target is server owner (Discord prevents bots from altering owner's nickname)
     if interaction.guild.owner_id == member.id:
         await interaction.response.send_message(
             "❌ Discord does not permit bots to change the server owner's nickname.",
@@ -117,7 +117,6 @@ async def changenick(
         )
         return
 
-    # Check Discord Role Hierarchy
     bot_member = interaction.guild.get_member(bot.user.id)
     if member.top_role >= bot_member.top_role:
         await interaction.response.send_message(
@@ -147,28 +146,35 @@ async def changenick(
         )
 
 # ==============================================================================
-# 3. DISPLAY ROLES OF A SPECIFIC PERSON
+# 3. DISPLAY ROLES & DATES OF A SPECIFIC PERSON
 # ==============================================================================
-@bot.tree.command(name="roles", description="Show all roles and details for a specific member")
+@bot.tree.command(name="roles", description="Show all roles and join dates for a member")
 @app_commands.describe(member="The member whose roles you want to view")
 async def show_roles(interaction: discord.Interaction, member: discord.Member):
-    # Get all roles excluding @everyone, ordered from highest to lowest hierarchy
     member_roles = [role for role in member.roles if role.name != "@everyone"]
     member_roles.reverse()
 
     role_mentions = [role.mention for role in member_roles]
     role_count = len(member_roles)
 
-    embed_color = member.color if member.color.value != 0 else discord.Color.blue()
+    created_ts = int(member.created_at.timestamp())
+    joined_ts = int(member.joined_at.timestamp()) if member.joined_at else None
 
+    embed_color = member.color if member.color.value != 0 else discord.Color.blue()
     embed = discord.Embed(
-        title=f"👤 Roles & Info for {member.display_name}",
+        title=f"👤 Member Info & Roles: {member.display_name}",
         color=embed_color
     )
     embed.set_thumbnail(url=member.display_avatar.url)
     embed.add_field(name="Username", value=f"{member.name} (`{member.id}`)", inline=True)
     embed.add_field(name="Highest Role", value=member.top_role.mention, inline=True)
     embed.add_field(name="Total Roles", value=str(role_count), inline=True)
+    embed.add_field(name="Joined Discord", value=f"<t:{created_ts}:D> (<t:{created_ts}:R>)", inline=True)
+    
+    if joined_ts:
+        embed.add_field(name="Joined Server", value=f"<t:{joined_ts}:D> (<t:{joined_ts}:R>)", inline=True)
+    else:
+        embed.add_field(name="Joined Server", value="*Unknown*", inline=True)
 
     if role_mentions:
         roles_text = " ".join(role_mentions)
@@ -179,26 +185,135 @@ async def show_roles(interaction: discord.Interaction, member: discord.Member):
         embed.add_field(name="Assigned Roles", value="*No roles assigned*", inline=False)
 
     embed.set_footer(text=f"Requested by {interaction.user.display_name}")
+    await interaction.response.send_message(embed=embed)
+
+# ==============================================================================
+# 4. AVATAR COMMAND
+# ==============================================================================
+@bot.tree.command(name="avatar", description="Display a member's avatar in full size")
+@app_commands.describe(member="The member whose avatar you want to view (defaults to yourself)")
+async def avatar(interaction: discord.Interaction, member: discord.Member = None):
+    target = member or interaction.user
+    avatar_url = target.display_avatar.url
+
+    embed = discord.Embed(
+        title=f"🖼️ Avatar of {target.display_name}",
+        color=target.color if target.color.value != 0 else discord.Color.blue()
+    )
+    embed.set_image(url=avatar_url)
+    embed.add_field(name="Direct Link", value=f"[Open in Browser]({avatar_url})", inline=False)
+    embed.set_footer(text=f"Requested by {interaction.user.display_name}")
 
     await interaction.response.send_message(embed=embed)
 
+# ==============================================================================
+# 5. VOICE CHAT CONTROLS: MUTE / UNMUTE
+# ==============================================================================
+@bot.tree.command(name="vmute", description="Server mute or unmute a member in voice chat")
+@app_commands.describe(
+    member="The member currently in a voice channel",
+    mute="True to mute, False to unmute (default: True)"
+)
+@app_commands.checks.has_permissions(mute_members=True)
+async def vmute(interaction: discord.Interaction, member: discord.Member, mute: bool = True):
+    if not member.voice or not member.voice.channel:
+        await interaction.response.send_message(f"❌ {member.mention} is not in any voice channel.", ephemeral=True)
+        return
+
+    try:
+        await member.edit(mute=mute)
+        status = "server-muted 🔇" if mute else "server-unmuted 🔊"
+        await interaction.response.send_message(f"✅ Successfully **{status}** {member.mention}.")
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "❌ Missing Permissions: Ensure the bot has 'Mute Members' permission and its role is higher than the target.",
+            ephemeral=True
+        )
+    except discord.HTTPException as e:
+        await interaction.response.send_message(f"❌ Failed to update voice mute: {e}", ephemeral=True)
+
+# ==============================================================================
+# 6. VOICE CHAT CONTROLS: DEAFEN / UNDEAFEN
+# ==============================================================================
+@bot.tree.command(name="vdeafen", description="Server deafen or undeafen a member in voice chat")
+@app_commands.describe(
+    member="The member currently in a voice channel",
+    deafen="True to deafen, False to undeafen (default: True)"
+)
+@app_commands.checks.has_permissions(deafen_members=True)
+async def vdeafen(interaction: discord.Interaction, member: discord.Member, deafen: bool = True):
+    if not member.voice or not member.voice.channel:
+        await interaction.response.send_message(f"❌ {member.mention} is not in any voice channel.", ephemeral=True)
+        return
+
+    try:
+        await member.edit(deafen=deafen)
+        status = "server-deafened 🛑" if deafen else "server-undeafened 🎧"
+        await interaction.response.send_message(f"✅ Successfully **{status}** {member.mention}.")
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "❌ Missing Permissions: Ensure the bot has 'Deafen Members' permission and its role is higher than the target.",
+            ephemeral=True
+        )
+    except discord.HTTPException as e:
+        await interaction.response.send_message(f"❌ Failed to update voice deafen: {e}", ephemeral=True)
+
+# ==============================================================================
+# 7. VOICE CHAT CONTROLS: MOVE MEMBER TO ANOTHER VC
+# ==============================================================================
+@bot.tree.command(name="movevc", description="Move a member from one voice channel to another")
+@app_commands.describe(
+    member="The member to move",
+    channel="The destination voice channel"
+)
+@app_commands.checks.has_permissions(move_members=True)
+async def movevc(interaction: discord.Interaction, member: discord.Member, channel: discord.VoiceChannel):
+    if not member.voice or not member.voice.channel:
+        await interaction.response.send_message(f"❌ {member.mention} is not currently connected to any voice channel.", ephemeral=True)
+        return
+
+    old_channel = member.voice.channel
+    if old_channel.id == channel.id:
+        await interaction.response.send_message(f"⚠️ {member.mention} is already in {channel.mention}.", ephemeral=True)
+        return
+
+    try:
+        await member.move_to(channel)
+        await interaction.response.send_message(
+            f"🚚 Successfully moved {member.mention} from **{old_channel.name}** ➔ {channel.mention}."
+        )
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "❌ Missing Permissions: Ensure the bot has 'Move Members' permission and its role is higher than the target.",
+            ephemeral=True
+        )
+    except discord.HTTPException as e:
+        await interaction.response.send_message(f"❌ Failed to move member: {e}", ephemeral=True)
+
+# ==============================================================================
+# GENERAL PERMISSION ERROR HANDLERS
+# ==============================================================================
 @changenick.error
-async def changenick_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+@vmute.error
+@vdeafen.error
+@movevc.error
+async def on_command_permission_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.MissingPermissions):
         await interaction.response.send_message(
-            "❌ You need the **Manage Nicknames** permission to use this command.",
+            "❌ You do not have permission to execute this command.",
             ephemeral=True
         )
     else:
         await interaction.response.send_message(
-            f"❌ Error executing command: {error}",
+            f"❌ An error occurred: {error}",
             ephemeral=True
         )
 
 async def main():
-    # 1. Start the web server first so Render detects port 10000 immediately
-    await start_web_server()
-    # 2. Connect to Discord Gateway
+    try:
+        await start_web_server()
+    except Exception:
+        pass
     async with bot:
         await bot.start(TOKEN)
 
@@ -206,8 +321,7 @@ if __name__ == "__main__":
     print("=== Discord Bot Process Starting ===", flush=True)
 
     if not TOKEN:
-        print("CRITICAL ERROR: DISCORD_TOKEN is missing or empty!", flush=True)
-        print("Please go to Render Dashboard -> Your Service -> Environment -> Add DISCORD_TOKEN", flush=True)
+        print("CRITICAL ERROR: DISCORD_TOKEN is missing or empty in .env!", flush=True)
         sys.exit(1)
 
     print(f"DISCORD_TOKEN loaded successfully ({len(TOKEN)} characters).", flush=True)
@@ -217,18 +331,12 @@ if __name__ == "__main__":
     except discord.errors.PrivilegedIntentsRequired:
         print("\n" + "!" * 60, flush=True)
         print("CRITICAL ERROR: Privileged Gateway Intents are NOT enabled!", flush=True)
-        print("Fix this in 30 seconds:", flush=True)
-        print("1. Go to https://discord.com/developers/applications", flush=True)
-        print("2. Click your bot -> Click 'Bot' tab on the left", flush=True)
-        print("3. Scroll to 'Privileged Gateway Intents'", flush=True)
-        print("4. Turn ON 'Server Members Intent' and 'Message Content Intent'", flush=True)
-        print("5. Click Save Changes", flush=True)
+        print("Enable 'Server Members Intent' and 'Message Content Intent' in Discord Dev Portal.", flush=True)
         print("!" * 60 + "\n", flush=True)
         sys.exit(1)
     except discord.errors.LoginFailure:
         print("\n" + "!" * 60, flush=True)
         print("CRITICAL ERROR: Invalid Discord Bot Token!", flush=True)
-        print("Please check your DISCORD_TOKEN in Render Environment variables.", flush=True)
         print("!" * 60 + "\n", flush=True)
         sys.exit(1)
     except Exception as e:
