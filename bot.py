@@ -1119,18 +1119,29 @@ async def leave_voice(interaction: discord.Interaction):
     await vc.disconnect()
     await interaction.response.send_message("👋 Disconnected from voice channel.")
 
-@bot.tree.command(name="play", description="Play a recorded audio file in your voice channel")
+@bot.tree.command(name="play", description="Play recorded audio with custom volume (up to 1000), gain (+24dB), and bass boost (+24dB)")
 @app_commands.describe(
     audio_file="Upload an audio file (.mp3, .wav, .m4a, .ogg) to play",
-    recording_name="Name of a saved audio file in the audio/ folder (e.g. sample.wav)"
+    recording_name="Name of a saved audio file in the audio/ folder (e.g. sample.wav)",
+    volume="Volume level from 1 to 1000 (default: 100, 1000 is 10x max amplification)",
+    gain="Audio gain in dB from 0 to 24 (default: 0 dB, max: 24 dB)",
+    bass="Bass boost in dB from 0 to 24 (default: 0 dB, max: 24 dB)"
 )
 @check_bot_admin()
 async def play_audio(
     interaction: discord.Interaction,
     audio_file: discord.Attachment = None,
-    recording_name: str = None
+    recording_name: str = None,
+    volume: int = 100,
+    gain: int = 0,
+    bass: int = 0
 ):
     await interaction.response.defer()
+
+    # Clamp parameters to safe boundaries
+    volume = max(1, min(volume, 1000))
+    gain = max(0, min(gain, 24))
+    bass = max(0, min(bass, 24))
 
     # 1. Connect to voice channel if not already connected
     vc = interaction.guild.voice_client
@@ -1188,12 +1199,45 @@ async def play_audio(
     if vc.is_playing():
         vc.stop()
 
-    # 4. Play audio via FFmpeg
+    # 4. Construct FFmpeg Audio Filters (Volume, Gain, Bass Boost)
+    filters = []
+    if volume != 100:
+        vol_multiplier = volume / 100.0
+        filters.append(f"volume={vol_multiplier:.2f}")
+
+    if bass > 0:
+        filters.append(f"bass=g={bass}:f=100")
+
+    if gain > 0:
+        filters.append(f"volume={gain}dB")
+
+    ffmpeg_opts = f'-filter:a "{",".join(filters)}"' if filters else None
+
+    # 5. Play audio via FFmpeg
     try:
         ffmpeg_bin = get_ffmpeg_path()
-        audio_source = discord.FFmpegPCMAudio(audio_path, executable=ffmpeg_bin)
+        if ffmpeg_opts:
+            audio_source = discord.FFmpegPCMAudio(audio_path, executable=ffmpeg_bin, options=ffmpeg_opts)
+        else:
+            audio_source = discord.FFmpegPCMAudio(audio_path, executable=ffmpeg_bin)
+
         vc.play(audio_source)
-        await interaction.followup.send(f"🎶 Now playing **`{display_title}`** in {vc.channel.mention}!")
+
+        settings_info = [f"🔊 Volume: **{volume}%**"]
+        if gain > 0:
+            settings_info.append(f"⚡ Gain: **+{gain}dB**")
+        if bass > 0:
+            settings_info.append(f"🎛️ Bass: **+{bass}dB**")
+
+        embed = discord.Embed(
+            title="🎶 Now Playing",
+            description=f"Playing **`{display_title}`** in {vc.channel.mention}",
+            color=discord.Color.green()
+        )
+        embed.add_field(name="Audio Settings", value=" • ".join(settings_info), inline=False)
+        embed.set_footer(text=f"Requested by {interaction.user.display_name}")
+
+        await interaction.followup.send(embed=embed)
     except Exception as e:
         await interaction.followup.send(f"❌ Failed to play audio: {e}")
 
