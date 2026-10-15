@@ -531,7 +531,70 @@ async def warn_member(interaction: discord.Interaction, member: discord.Member, 
     await interaction.response.send_message(content=member.mention, embed=embed)
 
 # ==============================================================================
-# MATCHMAKER — Split up to 8-12 members into two random balanced teams
+# CLEAR — Delete 4 to 40 recent messages from a channel
+# ==============================================================================
+@bot.tree.command(name="clear", description="Delete recent messages from this channel (4–40 messages)")
+@app_commands.describe(
+    amount="Number of messages to delete (minimum 4, maximum 40)",
+    target="Optional: only delete messages from this specific member"
+)
+@app_commands.checks.has_permissions(manage_messages=True)
+@check_bot_admin()
+async def clear_messages(
+    interaction: discord.Interaction,
+    amount: int,
+    target: discord.Member = None
+):
+    if amount < 4:
+        await interaction.response.send_message(
+            "❌ Minimum amount is **4** messages.", ephemeral=True
+        )
+        return
+    if amount > 40:
+        await interaction.response.send_message(
+            "❌ Maximum amount is **40** messages.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    def check_target(msg):
+        # If a target member is specified, only delete their messages
+        if target:
+            return msg.author.id == target.id
+        return True
+
+    try:
+        deleted = await interaction.channel.purge(limit=amount, check=check_target)
+        actual = len(deleted)
+
+        if actual == 0:
+            await interaction.followup.send(
+                f"⚠️ No messages found{f' from {target.mention}' if target else ''} to delete.",
+                ephemeral=True
+            )
+            return
+
+        # Send a brief confirmation that auto-deletes after 5 seconds
+        confirm = await interaction.followup.send(
+            f"✅ Successfully deleted **{actual}** message(s)"
+            f"{f' from {target.mention}' if target else ''} in {interaction.channel.mention}.",
+            ephemeral=False
+        )
+        await asyncio.sleep(5)
+        try:
+            await confirm.delete()
+        except (discord.NotFound, discord.Forbidden):
+            pass
+
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "❌ Missing Permissions: Ensure the bot has **Manage Messages** permission in this channel.",
+            ephemeral=True
+        )
+    except discord.HTTPException as e:
+        await interaction.followup.send(f"❌ Failed to delete messages: {e}", ephemeral=True)
+
 # ==============================================================================
 @bot.tree.command(name="matchmaker", description="Randomly split 8–12 members into two balanced teams")
 @app_commands.describe(
