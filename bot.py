@@ -11,10 +11,16 @@ from discord import app_commands
 from dotenv import load_dotenv
 from aiohttp import web
 
-# Force unbuffered stdout/stderr so logs appear immediately
+# Force unbuffered stdout/stderr so logs appear immediately (and handle pythonw where stdout is None)
 try:
-    sys.stdout.reconfigure(line_buffering=True)
-    sys.stderr.reconfigure(line_buffering=True)
+    if sys.stdout is None:
+        sys.stdout = open(os.path.join(os.path.dirname(__file__), "bot.log"), "a", encoding="utf-8", buffering=1)
+    else:
+        sys.stdout.reconfigure(line_buffering=True)
+    if sys.stderr is None:
+        sys.stderr = open(os.path.join(os.path.dirname(__file__), "bot_error.log"), "a", encoding="utf-8", buffering=1)
+    else:
+        sys.stderr.reconfigure(line_buffering=True)
 except Exception:
     pass
 
