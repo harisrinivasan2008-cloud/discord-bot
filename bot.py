@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import asyncio
 import traceback
 import discord
@@ -18,6 +19,48 @@ except Exception:
 # Load credentials from .env file
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
+
+# ==============================================================================
+# BOT ADMIN MANAGEMENT & PERSISTENCE
+# ==============================================================================
+ADMINS_FILE = os.path.join(os.path.dirname(__file__), "admins.json")
+
+def load_admin_ids() -> set:
+    if os.path.exists(ADMINS_FILE):
+        try:
+            with open(ADMINS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return set(data.get("admin_ids", []))
+        except Exception as e:
+            print(f"Error loading admins.json: {e}", flush=True)
+    return set()
+
+def save_admin_ids(admin_ids: set):
+    try:
+        with open(ADMINS_FILE, "w", encoding="utf-8") as f:
+            json.dump({"admin_ids": sorted(list(admin_ids))}, f, indent=2)
+    except Exception as e:
+        print(f"Error saving admins.json: {e}", flush=True)
+
+def is_authorized_admin(interaction: discord.Interaction) -> bool:
+    # 1. Server Owner is ALWAYS permanently authorized
+    if interaction.guild and interaction.guild.owner_id == interaction.user.id:
+        return True
+    # 2. Check if user is in authorized admins list
+    admin_ids = load_admin_ids()
+    return interaction.user.id in admin_ids
+
+def check_bot_admin():
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if is_authorized_admin(interaction):
+            return True
+        await interaction.response.send_message(
+            "🔒 **Access Denied**: You are not an authorized bot administrator.\n"
+            "Only the server owner and designated bot admins can access these commands.",
+            ephemeral=True
+        )
+        return False
+    return app_commands.check(predicate)
 
 # Helper function to get list of target user IDs (supports comma or space separated)
 def get_target_user_ids():
@@ -64,6 +107,8 @@ async def on_ready():
         print(f"Tracking {len(target_ids)} target user(s) for auto-reaction: {list(target_ids)}", flush=True)
     else:
         print("[Notice] No TARGET_USER_IDS configured yet in .env", flush=True)
+    admin_ids = load_admin_ids()
+    print(f"Loaded {len(admin_ids)} custom bot admin(s) from admins.json", flush=True)
     print("=" * 45, flush=True)
 
     # Sync slash commands globally across Discord
@@ -97,14 +142,99 @@ async def on_message(message: discord.Message):
     await bot.process_commands(message)
 
 # ==============================================================================
-# 2. CHANGE NICKNAME IN THE SERVER
+# 2. ADMIN ACCESS MANAGEMENT COMMANDS (/admin add, /admin remove, /admin list)
+# ==============================================================================
+admin_group = app_commands.Group(name="admin", description="Manage authorized bot administrators")
+
+@admin_group.command(name="add", description="Grant a user full access to use this bot")
+@app_commands.describe(member="The member to authorize as a bot administrator")
+@check_bot_admin()
+async def admin_add(interaction: discord.Interaction, member: discord.Member):
+    admin_ids = load_admin_ids()
+    if member.id in admin_ids or member.id == interaction.guild.owner_id:
+        await interaction.response.send_message(
+            f"⚠️ {member.mention} already has bot administrator access.",
+            ephemeral=True
+        )
+        return
+
+    admin_ids.add(member.id)
+    save_admin_ids(admin_ids)
+    await interaction.response.send_message(
+        f"✅ Successfully granted bot admin access to {member.mention}."
+    )
+
+@admin_group.command(name="remove", description="Revoke a user's access to this bot")
+@app_commands.describe(member="The member to remove from bot administrators")
+@check_bot_admin()
+async def admin_remove(interaction: discord.Interaction, member: discord.Member):
+    if member.id == interaction.guild.owner_id:
+        await interaction.response.send_message(
+            "❌ Cannot revoke access from the Server Owner (permanent administrator).",
+            ephemeral=True
+        )
+        return
+
+    admin_ids = load_admin_ids()
+    if member.id not in admin_ids:
+        await interaction.response.send_message(
+            f"⚠️ {member.mention} is not in the bot administrators list.",
+            ephemeral=True
+        )
+        return
+
+    admin_ids.remove(member.id)
+    save_admin_ids(admin_ids)
+    await interaction.response.send_message(
+        f"✅ Successfully revoked bot admin access from {member.mention}."
+    )
+
+@admin_group.command(name="list", description="Show all users authorized to access this bot")
+@check_bot_admin()
+async def admin_list(interaction: discord.Interaction):
+    admin_ids = load_admin_ids()
+    owner = interaction.guild.owner
+    owner_str = f"👑 {owner.mention} *(Server Owner - Permanent)*" if owner else "Unknown"
+
+    admin_list_text = []
+    for uid in admin_ids:
+        if interaction.guild and uid == interaction.guild.owner_id:
+            continue
+        admin_list_text.append(f"🛡️ <@{uid}> (`{uid}`)")
+
+    embed = discord.Embed(
+        title="🔐 Authorized Bot Administrators",
+        description="Only users on this list are permitted to execute bot commands.",
+        color=discord.Color.gold()
+    )
+    embed.add_field(name="Server Owner", value=owner_str, inline=False)
+    if admin_list_text:
+        embed.add_field(
+            name=f"Configured Admins ({len(admin_list_text)})",
+            value="\n".join(admin_list_text),
+            inline=False
+        )
+    else:
+        embed.add_field(
+            name="Configured Admins",
+            value="*No additional admins added yet. Use `/admin add` to authorize members.*",
+            inline=False
+        )
+    embed.set_footer(text=f"Total: {len(admin_list_text) + 1} Authorized User(s)")
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+bot.tree.add_command(admin_group)
+
+# ==============================================================================
+# 3. CHANGE NICKNAME IN THE SERVER
 # ==============================================================================
 @bot.tree.command(name="changenick", description="Change a member's nickname in this server")
 @app_commands.describe(
     member="The member whose nickname should be changed",
     new_nickname="The new nickname to apply (leave empty to reset to original name)"
 )
-@app_commands.checks.has_permissions(manage_nicknames=True)
+@check_bot_admin()
 async def changenick(
     interaction: discord.Interaction,
     member: discord.Member,
@@ -146,10 +276,11 @@ async def changenick(
         )
 
 # ==============================================================================
-# 3. DISPLAY ROLES & DATES OF A SPECIFIC PERSON
+# 4. DISPLAY ROLES & DATES OF A SPECIFIC PERSON
 # ==============================================================================
 @bot.tree.command(name="roles", description="Show all roles and join dates for a member")
 @app_commands.describe(member="The member whose roles you want to view")
+@check_bot_admin()
 async def show_roles(interaction: discord.Interaction, member: discord.Member):
     member_roles = [role for role in member.roles if role.name != "@everyone"]
     member_roles.reverse()
@@ -188,10 +319,11 @@ async def show_roles(interaction: discord.Interaction, member: discord.Member):
     await interaction.response.send_message(embed=embed)
 
 # ==============================================================================
-# 4. AVATAR COMMAND
+# 5. AVATAR COMMAND
 # ==============================================================================
 @bot.tree.command(name="avatar", description="Display a member's avatar in full size")
 @app_commands.describe(member="The member whose avatar you want to view (defaults to yourself)")
+@check_bot_admin()
 async def avatar(interaction: discord.Interaction, member: discord.Member = None):
     target = member or interaction.user
     avatar_url = target.display_avatar.url
@@ -207,14 +339,14 @@ async def avatar(interaction: discord.Interaction, member: discord.Member = None
     await interaction.response.send_message(embed=embed)
 
 # ==============================================================================
-# 5. VOICE CHAT CONTROLS: MUTE / UNMUTE
+# 6. VOICE CHAT CONTROLS: MUTE / UNMUTE (INDIVIDUAL)
 # ==============================================================================
 @bot.tree.command(name="vmute", description="Server mute or unmute a member in voice chat")
 @app_commands.describe(
     member="The member currently in a voice channel",
     mute="True to mute, False to unmute (default: True)"
 )
-@app_commands.checks.has_permissions(mute_members=True)
+@check_bot_admin()
 async def vmute(interaction: discord.Interaction, member: discord.Member, mute: bool = True):
     if not member.voice or not member.voice.channel:
         await interaction.response.send_message(f"❌ {member.mention} is not in any voice channel.", ephemeral=True)
@@ -233,14 +365,14 @@ async def vmute(interaction: discord.Interaction, member: discord.Member, mute: 
         await interaction.response.send_message(f"❌ Failed to update voice mute: {e}", ephemeral=True)
 
 # ==============================================================================
-# 6. VOICE CHAT CONTROLS: DEAFEN / UNDEAFEN
+# 7. VOICE CHAT CONTROLS: DEAFEN / UNDEAFEN (INDIVIDUAL)
 # ==============================================================================
 @bot.tree.command(name="vdeafen", description="Server deafen or undeafen a member in voice chat")
 @app_commands.describe(
     member="The member currently in a voice channel",
     deafen="True to deafen, False to undeafen (default: True)"
 )
-@app_commands.checks.has_permissions(deafen_members=True)
+@check_bot_admin()
 async def vdeafen(interaction: discord.Interaction, member: discord.Member, deafen: bool = True):
     if not member.voice or not member.voice.channel:
         await interaction.response.send_message(f"❌ {member.mention} is not in any voice channel.", ephemeral=True)
@@ -259,14 +391,14 @@ async def vdeafen(interaction: discord.Interaction, member: discord.Member, deaf
         await interaction.response.send_message(f"❌ Failed to update voice deafen: {e}", ephemeral=True)
 
 # ==============================================================================
-# 7. VOICE CHAT CONTROLS: MOVE MEMBER TO ANOTHER VC
+# 8. VOICE CHAT CONTROLS: MOVE MEMBER TO ANOTHER VC (INDIVIDUAL)
 # ==============================================================================
 @bot.tree.command(name="movevc", description="Move a member from one voice channel to another")
 @app_commands.describe(
     member="The member to move",
     channel="The destination voice channel"
 )
-@app_commands.checks.has_permissions(move_members=True)
+@check_bot_admin()
 async def movevc(interaction: discord.Interaction, member: discord.Member, channel: discord.VoiceChannel):
     if not member.voice or not member.voice.channel:
         await interaction.response.send_message(f"❌ {member.mention} is not currently connected to any voice channel.", ephemeral=True)
@@ -291,14 +423,14 @@ async def movevc(interaction: discord.Interaction, member: discord.Member, chann
         await interaction.response.send_message(f"❌ Failed to move member: {e}", ephemeral=True)
 
 # ==============================================================================
-# 8. MASS VOICE CHAT CONTROLS: MOVE ALL, MUTE ALL, DEAFEN ALL
+# 9. MASS VOICE CHAT CONTROLS: MOVE ALL, MUTE ALL, DEAFEN ALL
 # ==============================================================================
 @bot.tree.command(name="moveall", description="Move ALL members from one voice channel to another")
 @app_commands.describe(
     target_channel="The destination voice channel to move everyone into",
     source_channel="Source voice channel (optional: defaults to your current voice channel)"
 )
-@app_commands.checks.has_permissions(move_members=True)
+@check_bot_admin()
 async def moveall(
     interaction: discord.Interaction,
     target_channel: discord.VoiceChannel,
@@ -328,7 +460,6 @@ async def moveall(
     bot_member = interaction.guild.get_member(bot.user.id)
 
     for member in members:
-        # Skip server owner or users with roles equal to/higher than the bot
         if interaction.guild.owner_id == member.id or (bot_member and member.top_role >= bot_member.top_role):
             skipped_count += 1
             continue
@@ -350,7 +481,7 @@ async def moveall(
     mute="True to mute all, False to unmute all (default: True)",
     channel="Voice channel (optional: defaults to your current voice channel)"
 )
-@app_commands.checks.has_permissions(mute_members=True)
+@check_bot_admin()
 async def muteall(
     interaction: discord.Interaction,
     mute: bool = True,
@@ -398,7 +529,7 @@ async def muteall(
     deafen="True to deafen all, False to undeafen all (default: True)",
     channel="Voice channel (optional: defaults to your current voice channel)"
 )
-@app_commands.checks.has_permissions(deafen_members=True)
+@check_bot_admin()
 async def deafenall(
     interaction: discord.Interaction,
     deafen: bool = True,
@@ -440,28 +571,6 @@ async def deafenall(
     if skipped_count > 0:
         msg += f"\n*(Skipped {skipped_count} member(s) due to higher role hierarchy)*"
     await interaction.followup.send(msg)
-
-# ==============================================================================
-# GENERAL PERMISSION ERROR HANDLERS
-# ==============================================================================
-@changenick.error
-@vmute.error
-@vdeafen.error
-@movevc.error
-@moveall.error
-@muteall.error
-@deafenall.error
-async def on_command_permission_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message(
-            "❌ You do not have permission to execute this command.",
-            ephemeral=True
-        )
-    else:
-        await interaction.response.send_message(
-            f"❌ An error occurred: {error}",
-            ephemeral=True
-        )
 
 async def main():
     try:
