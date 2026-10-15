@@ -81,8 +81,9 @@ def get_target_user_ids():
 # Configure the emojis to react with when any target user is mentioned
 REACTION_EMOJIS = ["🔥", "👑", "👀"]
 
-# Anti-spam tracking dictionary: maps user_id -> list of message timestamps
+# Anti-spam tracking dictionaries
 user_message_times = defaultdict(list)
+user_last_messages = defaultdict(list)
 
 # Configure bot intents
 intents = discord.Intents.default()
@@ -133,40 +134,68 @@ async def on_ready():
 # ==============================================================================
 @bot.event
 async def on_message(message: discord.Message):
-    # Ignore messages sent by bots (including our own bot)
+    # Ignore messages sent by bots
     if message.author.bot:
         return
 
-    # Anti-Spam Detection (Exempts Server Owner and Bot Admins)
-    if message.guild and not is_user_admin(message.author.id, message.guild):
+    # ================= AUTOMATED ANTI-SPAM SYSTEM =================
+    if message.guild:
         now = time.time()
         uid = message.author.id
-        # Keep timestamps from the last 4 seconds
+        spam_detected = False
+        spam_reason = ""
+
+        # 1. Check Mass Mentions (Tagging 4 or more users in 1 message)
+        if len(message.mentions) >= 4:
+            spam_detected = True
+            spam_reason = f"Mass Mentions ({len(message.mentions)} users tagged in a single message)"
+
+        # 2. Check Rapid Message Flooding (4 or more messages within 4 seconds)
         user_message_times[uid] = [t for t in user_message_times[uid] if now - t < 4.0]
         user_message_times[uid].append(now)
+        if len(user_message_times[uid]) >= 4:
+            spam_detected = True
+            spam_reason = "Message Flooding (4+ messages sent in under 4 seconds)"
+            user_message_times[uid].clear()
 
-        # Trigger warning if 5 or more messages sent in 4 seconds
-        if len(user_message_times[uid]) >= 5:
-            user_message_times[uid].clear()  # Reset so it doesn't double-warn in the same second
+        # 3. Check Repeated Text Spam (Sending identical message 3 times within 10 seconds)
+        cleaned_text = message.content.strip().lower()
+        if len(cleaned_text) > 1 and not spam_detected:
+            history = [entry for entry in user_last_messages[uid] if now - entry[1] < 10.0]
+            history.append((cleaned_text, now))
+            user_last_messages[uid] = history
 
+            if sum(1 for text, _ in history if text == cleaned_text) >= 3:
+                spam_detected = True
+                spam_reason = f"Repeated Message Spam (repeated '{message.content[:30]}' 3 times)"
+                user_last_messages[uid].clear()
+
+        # If spam condition met, issue automatic warning card!
+        if spam_detected:
             warning_embed = discord.Embed(
-                title="⚠️ SPAM WARNING CARD",
-                description=f"**{message.author.mention}, slow down!**\n"
-                            f"Excessive messaging and spamming are not allowed in this server.",
+                title="⚠️ AUTOMATIC SPAM WARNING CARD",
+                description=f"**{message.author.mention}, you have triggered Anti-Spam protection!**\n"
+                            f"Please stop spamming to maintain chat quality.",
                 color=discord.Color.red()
             )
             warning_embed.set_thumbnail(url=message.author.display_avatar.url)
             warning_embed.add_field(name="Member", value=f"{message.author.name} (`{message.author.id}`)", inline=True)
             warning_embed.add_field(name="Channel", value=message.channel.mention, inline=True)
-            warning_embed.add_field(name="Reason", value="Sending messages too rapidly (Anti-Spam Triggered)", inline=False)
-            warning_embed.set_footer(text="Automated Server Anti-Spam Protection")
+            warning_embed.add_field(name="Violation Detected", value=spam_reason, inline=False)
+            warning_embed.set_footer(text="Automated Anti-Spam Moderation System")
 
             try:
+                # Attempt to delete the spam message if bot has Manage Messages permission
+                try:
+                    await message.delete()
+                except (discord.Forbidden, discord.NotFound):
+                    pass
+
                 await message.channel.send(content=message.author.mention, embed=warning_embed)
             except discord.HTTPException as e:
-                print(f"Failed to send spam warning card: {e}", flush=True)
+                print(f"Failed to send automatic spam warning card: {e}", flush=True)
 
-    # Check if any mentioned user is in our target_ids
+    # Check if any mentioned user is in our target_ids for auto-reactions
     target_ids = get_target_user_ids()
     if target_ids and any(user.id in target_ids for user in message.mentions):
         for emoji in REACTION_EMOJIS:
