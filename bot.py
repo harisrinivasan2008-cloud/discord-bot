@@ -26,6 +26,8 @@ TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 # BOT ADMIN MANAGEMENT & PERSISTENCE
 # ==============================================================================
 ADMINS_FILE = os.path.join(os.path.dirname(__file__), "admins.json")
+SERVER_CONFIG_FILE = os.path.join(os.path.dirname(__file__), "server_config.json")
+BOT_OWNER_ID = int(os.getenv("BOT_OWNER_ID", "1548399037378723977"))
 
 def load_admin_ids() -> set:
     if os.path.exists(ADMINS_FILE):
@@ -44,18 +46,55 @@ def save_admin_ids(admin_ids: set):
     except Exception as e:
         print(f"Error saving admins.json: {e}", flush=True)
 
-def is_user_admin(user_id: int, guild: discord.Guild = None) -> bool:
-    # 1. Server Owner is ALWAYS permanently authorized
-    if guild and guild.owner_id == user_id:
+def load_server_config() -> dict:
+    if os.path.exists(SERVER_CONFIG_FILE):
+        try:
+            with open(SERVER_CONFIG_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Error loading server_config.json: {e}", flush=True)
+    return {}
+
+def save_server_config(config: dict):
+    try:
+        with open(SERVER_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2)
+    except Exception as e:
+        print(f"Error saving server_config.json: {e}", flush=True)
+
+def get_default_prefix(guild_id: int) -> str | None:
+    config = load_server_config()
+    return config.get(str(guild_id), {}).get("default_prefix")
+
+def set_default_prefix(guild_id: int, prefix: str):
+    config = load_server_config()
+    guild_key = str(guild_id)
+    if guild_key not in config:
+        config[guild_key] = {}
+    config[guild_key]["default_prefix"] = prefix
+    save_server_config(config)
+
+def remove_default_prefix(guild_id: int) -> bool:
+    config = load_server_config()
+    guild_key = str(guild_id)
+    if guild_key in config and "default_prefix" in config[guild_key]:
+        del config[guild_key]["default_prefix"]
+        save_server_config(config)
+        return True
+    return False
+
+def is_user_admin(user_id: int) -> bool:
+    # 1. Supreme Bot Owner is ALWAYS permanently authorized across all servers
+    if user_id == BOT_OWNER_ID:
+        return True
+    if bot.owner_id and user_id == bot.owner_id:
         return True
     # 2. Check if user is in authorized admins list
     admin_ids = load_admin_ids()
     return user_id in admin_ids
 
 def is_authorized_admin(interaction: discord.Interaction) -> bool:
-    if not interaction.guild:
-        return False
-    return is_user_admin(interaction.user.id, interaction.guild)
+    return is_user_admin(interaction.user.id)
 
 def check_bot_admin():
     async def predicate(interaction: discord.Interaction) -> bool:
@@ -63,7 +102,7 @@ def check_bot_admin():
             return True
         await interaction.response.send_message(
             "🔒 **Access Denied**: You are not an authorized bot administrator.\n"
-            "Only the server owner and designated bot admins can access these commands.",
+            "Only the Bot Owner and designated bot admins can access these commands.",
             ephemeral=True
         )
         return False
@@ -129,6 +168,37 @@ async def on_ready():
         print(f"Successfully synced {len(synced)} slash command(s).", flush=True)
     except Exception as e:
         print(f"Failed to sync slash commands: {e}", flush=True)
+
+# ==============================================================================
+# AUTO DEFAULT PREFIX ON MEMBER JOIN
+# ==============================================================================
+@bot.event
+async def on_member_join(member: discord.Member):
+    # Ignore bots
+    if member.bot:
+        return
+
+    prefix = get_default_prefix(member.guild.id)
+    if not prefix:
+        return
+
+    # Check bot role hierarchy before attempting edit
+    bot_member = member.guild.get_member(bot.user.id)
+    if bot_member and member.top_role >= bot_member.top_role:
+        print(f"[Auto-Prefix] Cannot set prefix for {member.name} in {member.guild.name}: role higher than or equal to bot.", flush=True)
+        return
+
+    new_nick = f"{prefix} {member.name}".strip()
+    if len(new_nick) > 32:
+        new_nick = new_nick[:32]
+
+    try:
+        await member.edit(nick=new_nick)
+        print(f"[Auto-Prefix] Applied prefix '{prefix}' to new member {member.name} ({member.id}) in {member.guild.name}.", flush=True)
+    except discord.Forbidden:
+        print(f"[Auto-Prefix] Forbidden: Bot lacks permission to edit {member.name}'s nickname in {member.guild.name}.", flush=True)
+    except Exception as e:
+        print(f"[Auto-Prefix] Error editing nickname for {member.name}: {e}", flush=True)
 
 # ==============================================================================
 # 1. AUTO-REACT ON MENTION & AUTOMATED ANTI-SPAM DETECTION
@@ -292,8 +362,15 @@ admin_group = app_commands.Group(name="admin", description="Manage authorized bo
 @app_commands.describe(member="The member to authorize as a bot administrator")
 @check_bot_admin()
 async def admin_add(interaction: discord.Interaction, member: discord.Member):
+    if member.id == BOT_OWNER_ID:
+        await interaction.response.send_message(
+            f"👑 {member.mention} is the supreme Bot Owner and already has permanent global access.",
+            ephemeral=True
+        )
+        return
+
     admin_ids = load_admin_ids()
-    if member.id in admin_ids or member.id == interaction.guild.owner_id:
+    if member.id in admin_ids:
         await interaction.response.send_message(
             f"⚠️ {member.mention} already has bot administrator access.",
             ephemeral=True
@@ -310,9 +387,9 @@ async def admin_add(interaction: discord.Interaction, member: discord.Member):
 @app_commands.describe(member="The member to remove from bot administrators")
 @check_bot_admin()
 async def admin_remove(interaction: discord.Interaction, member: discord.Member):
-    if member.id == interaction.guild.owner_id:
+    if member.id == BOT_OWNER_ID:
         await interaction.response.send_message(
-            "❌ Cannot revoke access from the Server Owner (permanent administrator).",
+            "❌ Cannot revoke access from the Bot Owner (permanent supreme administrator).",
             ephemeral=True
         )
         return
@@ -335,21 +412,20 @@ async def admin_remove(interaction: discord.Interaction, member: discord.Member)
 @check_bot_admin()
 async def admin_list(interaction: discord.Interaction):
     admin_ids = load_admin_ids()
-    owner = interaction.guild.owner
-    owner_str = f"👑 {owner.mention} *(Server Owner - Permanent)*" if owner else "Unknown"
+    owner_str = f"👑 <@{BOT_OWNER_ID}> (`{BOT_OWNER_ID}`) *(Supreme Bot Owner - Global)*"
 
     admin_list_text = []
-    for uid in admin_ids:
-        if interaction.guild and uid == interaction.guild.owner_id:
+    for uid in sorted(admin_ids):
+        if uid == BOT_OWNER_ID:
             continue
         admin_list_text.append(f"🛡️ <@{uid}> (`{uid}`)")
 
     embed = discord.Embed(
         title="🔐 Authorized Bot Administrators",
-        description="Only users on this list are permitted to execute bot commands.",
+        description="Only users on this list are permitted to execute bot commands across servers.",
         color=discord.Color.gold()
     )
-    embed.add_field(name="Server Owner", value=owner_str, inline=False)
+    embed.add_field(name="Supreme Bot Owner", value=owner_str, inline=False)
     if admin_list_text:
         embed.add_field(
             name=f"Configured Admins ({len(admin_list_text)})",
@@ -532,6 +608,55 @@ async def reset_all_nicks(interaction: discord.Interaction):
         msg += f"\n*(Skipped {skipped_count} member(s) due to higher roles or server ownership)*"
 
     await interaction.followup.send(msg)
+
+# ==============================================================================
+# DEFAULT PREFIX COMMANDS (/setprefix, /removeprefix, /viewprefix)
+# ==============================================================================
+@bot.tree.command(name="setprefix", description="Set the default prefix automatically applied to new members joining the server")
+@app_commands.describe(prefix="The prefix string to prepend to new members' names (e.g. [TAG] or 🔥)")
+@check_bot_admin()
+async def set_prefix(interaction: discord.Interaction, prefix: str):
+    clean_prefix = prefix.strip()
+    if not clean_prefix:
+        await interaction.response.send_message("❌ Prefix cannot be empty.", ephemeral=True)
+        return
+    if len(clean_prefix) > 15:
+        await interaction.response.send_message("❌ Prefix must be 15 characters or fewer.", ephemeral=True)
+        return
+
+    set_default_prefix(interaction.guild.id, clean_prefix)
+    await interaction.response.send_message(
+        f"✅ Default prefix for new members has been set to: **`{clean_prefix}`**\n"
+        f"Anyone who joins **{interaction.guild.name}** will automatically have this prefix applied (e.g. `{clean_prefix} Username`)."
+    )
+
+@bot.tree.command(name="removeprefix", description="Remove the default prefix applied to new members")
+@check_bot_admin()
+async def remove_prefix(interaction: discord.Interaction):
+    if remove_default_prefix(interaction.guild.id):
+        await interaction.response.send_message(
+            f"✅ Default prefix removed for **{interaction.guild.name}**.\nNew members will now join with their original username."
+        )
+    else:
+        await interaction.response.send_message(
+            f"⚠️ No default prefix was set for **{interaction.guild.name}**.",
+            ephemeral=True
+        )
+
+@bot.tree.command(name="viewprefix", description="View the current default prefix configured for new members")
+@check_bot_admin()
+async def view_prefix(interaction: discord.Interaction):
+    prefix = get_default_prefix(interaction.guild.id)
+    if prefix:
+        await interaction.response.send_message(
+            f"🏷️ Current default prefix for **{interaction.guild.name}** is: **`{prefix}`**\n"
+            f"Example for a new member: `{prefix} Username`"
+        )
+    else:
+        await interaction.response.send_message(
+            f"ℹ️ No default prefix is currently set for **{interaction.guild.name}**.\n"
+            f"Use `/setprefix <prefix>` to configure one."
+        )
 
 # ==============================================================================
 # 4. DISPLAY MEMBER INFO, ROLES & DATES (/info)
@@ -1298,7 +1423,7 @@ async def play_audio(
                     display_title = f"{recording_name}{ext}"
                     break
             if not audio_path:
-                await interaction.followup.send(f"❌ Could not find `{recording_name}` in the `audio/` folder. Use `/recordings` to see available files.")
+                await interaction.followup.send(f"❌ Could not find `{recording_name}` in the `audio/` folder.")
                 return
     else:
         # Default: look for any audio in audio/ folder
@@ -1369,23 +1494,6 @@ async def stop_audio(interaction: discord.Interaction):
         await interaction.response.send_message("⏹️ Audio playback stopped.")
     else:
         await interaction.response.send_message("⚠️ No audio is currently playing.", ephemeral=True)
-
-@bot.tree.command(name="recordings", description="List all saved audio recordings available to play")
-@check_bot_admin()
-async def list_recordings(interaction: discord.Interaction):
-    files = [f for f in os.listdir(AUDIO_DIR) if f.lower().endswith(('.mp3', '.wav', '.m4a', '.ogg', '.flac'))]
-    if not files:
-        await interaction.response.send_message("📁 No audio recordings found in the `audio/` folder.\nYou can upload recordings using `/play audio_file: [your_audio]` or place files in the bot's `audio/` folder.", ephemeral=True)
-        return
-
-    file_list = "\n".join(f"🎵 `{f}`" for f in files)
-    embed = discord.Embed(
-        title="🎙️ Available Audio Recordings",
-        description=f"Play any of these files using `/play recording_name: <filename>`:\n\n{file_list}",
-        color=discord.Color.blue()
-    )
-    embed.set_footer(text=f"Total: {len(files)} file(s) in audio/ folder")
-    await interaction.response.send_message(embed=embed)
 
 async def main():
     try:
