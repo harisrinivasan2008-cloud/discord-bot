@@ -1,8 +1,10 @@
 import os
 import sys
 import json
+import time
 import asyncio
 import traceback
+from collections import defaultdict
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -42,13 +44,18 @@ def save_admin_ids(admin_ids: set):
     except Exception as e:
         print(f"Error saving admins.json: {e}", flush=True)
 
-def is_authorized_admin(interaction: discord.Interaction) -> bool:
+def is_user_admin(user_id: int, guild: discord.Guild = None) -> bool:
     # 1. Server Owner is ALWAYS permanently authorized
-    if interaction.guild and interaction.guild.owner_id == interaction.user.id:
+    if guild and guild.owner_id == user_id:
         return True
     # 2. Check if user is in authorized admins list
     admin_ids = load_admin_ids()
-    return interaction.user.id in admin_ids
+    return user_id in admin_ids
+
+def is_authorized_admin(interaction: discord.Interaction) -> bool:
+    if not interaction.guild:
+        return False
+    return is_user_admin(interaction.user.id, interaction.guild)
 
 def check_bot_admin():
     async def predicate(interaction: discord.Interaction) -> bool:
@@ -73,6 +80,9 @@ def get_target_user_ids():
 
 # Configure the emojis to react with when any target user is mentioned
 REACTION_EMOJIS = ["🔥", "👑", "👀"]
+
+# Anti-spam tracking dictionary: maps user_id -> list of message timestamps
+user_message_times = defaultdict(list)
 
 # Configure bot intents
 intents = discord.Intents.default()
@@ -119,13 +129,42 @@ async def on_ready():
         print(f"Failed to sync slash commands: {e}", flush=True)
 
 # ==============================================================================
-# 1. AUTO-REACT WHEN SPECIFIC USER(S) ARE TAGGED / MENTIONED
+# 1. AUTO-REACT ON MENTION & AUTOMATED ANTI-SPAM DETECTION
 # ==============================================================================
 @bot.event
 async def on_message(message: discord.Message):
-    # Ignore messages sent by the bot itself
+    # Ignore messages sent by bots (including our own bot)
     if message.author.bot:
         return
+
+    # Anti-Spam Detection (Exempts Server Owner and Bot Admins)
+    if message.guild and not is_user_admin(message.author.id, message.guild):
+        now = time.time()
+        uid = message.author.id
+        # Keep timestamps from the last 4 seconds
+        user_message_times[uid] = [t for t in user_message_times[uid] if now - t < 4.0]
+        user_message_times[uid].append(now)
+
+        # Trigger warning if 5 or more messages sent in 4 seconds
+        if len(user_message_times[uid]) >= 5:
+            user_message_times[uid].clear()  # Reset so it doesn't double-warn in the same second
+
+            warning_embed = discord.Embed(
+                title="⚠️ SPAM WARNING CARD",
+                description=f"**{message.author.mention}, slow down!**\n"
+                            f"Excessive messaging and spamming are not allowed in this server.",
+                color=discord.Color.red()
+            )
+            warning_embed.set_thumbnail(url=message.author.display_avatar.url)
+            warning_embed.add_field(name="Member", value=f"{message.author.name} (`{message.author.id}`)", inline=True)
+            warning_embed.add_field(name="Channel", value=message.channel.mention, inline=True)
+            warning_embed.add_field(name="Reason", value="Sending messages too rapidly (Anti-Spam Triggered)", inline=False)
+            warning_embed.set_footer(text="Automated Server Anti-Spam Protection")
+
+            try:
+                await message.channel.send(content=message.author.mention, embed=warning_embed)
+            except discord.HTTPException as e:
+                print(f"Failed to send spam warning card: {e}", flush=True)
 
     # Check if any mentioned user is in our target_ids
     target_ids = get_target_user_ids()
@@ -276,32 +315,33 @@ async def changenick(
         )
 
 # ==============================================================================
-# 4. DISPLAY ROLES & DATES OF A SPECIFIC PERSON
+# 4. DISPLAY MEMBER INFO, ROLES & DATES (/info)
 # ==============================================================================
-@bot.tree.command(name="roles", description="Show all roles and join dates for a member")
-@app_commands.describe(member="The member whose roles you want to view")
+@bot.tree.command(name="info", description="Show detailed member info, join dates, and roles")
+@app_commands.describe(member="The member whose info you want to view (defaults to yourself)")
 @check_bot_admin()
-async def show_roles(interaction: discord.Interaction, member: discord.Member):
-    member_roles = [role for role in member.roles if role.name != "@everyone"]
+async def show_info(interaction: discord.Interaction, member: discord.Member = None):
+    target = member or interaction.user
+    member_roles = [role for role in target.roles if role.name != "@everyone"]
     member_roles.reverse()
 
     role_mentions = [role.mention for role in member_roles]
     role_count = len(member_roles)
 
-    created_ts = int(member.created_at.timestamp())
-    joined_ts = int(member.joined_at.timestamp()) if member.joined_at else None
+    created_ts = int(target.created_at.timestamp())
+    joined_ts = int(target.joined_at.timestamp()) if target.joined_at else None
 
-    embed_color = member.color if member.color.value != 0 else discord.Color.blue()
+    embed_color = target.color if target.color.value != 0 else discord.Color.blue()
     embed = discord.Embed(
-        title=f"👤 Member Info & Roles: {member.display_name}",
+        title=f"👤 Member Information: {target.display_name}",
         color=embed_color
     )
-    embed.set_thumbnail(url=member.display_avatar.url)
-    embed.add_field(name="Username", value=f"{member.name} (`{member.id}`)", inline=True)
-    embed.add_field(name="Highest Role", value=member.top_role.mention, inline=True)
+    embed.set_thumbnail(url=target.display_avatar.url)
+    embed.add_field(name="Username", value=f"{target.name} (`{target.id}`)", inline=True)
+    embed.add_field(name="Highest Role", value=target.top_role.mention, inline=True)
     embed.add_field(name="Total Roles", value=str(role_count), inline=True)
     embed.add_field(name="Joined Discord", value=f"<t:{created_ts}:D> (<t:{created_ts}:R>)", inline=True)
-    
+
     if joined_ts:
         embed.add_field(name="Joined Server", value=f"<t:{joined_ts}:D> (<t:{joined_ts}:R>)", inline=True)
     else:
@@ -339,7 +379,56 @@ async def avatar(interaction: discord.Interaction, member: discord.Member = None
     await interaction.response.send_message(embed=embed)
 
 # ==============================================================================
-# 6. VOICE CHAT CONTROLS: MUTE / UNMUTE (INDIVIDUAL)
+# 6. SPAM MESSAGES COMMAND (/spam)
+# ==============================================================================
+@bot.tree.command(name="spam", description="Send a message multiple times (Admin only)")
+@app_commands.describe(
+    amount="How many times to send the message (1 to 25)",
+    message="The text message to spam"
+)
+@check_bot_admin()
+async def spam_messages(interaction: discord.Interaction, amount: int, message: str):
+    if amount < 1:
+        await interaction.response.send_message("❌ Amount must be at least 1.", ephemeral=True)
+        return
+    if amount > 25:
+        await interaction.response.send_message("❌ Amount cannot exceed 25 to protect the bot from Discord rate limits.", ephemeral=True)
+        return
+
+    await interaction.response.send_message(f"🚀 Spaming {amount} message(s)...", ephemeral=True)
+    for _ in range(amount):
+        try:
+            await interaction.channel.send(message)
+            await asyncio.sleep(0.5)  # Safe delay to prevent Discord API 429 rate limit
+        except Exception as e:
+            print(f"Error during spam command: {e}", flush=True)
+            break
+
+# ==============================================================================
+# 7. MANUAL WARNING CARD COMMAND (/warn)
+# ==============================================================================
+@bot.tree.command(name="warn", description="Issue a formal warning card to a member")
+@app_commands.describe(
+    member="The member to issue a warning card to",
+    reason="Reason for the warning (e.g. Spamming)"
+)
+@check_bot_admin()
+async def warn_member(interaction: discord.Interaction, member: discord.Member, reason: str = "Spamming in chat"):
+    embed = discord.Embed(
+        title="⚠️ OFFICIAL WARNING CARD",
+        description=f"**{member.mention} has received a formal warning!**",
+        color=discord.Color.orange()
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name="Member", value=f"{member.name} (`{member.id}`)", inline=True)
+    embed.add_field(name="Warned By", value=interaction.user.mention, inline=True)
+    embed.add_field(name="Reason", value=reason, inline=False)
+    embed.set_footer(text="Please adhere to server guidelines to avoid further moderation.")
+
+    await interaction.response.send_message(content=member.mention, embed=embed)
+
+# ==============================================================================
+# 8. VOICE CHAT CONTROLS: MUTE / UNMUTE (INDIVIDUAL)
 # ==============================================================================
 @bot.tree.command(name="vmute", description="Server mute or unmute a member in voice chat")
 @app_commands.describe(
@@ -365,7 +454,7 @@ async def vmute(interaction: discord.Interaction, member: discord.Member, mute: 
         await interaction.response.send_message(f"❌ Failed to update voice mute: {e}", ephemeral=True)
 
 # ==============================================================================
-# 7. VOICE CHAT CONTROLS: DEAFEN / UNDEAFEN (INDIVIDUAL)
+# 9. VOICE CHAT CONTROLS: DEAFEN / UNDEAFEN (INDIVIDUAL)
 # ==============================================================================
 @bot.tree.command(name="vdeafen", description="Server deafen or undeafen a member in voice chat")
 @app_commands.describe(
@@ -391,7 +480,7 @@ async def vdeafen(interaction: discord.Interaction, member: discord.Member, deaf
         await interaction.response.send_message(f"❌ Failed to update voice deafen: {e}", ephemeral=True)
 
 # ==============================================================================
-# 8. VOICE CHAT CONTROLS: MOVE MEMBER TO ANOTHER VC (INDIVIDUAL)
+# 10. VOICE CHAT CONTROLS: MOVE MEMBER TO ANOTHER VC (INDIVIDUAL)
 # ==============================================================================
 @bot.tree.command(name="movevc", description="Move a member from one voice channel to another")
 @app_commands.describe(
@@ -423,7 +512,7 @@ async def movevc(interaction: discord.Interaction, member: discord.Member, chann
         await interaction.response.send_message(f"❌ Failed to move member: {e}", ephemeral=True)
 
 # ==============================================================================
-# 9. MASS VOICE CHAT CONTROLS: MOVE ALL, MUTE ALL, DEAFEN ALL
+# 11. MASS VOICE CHAT CONTROLS: MOVE ALL, MUTE ALL, DEAFEN ALL
 # ==============================================================================
 @bot.tree.command(name="moveall", description="Move ALL members from one voice channel to another")
 @app_commands.describe(
