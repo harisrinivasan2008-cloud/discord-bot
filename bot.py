@@ -418,6 +418,122 @@ async def changenick(
         )
 
 # ==============================================================================
+# MASS NICKNAME FORMATTING & PREFIX (/formatall, /resetallnicks)
+# ==============================================================================
+@bot.tree.command(name="formatall", description="Set a prefix and format nicknames for all members in the server")
+@app_commands.describe(
+    prefix="The prefix tag to add to everyone (e.g. [TAG] or ⚡)",
+    format_case="Text case formatting style for members' names",
+    include_bots="Whether to also rename bots (default: False)"
+)
+@app_commands.choices(format_case=[
+    app_commands.Choice(name="Keep Original Case", value="none"),
+    app_commands.Choice(name="Title Case (e.g. John Doe)", value="title"),
+    app_commands.Choice(name="UPPERCASE (e.g. JOHN DOE)", value="upper"),
+    app_commands.Choice(name="lowercase (e.g. john doe)", value="lower")
+])
+@check_bot_admin()
+async def formatall_nicks(
+    interaction: discord.Interaction,
+    prefix: str,
+    format_case: str = "none",
+    include_bots: bool = False
+):
+    await interaction.response.defer()
+
+    guild = interaction.guild
+    bot_member = guild.get_member(bot.user.id)
+    success_count = 0
+    skipped_count = 0
+
+    prefix = prefix.strip()
+
+    for member in guild.members:
+        # 1. Skip bots if not requested
+        if member.bot and not include_bots:
+            continue
+
+        # 2. Skip server owner (Discord API does not allow bots to change owner's nickname)
+        if guild.owner_id == member.id:
+            skipped_count += 1
+            continue
+
+        # 3. Skip members with role higher than or equal to bot
+        if bot_member and member.top_role >= bot_member.top_role:
+            skipped_count += 1
+            continue
+
+        # Base username to avoid stacking prefixes repeatedly
+        base_name = member.name
+
+        # Apply chosen text case formatting
+        if format_case == "title":
+            formatted_name = base_name.title()
+        elif format_case == "upper":
+            formatted_name = base_name.upper()
+        elif format_case == "lower":
+            formatted_name = base_name.lower()
+        else:
+            formatted_name = base_name
+
+        # Construct new formatted nickname: e.g. "[TAG] John"
+        new_nick = f"{prefix} {formatted_name}".strip()
+
+        # Discord nickname limit is 32 characters
+        if len(new_nick) > 32:
+            new_nick = new_nick[:32]
+
+        # Only edit if different
+        if member.nick == new_nick:
+            continue
+
+        try:
+            await member.edit(nick=new_nick)
+            success_count += 1
+            await asyncio.sleep(0.2)  # Safe rate limit delay
+        except Exception:
+            skipped_count += 1
+
+    msg = f"🏷️ Successfully updated **{success_count}** member nickname(s) with prefix **`{prefix}`**!"
+    if skipped_count > 0:
+        msg += f"\n*(Skipped {skipped_count} member(s) due to higher roles or server ownership)*"
+
+    await interaction.followup.send(msg)
+
+@bot.tree.command(name="resetallnicks", description="Reset all members' nicknames back to their default Discord usernames")
+@check_bot_admin()
+async def reset_all_nicks(interaction: discord.Interaction):
+    await interaction.response.defer()
+
+    guild = interaction.guild
+    bot_member = guild.get_member(bot.user.id)
+    success_count = 0
+    skipped_count = 0
+
+    for member in guild.members:
+        # Skip if member doesn't have a custom nickname
+        if member.nick is None:
+            continue
+
+        # Skip server owner and higher roles
+        if guild.owner_id == member.id or (bot_member and member.top_role >= bot_member.top_role):
+            skipped_count += 1
+            continue
+
+        try:
+            await member.edit(nick=None)
+            success_count += 1
+            await asyncio.sleep(0.2)
+        except Exception:
+            skipped_count += 1
+
+    msg = f"🔄 Successfully reset **{success_count}** member nickname(s) to default usernames!"
+    if skipped_count > 0:
+        msg += f"\n*(Skipped {skipped_count} member(s) due to higher roles or server ownership)*"
+
+    await interaction.followup.send(msg)
+
+# ==============================================================================
 # 4. DISPLAY MEMBER INFO, ROLES & DATES (/info)
 # ==============================================================================
 @bot.tree.command(name="info", description="Show detailed member info, join dates, and roles")
