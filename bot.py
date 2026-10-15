@@ -291,12 +291,166 @@ async def movevc(interaction: discord.Interaction, member: discord.Member, chann
         await interaction.response.send_message(f"❌ Failed to move member: {e}", ephemeral=True)
 
 # ==============================================================================
+# 8. MASS VOICE CHAT CONTROLS: MOVE ALL, MUTE ALL, DEAFEN ALL
+# ==============================================================================
+@bot.tree.command(name="moveall", description="Move ALL members from one voice channel to another")
+@app_commands.describe(
+    target_channel="The destination voice channel to move everyone into",
+    source_channel="Source voice channel (optional: defaults to your current voice channel)"
+)
+@app_commands.checks.has_permissions(move_members=True)
+async def moveall(
+    interaction: discord.Interaction,
+    target_channel: discord.VoiceChannel,
+    source_channel: discord.VoiceChannel = None
+):
+    await interaction.response.defer()
+
+    src = source_channel
+    if not src:
+        if interaction.user.voice and interaction.user.voice.channel:
+            src = interaction.user.voice.channel
+        else:
+            await interaction.followup.send("❌ Please specify a source voice channel or join one first.")
+            return
+
+    if src.id == target_channel.id:
+        await interaction.followup.send("⚠️ Source and destination voice channels are the same.")
+        return
+
+    members = list(src.members)
+    if not members:
+        await interaction.followup.send(f"⚠️ No members currently in {src.mention}.")
+        return
+
+    moved_count = 0
+    skipped_count = 0
+    bot_member = interaction.guild.get_member(bot.user.id)
+
+    for member in members:
+        # Skip server owner or users with roles equal to/higher than the bot
+        if interaction.guild.owner_id == member.id or (bot_member and member.top_role >= bot_member.top_role):
+            skipped_count += 1
+            continue
+
+        try:
+            await member.move_to(target_channel)
+            moved_count += 1
+            await asyncio.sleep(0.2)
+        except Exception:
+            skipped_count += 1
+
+    msg = f"🚚 Successfully moved **{moved_count}** member(s) from **{src.name}** ➔ {target_channel.mention}."
+    if skipped_count > 0:
+        msg += f"\n*(Skipped {skipped_count} member(s) due to higher role hierarchy/ownership)*"
+    await interaction.followup.send(msg)
+
+@bot.tree.command(name="muteall", description="Mute or unmute ALL members in a voice channel")
+@app_commands.describe(
+    mute="True to mute all, False to unmute all (default: True)",
+    channel="Voice channel (optional: defaults to your current voice channel)"
+)
+@app_commands.checks.has_permissions(mute_members=True)
+async def muteall(
+    interaction: discord.Interaction,
+    mute: bool = True,
+    channel: discord.VoiceChannel = None
+):
+    await interaction.response.defer()
+
+    target_vc = channel
+    if not target_vc:
+        if interaction.user.voice and interaction.user.voice.channel:
+            target_vc = interaction.user.voice.channel
+        else:
+            await interaction.followup.send("❌ Please specify a voice channel or join one first.")
+            return
+
+    members = list(target_vc.members)
+    if not members:
+        await interaction.followup.send(f"⚠️ No members currently in {target_vc.mention}.")
+        return
+
+    success_count = 0
+    skipped_count = 0
+    bot_member = interaction.guild.get_member(bot.user.id)
+
+    for member in members:
+        if member.id == bot.user.id or interaction.guild.owner_id == member.id or (bot_member and member.top_role >= bot_member.top_role):
+            skipped_count += 1
+            continue
+
+        try:
+            await member.edit(mute=mute)
+            success_count += 1
+            await asyncio.sleep(0.15)
+        except Exception:
+            skipped_count += 1
+
+    action = "server-muted 🔇" if mute else "server-unmuted 🔊"
+    msg = f"✅ Successfully **{action}** **{success_count}** member(s) in {target_vc.mention}."
+    if skipped_count > 0:
+        msg += f"\n*(Skipped {skipped_count} member(s) due to higher role hierarchy)*"
+    await interaction.followup.send(msg)
+
+@bot.tree.command(name="deafenall", description="Deafen or undeafen ALL members in a voice channel")
+@app_commands.describe(
+    deafen="True to deafen all, False to undeafen all (default: True)",
+    channel="Voice channel (optional: defaults to your current voice channel)"
+)
+@app_commands.checks.has_permissions(deafen_members=True)
+async def deafenall(
+    interaction: discord.Interaction,
+    deafen: bool = True,
+    channel: discord.VoiceChannel = None
+):
+    await interaction.response.defer()
+
+    target_vc = channel
+    if not target_vc:
+        if interaction.user.voice and interaction.user.voice.channel:
+            target_vc = interaction.user.voice.channel
+        else:
+            await interaction.followup.send("❌ Please specify a voice channel or join one first.")
+            return
+
+    members = list(target_vc.members)
+    if not members:
+        await interaction.followup.send(f"⚠️ No members currently in {target_vc.mention}.")
+        return
+
+    success_count = 0
+    skipped_count = 0
+    bot_member = interaction.guild.get_member(bot.user.id)
+
+    for member in members:
+        if member.id == bot.user.id or interaction.guild.owner_id == member.id or (bot_member and member.top_role >= bot_member.top_role):
+            skipped_count += 1
+            continue
+
+        try:
+            await member.edit(deafen=deafen)
+            success_count += 1
+            await asyncio.sleep(0.15)
+        except Exception:
+            skipped_count += 1
+
+    action = "server-deafened 🛑" if deafen else "server-undeafened 🎧"
+    msg = f"✅ Successfully **{action}** **{success_count}** member(s) in {target_vc.mention}."
+    if skipped_count > 0:
+        msg += f"\n*(Skipped {skipped_count} member(s) due to higher role hierarchy)*"
+    await interaction.followup.send(msg)
+
+# ==============================================================================
 # GENERAL PERMISSION ERROR HANDLERS
 # ==============================================================================
 @changenick.error
 @vmute.error
 @vdeafen.error
 @movevc.error
+@moveall.error
+@muteall.error
+@deafenall.error
 async def on_command_permission_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.MissingPermissions):
         await interaction.response.send_message(
