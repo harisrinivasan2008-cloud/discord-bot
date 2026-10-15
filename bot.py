@@ -531,7 +531,90 @@ async def warn_member(interaction: discord.Interaction, member: discord.Member, 
     await interaction.response.send_message(content=member.mention, embed=embed)
 
 # ==============================================================================
-# 8. VOICE CHAT CONTROLS: MUTE / UNMUTE (INDIVIDUAL)
+# MATCHMAKER — Split up to 8-12 members into two random balanced teams
+# ==============================================================================
+@bot.tree.command(name="matchmaker", description="Randomly split 8–12 members into two balanced teams")
+@app_commands.describe(
+    player1="Player 1 (required)",
+    player2="Player 2 (required)",
+    player3="Player 3 (required)",
+    player4="Player 4 (required)",
+    player5="Player 5 (required)",
+    player6="Player 6 (required)",
+    player7="Player 7 (required)",
+    player8="Player 8 (required)",
+    player9="Player 9 (optional)",
+    player10="Player 10 (optional)",
+    player11="Player 11 (optional)",
+    player12="Player 12 (optional)",
+)
+@check_bot_admin()
+async def matchmaker(
+    interaction: discord.Interaction,
+    player1: discord.Member,
+    player2: discord.Member,
+    player3: discord.Member,
+    player4: discord.Member,
+    player5: discord.Member,
+    player6: discord.Member,
+    player7: discord.Member,
+    player8: discord.Member,
+    player9: discord.Member = None,
+    player10: discord.Member = None,
+    player11: discord.Member = None,
+    player12: discord.Member = None,
+):
+    import random
+
+    # Collect all unique players (filter out None and duplicates)
+    raw_players = [player1, player2, player3, player4, player5, player6, player7, player8,
+                   player9, player10, player11, player12]
+    seen_ids = set()
+    players = []
+    for p in raw_players:
+        if p is not None and p.id not in seen_ids:
+            seen_ids.add(p.id)
+            players.append(p)
+
+    total = len(players)
+    if total < 8:
+        await interaction.response.send_message(
+            f"❌ You need at least **8 unique players** to use matchmaker. You provided **{total}**.",
+            ephemeral=True
+        )
+        return
+
+    # Shuffle and split into two balanced teams
+    random.shuffle(players)
+    half = total // 2
+    team_a = players[:half]
+    team_b = players[half:]
+
+    TEAM_A_EMOJIS = ["🔴", "🅰️"]
+    TEAM_B_EMOJIS = ["🔵", "🅱️"]
+
+    team_a_text = "\n".join(f"{'🔴'} {m.mention}" for i, m in enumerate(team_a, 1))
+    team_b_text = "\n".join(f"{'🔵'} {m.mention}" for i, m in enumerate(team_b, 1))
+
+    embed = discord.Embed(
+        title="⚔️ MATCHMAKER — Teams Ready!",
+        description=f"**{total} players** have been randomly split into 2 balanced teams.\nGood luck to everyone! 🎮",
+        color=discord.Color.purple()
+    )
+    embed.add_field(
+        name=f"🔴 Team A — {len(team_a)} Players",
+        value=team_a_text or "*Empty*",
+        inline=True
+    )
+    embed.add_field(
+        name=f"🔵 Team B — {len(team_b)} Players",
+        value=team_b_text or "*Empty*",
+        inline=True
+    )
+    embed.set_footer(text=f"Matchmaker by {interaction.user.display_name} • {total} Total Players")
+
+    await interaction.response.send_message(embed=embed)
+
 # ==============================================================================
 @bot.tree.command(name="vmute", description="Server mute or unmute a member in voice chat")
 @app_commands.describe(
