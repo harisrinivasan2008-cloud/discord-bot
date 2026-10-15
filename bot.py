@@ -596,6 +596,166 @@ async def clear_messages(
         await interaction.followup.send(f"❌ Failed to delete messages: {e}", ephemeral=True)
 
 # ==============================================================================
+# SERVER INFO — Full server dashboard with all statistics
+# ==============================================================================
+@bot.tree.command(name="serverinfo", description="Display comprehensive server statistics and information")
+@check_bot_admin()
+async def serverinfo(interaction: discord.Interaction):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+
+    # ---- Member Counts ----
+    total_members = guild.member_count
+    all_members = guild.members  # Requires members intent
+
+    online_members = sum(1 for m in all_members if not m.bot and m.status != discord.Status.offline)
+    total_bots = sum(1 for m in all_members if m.bot)
+    online_bots = sum(1 for m in all_members if m.bot and m.status != discord.Status.offline)
+    total_humans = total_members - total_bots
+
+    # ---- Voice Channel Users ----
+    vc_users = 0
+    for vc in guild.voice_channels:
+        vc_users += len(vc.members)
+    for sc in guild.stage_channels:
+        vc_users += len(sc.members)
+
+    # ---- Channel Counts ----
+    text_channels = len(guild.text_channels)
+    voice_channels = len(guild.voice_channels)
+    categories = len(guild.categories)
+    stage_channels = len(guild.stage_channels)
+    forum_channels = len(guild.forum_channels) if hasattr(guild, 'forum_channels') else 0
+
+    # ---- Roles, Emojis, Stickers ----
+    total_roles = len(guild.roles) - 1  # Exclude @everyone
+    custom_emojis = len(guild.emojis)
+    custom_stickers = len(guild.stickers)
+
+    # ---- Soundboards ----
+    try:
+        soundboards = len(guild.soundboard_sounds) if hasattr(guild, 'soundboard_sounds') else 0
+    except Exception:
+        soundboards = 0
+
+    # ---- Bot Commands Count ----
+    total_commands = len(bot.tree.get_commands())
+
+    # ---- Server Info ----
+    created_ts = int(guild.created_at.timestamp())
+    boost_level = guild.premium_tier
+    boost_count = guild.premium_subscription_count or 0
+    verification = str(guild.verification_level).replace("_", " ").title()
+
+    # ---- Build Embed ----
+    embed = discord.Embed(
+        title=f"📊 Server Dashboard — {guild.name}",
+        description=f"Created <t:{created_ts}:D> (<t:{created_ts}:R>)",
+        color=discord.Color.blurple()
+    )
+
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+
+    # Members Section
+    embed.add_field(
+        name="👥 Members",
+        value=(
+            f"**Total:** {total_members}\n"
+            f"**Humans:** {total_humans}\n"
+            f"**Online Members:** {online_members}"
+        ),
+        inline=True
+    )
+
+    # Bots Section
+    embed.add_field(
+        name="🤖 Bots",
+        value=(
+            f"**Total Bots:** {total_bots}\n"
+            f"**Active Bots:** {online_bots}"
+        ),
+        inline=True
+    )
+
+    # Voice Section
+    embed.add_field(
+        name="🎙️ Voice Activity",
+        value=(
+            f"**Users in VC:** {vc_users}"
+        ),
+        inline=True
+    )
+
+    # Channels Section
+    channel_text = (
+        f"💬 Text: **{text_channels}**\n"
+        f"🔊 Voice: **{voice_channels}**\n"
+        f"📁 Categories: **{categories}**"
+    )
+    if stage_channels > 0:
+        channel_text += f"\n🎤 Stage: **{stage_channels}**"
+    if forum_channels > 0:
+        channel_text += f"\n📋 Forums: **{forum_channels}**"
+    embed.add_field(
+        name=f"📌 Channels ({text_channels + voice_channels + stage_channels + forum_channels})",
+        value=channel_text,
+        inline=True
+    )
+
+    # Roles
+    embed.add_field(
+        name="🏷️ Roles",
+        value=f"**Total:** {total_roles}",
+        inline=True
+    )
+
+    # Customization Section
+    embed.add_field(
+        name="🎨 Customization",
+        value=(
+            f"😀 Emojis: **{custom_emojis}**\n"
+            f"🎭 Stickers: **{custom_stickers}**\n"
+            f"🔊 Soundboards: **{soundboards}**"
+        ),
+        inline=True
+    )
+
+    # Server Features
+    embed.add_field(
+        name="⚙️ Server Info",
+        value=(
+            f"**Boost Level:** {'⭐' * boost_level if boost_level > 0 else 'None'} (Tier {boost_level})\n"
+            f"**Boosts:** {boost_count}\n"
+            f"**Verification:** {verification}"
+        ),
+        inline=True
+    )
+
+    # Bot Commands
+    embed.add_field(
+        name="🤖 Bot Commands",
+        value=f"**Total Slash Commands:** {total_commands}",
+        inline=True
+    )
+
+    # Owner
+    owner = guild.owner
+    embed.add_field(
+        name="👑 Server Owner",
+        value=f"{owner.mention}" if owner else "Unknown",
+        inline=True
+    )
+
+    embed.set_footer(text=f"Server ID: {guild.id} • Requested by {interaction.user.display_name}")
+
+    await interaction.followup.send(embed=embed)
+
+
 @bot.tree.command(name="matchmaker", description="Randomly split 8–12 members into two balanced teams")
 @app_commands.describe(
     player1="Player 1 (required)",
