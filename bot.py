@@ -1070,6 +1070,163 @@ async def deafenall(
         msg += f"\n*(Skipped {skipped_count} member(s) due to higher role hierarchy)*"
     await interaction.followup.send(msg)
 
+# ==============================================================================
+# 12. VOICE CHANNEL CONNECT & AUDIO PLAYBACK
+# ==============================================================================
+AUDIO_DIR = os.path.join(os.path.dirname(__file__), "audio")
+os.makedirs(AUDIO_DIR, exist_ok=True)
+
+def get_ffmpeg_path():
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return "ffmpeg"
+
+@bot.tree.command(name="join", description="Connect the bot to your current voice channel")
+@app_commands.describe(channel="Voice channel to join (optional, defaults to your current VC)")
+@check_bot_admin()
+async def join_voice(interaction: discord.Interaction, channel: discord.VoiceChannel = None):
+    target = channel
+    if not target:
+        if interaction.user.voice and interaction.user.voice.channel:
+            target = interaction.user.voice.channel
+        else:
+            await interaction.response.send_message("❌ Please join a voice channel first or select one.", ephemeral=True)
+            return
+
+    vc = interaction.guild.voice_client
+    if vc and vc.is_connected():
+        if vc.channel.id == target.id:
+            await interaction.response.send_message(f"⚠️ Already connected to {target.mention}.", ephemeral=True)
+            return
+        await vc.move_to(target)
+        await interaction.response.send_message(f"🔊 Moved to {target.mention}.")
+    else:
+        try:
+            await target.connect()
+            await interaction.response.send_message(f"🔊 Successfully connected to {target.mention}!")
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Failed to connect: {e}", ephemeral=True)
+
+@bot.tree.command(name="leave", description="Disconnect the bot from the voice channel")
+@check_bot_admin()
+async def leave_voice(interaction: discord.Interaction):
+    vc = interaction.guild.voice_client
+    if not vc or not vc.is_connected():
+        await interaction.response.send_message("❌ The bot is not currently in any voice channel.", ephemeral=True)
+        return
+    await vc.disconnect()
+    await interaction.response.send_message("👋 Disconnected from voice channel.")
+
+@bot.tree.command(name="play", description="Play a recorded audio file in your voice channel")
+@app_commands.describe(
+    audio_file="Upload an audio file (.mp3, .wav, .m4a, .ogg) to play",
+    recording_name="Name of a saved audio file in the audio/ folder (e.g. sample.wav)"
+)
+@check_bot_admin()
+async def play_audio(
+    interaction: discord.Interaction,
+    audio_file: discord.Attachment = None,
+    recording_name: str = None
+):
+    await interaction.response.defer()
+
+    # 1. Connect to voice channel if not already connected
+    vc = interaction.guild.voice_client
+    if not vc or not vc.is_connected():
+        if interaction.user.voice and interaction.user.voice.channel:
+            target_vc = interaction.user.voice.channel
+            try:
+                vc = await target_vc.connect()
+            except Exception as e:
+                await interaction.followup.send(f"❌ Could not connect to {target_vc.mention}: {e}")
+                return
+        else:
+            await interaction.followup.send("❌ You must be in a voice channel (or use `/join`) to play audio.")
+            return
+
+    # 2. Determine file to play
+    audio_path = None
+    display_title = ""
+
+    if audio_file:
+        # User uploaded a file in the command
+        filename = audio_file.filename
+        safe_filename = "".join(c for c in filename if c.isalnum() or c in "._- ")
+        audio_path = os.path.join(AUDIO_DIR, safe_filename)
+        await audio_file.save(audio_path)
+        display_title = safe_filename
+    elif recording_name:
+        # User requested a specific saved recording
+        candidate = os.path.join(AUDIO_DIR, recording_name)
+        if os.path.exists(candidate):
+            audio_path = candidate
+            display_title = recording_name
+        else:
+            for ext in [".mp3", ".wav", ".m4a", ".ogg"]:
+                test_path = os.path.join(AUDIO_DIR, f"{recording_name}{ext}")
+                if os.path.exists(test_path):
+                    audio_path = test_path
+                    display_title = f"{recording_name}{ext}"
+                    break
+            if not audio_path:
+                await interaction.followup.send(f"❌ Could not find `{recording_name}` in the `audio/` folder. Use `/recordings` to see available files.")
+                return
+    else:
+        # Default: look for any audio in audio/ folder
+        files = [f for f in os.listdir(AUDIO_DIR) if f.lower().endswith(('.mp3', '.wav', '.m4a', '.ogg', '.flac'))]
+        if files:
+            chosen = "sample.wav" if "sample.wav" in files else files[0]
+            audio_path = os.path.join(AUDIO_DIR, chosen)
+            display_title = chosen
+        else:
+            await interaction.followup.send("❌ No audio file specified and no saved recordings found in `audio/`. Please upload an audio file with `/play audio_file: [your_file]`.")
+            return
+
+    # 3. Check if audio is currently playing
+    if vc.is_playing():
+        vc.stop()
+
+    # 4. Play audio via FFmpeg
+    try:
+        ffmpeg_bin = get_ffmpeg_path()
+        audio_source = discord.FFmpegPCMAudio(audio_path, executable=ffmpeg_bin)
+        vc.play(audio_source)
+        await interaction.followup.send(f"🎶 Now playing **`{display_title}`** in {vc.channel.mention}!")
+    except Exception as e:
+        await interaction.followup.send(f"❌ Failed to play audio: {e}")
+
+@bot.tree.command(name="stop", description="Stop currently playing audio in voice channel")
+@check_bot_admin()
+async def stop_audio(interaction: discord.Interaction):
+    vc = interaction.guild.voice_client
+    if not vc or not vc.is_connected():
+        await interaction.response.send_message("❌ The bot is not connected to any voice channel.", ephemeral=True)
+        return
+    if vc.is_playing():
+        vc.stop()
+        await interaction.response.send_message("⏹️ Audio playback stopped.")
+    else:
+        await interaction.response.send_message("⚠️ No audio is currently playing.", ephemeral=True)
+
+@bot.tree.command(name="recordings", description="List all saved audio recordings available to play")
+@check_bot_admin()
+async def list_recordings(interaction: discord.Interaction):
+    files = [f for f in os.listdir(AUDIO_DIR) if f.lower().endswith(('.mp3', '.wav', '.m4a', '.ogg', '.flac'))]
+    if not files:
+        await interaction.response.send_message("📁 No audio recordings found in the `audio/` folder.\nYou can upload recordings using `/play audio_file: [your_audio]` or place files in the bot's `audio/` folder.", ephemeral=True)
+        return
+
+    file_list = "\n".join(f"🎵 `{f}`" for f in files)
+    embed = discord.Embed(
+        title="🎙️ Available Audio Recordings",
+        description=f"Play any of these files using `/play recording_name: <filename>`:\n\n{file_list}",
+        color=discord.Color.blue()
+    )
+    embed.set_footer(text=f"Total: {len(files)} file(s) in audio/ folder")
+    await interaction.response.send_message(embed=embed)
+
 async def main():
     try:
         await start_web_server()
