@@ -27,7 +27,7 @@ TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 # ==============================================================================
 ADMINS_FILE = os.path.join(os.path.dirname(__file__), "admins.json")
 SERVER_CONFIG_FILE = os.path.join(os.path.dirname(__file__), "server_config.json")
-BOT_OWNER_ID = int(os.getenv("BOT_OWNER_ID", "1548399037378723977"))
+BOT_OWNER_ID = int(os.getenv("BOT_OWNER_ID", "1506483667604734183"))
 
 def load_admin_ids() -> set:
     if os.path.exists(ADMINS_FILE):
