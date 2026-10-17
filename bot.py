@@ -114,6 +114,37 @@ def check_bot_admin():
         return False
     return app_commands.check(predicate)
 
+def is_spam_exempt(member: discord.Member) -> bool:
+    if not isinstance(member, discord.Member):
+        return False
+
+    # 1. Supreme Bot Owner and Authorized Admins are always exempt
+    if is_user_admin(member.id):
+        return True
+
+    # 2. Members with the "monarch" role (case-insensitive) are exempt
+    for role in member.roles:
+        if role.name.lower() == "monarch":
+            return True
+
+    # 3. Members with the Server Tag / Prefix in their name or nickname
+    if member.guild:
+        server_prefix = get_default_prefix(member.guild.id)
+        if server_prefix:
+            tag_raw = server_prefix.strip().lower()
+            tag_clean = tag_raw.strip("[](){}<>|# ").lower()
+
+            display_name = member.display_name.lower()
+            user_name = member.name.lower()
+
+            if tag_raw and (tag_raw in display_name or tag_raw in user_name):
+                return True
+            if tag_clean and (tag_clean in display_name or tag_clean in user_name):
+                return True
+
+    return False
+
+
 # Helper function to get list of target user IDs (supports comma or space separated)
 def get_target_user_ids():
     raw = os.getenv("TARGET_USER_IDS", "") or os.getenv("TARGET_USER_ID", "")
@@ -175,6 +206,22 @@ async def on_ready():
     except Exception as e:
         print(f"Failed to sync slash commands: {e}", flush=True)
 
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CheckFailure):
+        # Already handled by custom permission check
+        return
+    print(f"App command error in /{interaction.command.name if interaction.command else 'unknown'}: {error}", flush=True)
+    traceback.print_exc()
+    error_msg = f"❌ An error occurred: {error}"
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(error_msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(error_msg, ephemeral=True)
+    except Exception:
+        pass
+
 # ==============================================================================
 # AUTO DEFAULT PREFIX ON MEMBER JOIN
 # ==============================================================================
@@ -194,7 +241,7 @@ async def on_member_join(member: discord.Member):
         print(f"[Auto-Prefix] Cannot set prefix for {member.name} in {member.guild.name}: role higher than or equal to bot.", flush=True)
         return
 
-    new_nick = f"{prefix} {member.name}".strip()
+    new_nick = f"{prefix} {member.display_name}".strip()
     if len(new_nick) > 32:
         new_nick = new_nick[:32]
 
@@ -216,7 +263,8 @@ async def on_message(message: discord.Message):
         return
 
     # ================= AUTOMATED ANTI-SPAM SYSTEM =================
-    if message.guild:
+    # Members with the server tag, "monarch" role, or bot admins are 100% exempt from spam warnings
+    if message.guild and isinstance(message.author, discord.Member) and not is_spam_exempt(message.author):
         now = time.time()
         uid = message.author.id
         spam_detected = False
@@ -545,20 +593,28 @@ async def formatall_nicks(
             skipped_count += 1
             continue
 
-        # Base username to avoid stacking prefixes repeatedly
-        base_name = member.name
+        # Use current per-server profile name (display_name), DO NOT replace with base username!
+        current_name = member.display_name
+
+        # Avoid duplicate prefixes if already prefixed with this exact prefix
+        if current_name.startswith(f"{prefix} "):
+            if format_case == "none":
+                continue
+            core_name = current_name[len(prefix) + 1:]
+        else:
+            core_name = current_name
 
         # Apply chosen text case formatting
         if format_case == "title":
-            formatted_name = base_name.title()
+            formatted_name = core_name.title()
         elif format_case == "upper":
-            formatted_name = base_name.upper()
+            formatted_name = core_name.upper()
         elif format_case == "lower":
-            formatted_name = base_name.lower()
+            formatted_name = core_name.lower()
         else:
-            formatted_name = base_name
+            formatted_name = core_name
 
-        # Construct new formatted nickname: e.g. "[TAG] John"
+        # Construct new formatted nickname: e.g. "HFC Alex"
         new_nick = f"{prefix} {formatted_name}".strip()
 
         # Discord nickname limit is 32 characters
@@ -566,7 +622,7 @@ async def formatall_nicks(
             new_nick = new_nick[:32]
 
         # Only edit if different
-        if member.nick == new_nick:
+        if member.nick == new_nick or (member.nick is None and member.name == new_nick):
             continue
 
         try:
@@ -731,13 +787,20 @@ async def avatar(interaction: discord.Interaction, member: discord.Member = None
 # ==============================================================================
 # 6. SPAM MESSAGES COMMAND (/spam)
 # ==============================================================================
-@bot.tree.command(name="spam", description="Send a message multiple times (Admin only)")
+@bot.tree.command(name="spam", description="Send a message multiple times")
 @app_commands.describe(
     amount="How many times to send the message (1 to 25)",
     message="The text message to spam"
 )
-@check_bot_admin()
 async def spam_messages(interaction: discord.Interaction, amount: int, message: str):
+    member = interaction.user if isinstance(interaction.user, discord.Member) else (interaction.guild.get_member(interaction.user.id) if interaction.guild else None)
+    if not (is_authorized_admin(interaction) or (member and is_spam_exempt(member))):
+        await interaction.response.send_message(
+            "🔒 **Access Denied**: You must be a bot administrator, have the **Monarch** role, or carry the server tag to use `/spam`.",
+            ephemeral=True
+        )
+        return
+
     if amount < 1:
         await interaction.response.send_message("❌ Amount must be at least 1.", ephemeral=True)
         return
@@ -745,7 +808,7 @@ async def spam_messages(interaction: discord.Interaction, amount: int, message: 
         await interaction.response.send_message("❌ Amount cannot exceed 25 to protect the bot from Discord rate limits.", ephemeral=True)
         return
 
-    await interaction.response.send_message(f"🚀 Spaming {amount} message(s)...", ephemeral=True)
+    await interaction.response.send_message(f"🚀 Spamming {amount} message(s)...", ephemeral=True)
     for _ in range(amount):
         try:
             await interaction.channel.send(message)
@@ -778,41 +841,56 @@ async def warn_member(interaction: discord.Interaction, member: discord.Member, 
     await interaction.response.send_message(content=member.mention, embed=embed)
 
 # ==============================================================================
-# CLEAR — Delete 4 to 40 recent messages from a channel
+# CLEAR — Delete 1 to 100 recent messages from a channel
 # ==============================================================================
-@bot.tree.command(name="clear", description="Delete recent messages from this channel (4–40 messages)")
+@bot.tree.command(name="clear", description="Delete recent messages from this channel (1–100 messages)")
 @app_commands.describe(
-    amount="Number of messages to delete (minimum 4, maximum 40)",
+    amount="Number of messages to delete (1 to 100, default: 10)",
     target="Optional: only delete messages from this specific member"
 )
-@app_commands.checks.has_permissions(manage_messages=True)
 @check_bot_admin()
 async def clear_messages(
     interaction: discord.Interaction,
-    amount: int,
+    amount: int = 10,
     target: discord.Member = None
 ):
-    if amount < 4:
-        await interaction.response.send_message(
-            "❌ Minimum amount is **4** messages.", ephemeral=True
-        )
+    if not interaction.guild or not interaction.channel:
+        await interaction.response.send_message("❌ This command can only be used in a server channel.", ephemeral=True)
         return
-    if amount > 40:
-        await interaction.response.send_message(
-            "❌ Maximum amount is **40** messages.", ephemeral=True
-        )
+
+    if amount < 1:
+        await interaction.response.send_message("❌ Minimum amount is **1** message.", ephemeral=True)
         return
+    if amount > 100:
+        await interaction.response.send_message("❌ Maximum amount is **100** messages (Discord bulk delete limit).", ephemeral=True)
+        return
+
+    channel = interaction.channel
+    if not hasattr(channel, "purge"):
+        await interaction.response.send_message("❌ Messages cannot be cleared in this channel type.", ephemeral=True)
+        return
+
+    # Check bot permissions in channel
+    bot_member = interaction.guild.me or interaction.guild.get_member(bot.user.id)
+    if bot_member and hasattr(channel, "permissions_for"):
+        perms = channel.permissions_for(bot_member)
+        if not perms.manage_messages:
+            await interaction.response.send_message(
+                "❌ **Missing Permission**: I need the **Manage Messages** permission in this channel to delete messages.\n"
+                "💡 *Fix:* Go to **Channel Settings -> Permissions** or **Server Settings -> Roles** and grant me **Manage Messages**.",
+                ephemeral=True
+            )
+            return
 
     await interaction.response.defer(ephemeral=True)
 
-    def check_target(msg):
-        # If a target member is specified, only delete their messages
+    def check_target(msg: discord.Message):
         if target:
             return msg.author.id == target.id
         return True
 
     try:
-        deleted = await interaction.channel.purge(limit=amount, check=check_target)
+        deleted = await channel.purge(limit=amount, check=check_target, bulk=True)
         actual = len(deleted)
 
         if actual == 0:
@@ -822,17 +900,11 @@ async def clear_messages(
             )
             return
 
-        # Send a brief confirmation that auto-deletes after 5 seconds
-        confirm = await interaction.followup.send(
-            f"✅ Successfully deleted **{actual}** message(s)"
-            f"{f' from {target.mention}' if target else ''} in {interaction.channel.mention}.",
-            ephemeral=False
+        await interaction.followup.send(
+            f"🧹 Successfully deleted **{actual}** message(s)"
+            f"{f' from {target.mention}' if target else ''} in {channel.mention}.",
+            ephemeral=True
         )
-        await asyncio.sleep(5)
-        try:
-            await confirm.delete()
-        except (discord.NotFound, discord.Forbidden):
-            pass
 
     except discord.Forbidden:
         await interaction.followup.send(
@@ -841,6 +913,8 @@ async def clear_messages(
         )
     except discord.HTTPException as e:
         await interaction.followup.send(f"❌ Failed to delete messages: {e}", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Unexpected error while deleting messages: {e}", ephemeral=True)
 
 # ==============================================================================
 # SERVER INFO — Full server dashboard with all statistics
