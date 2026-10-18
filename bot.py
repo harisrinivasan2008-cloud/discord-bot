@@ -1470,6 +1470,104 @@ async def leave_voice(interaction: discord.Interaction):
     await vc.disconnect()
     await interaction.response.send_message("👋 Disconnected from voice channel.")
 
+# ==============================================================================
+# VOICE CHANNEL LOCK & UNLOCK (/lock, /unlock)
+# ==============================================================================
+@bot.tree.command(name="lock", description="Lock a voice channel so members cannot join")
+@app_commands.describe(channel="Voice channel to lock (defaults to your current VC)")
+async def lock_vc(interaction: discord.Interaction, channel: discord.VoiceChannel = None):
+    member = interaction.user if isinstance(interaction.user, discord.Member) else (interaction.guild.get_member(interaction.user.id) if interaction.guild else None)
+    if not (is_authorized_admin(interaction) or (member and is_spam_exempt(member))):
+        await interaction.response.send_message(
+            "🔒 **Access Denied**: You must be a bot administrator, have the **Monarch** role, or carry the server tag to lock voice channels.",
+            ephemeral=True
+        )
+        return
+
+    target_vc = channel
+    if not target_vc:
+        if interaction.user.voice and interaction.user.voice.channel:
+            target_vc = interaction.user.voice.channel
+        else:
+            await interaction.response.send_message("❌ Please join a voice channel first or specify a channel to lock.", ephemeral=True)
+            return
+
+    # Check bot permissions in target channel
+    bot_member = interaction.guild.me or interaction.guild.get_member(bot.user.id)
+    if bot_member and hasattr(target_vc, "permissions_for"):
+        perms = target_vc.permissions_for(bot_member)
+        if not perms.manage_channels:
+            await interaction.response.send_message(
+                "❌ **Missing Permission**: I need the **Manage Channels** permission in this voice channel to lock it.\n"
+                "💡 *Fix:* Grant me 'Manage Channels' permission in Server Settings -> Roles.",
+                ephemeral=True
+            )
+            return
+
+    try:
+        # Deny connect permission for @everyone role
+        await target_vc.set_permissions(interaction.guild.default_role, connect=False)
+
+        embed = discord.Embed(
+            title="🔒 Voice Channel Locked",
+            description=f"{target_vc.mention} has been **locked**.\nMembers without special permissions can no longer connect.",
+            color=discord.Color.red()
+        )
+        embed.set_footer(text=f"Locked by {interaction.user.display_name} • Use /unlock to restore access")
+        await interaction.response.send_message(embed=embed)
+    except discord.Forbidden:
+        await interaction.response.send_message("❌ Missing Permissions: Ensure the bot has 'Manage Channels' permission.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Failed to lock voice channel: {e}", ephemeral=True)
+
+@bot.tree.command(name="unlock", description="Unlock a voice channel so members can join")
+@app_commands.describe(channel="Voice channel to unlock (defaults to your current VC)")
+async def unlock_vc(interaction: discord.Interaction, channel: discord.VoiceChannel = None):
+    member = interaction.user if isinstance(interaction.user, discord.Member) else (interaction.guild.get_member(interaction.user.id) if interaction.guild else None)
+    if not (is_authorized_admin(interaction) or (member and is_spam_exempt(member))):
+        await interaction.response.send_message(
+            "🔒 **Access Denied**: You must be a bot administrator, have the **Monarch** role, or carry the server tag to unlock voice channels.",
+            ephemeral=True
+        )
+        return
+
+    target_vc = channel
+    if not target_vc:
+        if interaction.user.voice and interaction.user.voice.channel:
+            target_vc = interaction.user.voice.channel
+        else:
+            await interaction.response.send_message("❌ Please join a voice channel first or specify a channel to unlock.", ephemeral=True)
+            return
+
+    # Check bot permissions in target channel
+    bot_member = interaction.guild.me or interaction.guild.get_member(bot.user.id)
+    if bot_member and hasattr(target_vc, "permissions_for"):
+        perms = target_vc.permissions_for(bot_member)
+        if not perms.manage_channels:
+            await interaction.response.send_message(
+                "❌ **Missing Permission**: I need the **Manage Channels** permission in this voice channel to unlock it.\n"
+                "💡 *Fix:* Grant me 'Manage Channels' permission in Server Settings -> Roles.",
+                ephemeral=True
+            )
+            return
+
+    try:
+        # Reset connect permission for @everyone role
+        await target_vc.set_permissions(interaction.guild.default_role, connect=None)
+
+        embed = discord.Embed(
+            title="🔓 Voice Channel Unlocked",
+            description=f"{target_vc.mention} has been **unlocked**.\nMembers can now freely connect to this voice channel.",
+            color=discord.Color.green()
+        )
+        embed.set_footer(text=f"Unlocked by {interaction.user.display_name}")
+        await interaction.response.send_message(embed=embed)
+    except discord.Forbidden:
+        await interaction.response.send_message("❌ Missing Permissions: Ensure the bot has 'Manage Channels' permission.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Failed to unlock voice channel: {e}", ephemeral=True)
+
+
 def fetch_youtube_audio(query_or_url: str) -> dict:
     import yt_dlp
 
