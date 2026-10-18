@@ -162,6 +162,12 @@ user_message_times = defaultdict(list)
 user_last_messages = defaultdict(list)
 user_warn_counts = {}          # Tracks how many spam warnings each user has received
 
+# Global task cancellation tracking for /stop command
+active_spam_count = defaultdict(int)
+stop_spam_flag = defaultdict(bool)
+active_formatall_flag = defaultdict(bool)
+stop_formatall_flag = defaultdict(bool)
+
 # Configure bot intents
 intents = discord.Intents.default()
 intents.message_content = True  # Required to read mentions in messages
@@ -577,63 +583,74 @@ async def formatall_nicks(
     skipped_count = 0
 
     prefix = prefix.strip()
+    guild_id = guild.id if guild else 0
+    stop_formatall_flag[guild_id] = False
+    active_formatall_flag[guild_id] = True
 
-    for member in guild.members:
-        # 1. Skip bots if not requested
-        if member.bot and not include_bots:
-            continue
+    try:
+        for member in guild.members:
+            if stop_formatall_flag.get(guild_id, False):
+                break
 
-        # 2. Skip server owner (Discord API does not allow bots to change owner's nickname)
-        if guild.owner_id == member.id:
-            skipped_count += 1
-            continue
-
-        # 3. Skip members with role higher than or equal to bot
-        if bot_member and member.top_role >= bot_member.top_role:
-            skipped_count += 1
-            continue
-
-        # Use current per-server profile name (display_name), DO NOT replace with base username!
-        current_name = member.display_name
-
-        # Avoid duplicate prefixes if already prefixed with this exact prefix
-        if current_name.startswith(f"{prefix} "):
-            if format_case == "none":
+            # 1. Skip bots if not requested
+            if member.bot and not include_bots:
                 continue
-            core_name = current_name[len(prefix) + 1:]
-        else:
-            core_name = current_name
 
-        # Apply chosen text case formatting
-        if format_case == "title":
-            formatted_name = core_name.title()
-        elif format_case == "upper":
-            formatted_name = core_name.upper()
-        elif format_case == "lower":
-            formatted_name = core_name.lower()
-        else:
-            formatted_name = core_name
+            # 2. Skip server owner (Discord API does not allow bots to change owner's nickname)
+            if guild.owner_id == member.id:
+                skipped_count += 1
+                continue
 
-        # Construct new formatted nickname: e.g. "HFC Alex"
-        new_nick = f"{prefix} {formatted_name}".strip()
+            # 3. Skip members with role higher than or equal to bot
+            if bot_member and member.top_role >= bot_member.top_role:
+                skipped_count += 1
+                continue
 
-        # Discord nickname limit is 32 characters
-        if len(new_nick) > 32:
-            new_nick = new_nick[:32]
+            # Use current per-server profile name (display_name), DO NOT replace with base username!
+            current_name = member.display_name
 
-        # Only edit if different
-        if member.nick == new_nick or (member.nick is None and member.name == new_nick):
-            continue
+            # Avoid duplicate prefixes if already prefixed with this exact prefix
+            if current_name.startswith(f"{prefix} "):
+                if format_case == "none":
+                    continue
+                core_name = current_name[len(prefix) + 1:]
+            else:
+                core_name = current_name
 
-        try:
-            await member.edit(nick=new_nick)
-            success_count += 1
-            await asyncio.sleep(0.2)  # Safe rate limit delay
-        except Exception:
-            skipped_count += 1
+            # Apply chosen text case formatting
+            if format_case == "title":
+                formatted_name = core_name.title()
+            elif format_case == "upper":
+                formatted_name = core_name.upper()
+            elif format_case == "lower":
+                formatted_name = core_name.lower()
+            else:
+                formatted_name = core_name
+
+            # Construct new formatted nickname: e.g. "HFC Alex"
+            new_nick = f"{prefix} {formatted_name}".strip()
+
+            # Discord nickname limit is 32 characters
+            if len(new_nick) > 32:
+                new_nick = new_nick[:32]
+
+            # Only edit if different
+            if member.nick == new_nick or (member.nick is None and member.name == new_nick):
+                continue
+
+            try:
+                await member.edit(nick=new_nick)
+                success_count += 1
+                await asyncio.sleep(0.2)  # Safe rate limit delay
+            except Exception:
+                skipped_count += 1
+    finally:
+        active_formatall_flag[guild_id] = False
 
     msg = f"🏷️ Successfully updated **{success_count}** member nickname(s) with prefix **`{prefix}`**!"
-    if skipped_count > 0:
+    if stop_formatall_flag.get(guild_id, False):
+        msg += "\n*(Formatting was stopped early by `/stop`)*"
+    elif skipped_count > 0:
         msg += f"\n*(Skipped {skipped_count} member(s) due to higher roles or server ownership)*"
 
     await interaction.followup.send(msg)
@@ -808,14 +825,23 @@ async def spam_messages(interaction: discord.Interaction, amount: int, message: 
         await interaction.response.send_message("❌ Amount cannot exceed 25 to protect the bot from Discord rate limits.", ephemeral=True)
         return
 
+    guild_id = interaction.guild_id if interaction.guild else 0
+    stop_spam_flag[guild_id] = False
+    active_spam_count[guild_id] += 1
+
     await interaction.response.send_message(f"🚀 Spamming {amount} message(s)...", ephemeral=True)
-    for _ in range(amount):
-        try:
-            await interaction.channel.send(message)
-            await asyncio.sleep(0.5)  # Safe delay to prevent Discord API 429 rate limit
-        except Exception as e:
-            print(f"Error during spam command: {e}", flush=True)
-            break
+    try:
+        for _ in range(amount):
+            if stop_spam_flag.get(guild_id, False):
+                break
+            try:
+                await interaction.channel.send(message)
+                await asyncio.sleep(0.5)  # Safe delay to prevent Discord API 429 rate limit
+            except Exception as e:
+                print(f"Error during spam command: {e}", flush=True)
+                break
+    finally:
+        active_spam_count[guild_id] = max(0, active_spam_count[guild_id] - 1)
 
 # ==============================================================================
 # 7. MANUAL WARNING CARD COMMAND (/warn)
@@ -1440,10 +1466,63 @@ async def leave_voice(interaction: discord.Interaction):
     await vc.disconnect()
     await interaction.response.send_message("👋 Disconnected from voice channel.")
 
-@bot.tree.command(name="play", description="Play recorded audio with custom volume (up to 1000), gain (+24dB), and bass boost (+24dB)")
+def fetch_youtube_audio(query_or_url: str) -> dict:
+    import yt_dlp
+
+    yt_cache_dir = os.path.join(AUDIO_DIR, "yt_cache")
+    os.makedirs(yt_cache_dir, exist_ok=True)
+
+    clean_target = query_or_url.strip()
+    is_url = (
+        clean_target.startswith(("http://", "https://", "www."))
+        or "youtube.com" in clean_target
+        or "youtu.be" in clean_target
+    )
+    target = clean_target if is_url else f"ytsearch1:{clean_target}"
+
+    ffmpeg_bin = get_ffmpeg_path()
+
+    ydl_opts = {
+        'format': 'bestaudio/best',
+        'outtmpl': os.path.join(yt_cache_dir, '%(id)s.%(ext)s'),
+        'ffmpeg_location': ffmpeg_bin,
+        'noplaylist': True,
+        'quiet': True,
+        'no_warnings': True,
+        'default_search': 'ytsearch',
+        'postprocessors': [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '192',
+        }],
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(target, download=True)
+        if 'entries' in info and info['entries']:
+            info = info['entries'][0]
+
+        video_id = info.get('id', 'audio')
+        title = info.get('title', 'YouTube Video')
+        webpage_url = info.get('webpage_url', clean_target)
+
+        final_path = os.path.join(yt_cache_dir, f"{video_id}.mp3")
+        if not os.path.exists(final_path):
+            for fname in os.listdir(yt_cache_dir):
+                if fname.startswith(video_id):
+                    final_path = os.path.join(yt_cache_dir, fname)
+                    break
+
+        return {
+            'path': final_path,
+            'title': title,
+            'url': webpage_url
+        }
+
+@bot.tree.command(name="play", description="Play audio from a YouTube link, video search, uploaded file, or saved audio")
 @app_commands.describe(
-    audio_file="Upload an audio file (.mp3, .wav, .m4a, .ogg) to play",
-    recording_name="Name of a saved audio file in the audio/ folder (e.g. sample.wav)",
+    link_or_name="YouTube link (https://...), search terms, or saved audio file name",
+    file="Upload an audio file (.mp3, .wav, .m4a, .ogg) to play directly",
     volume="Volume level from 1 to 1000 (default: 100, 1000 is 10x max amplification)",
     gain="Audio gain in dB from 0 to 24 (default: 0 dB, max: 24 dB)",
     bass="Bass boost in dB from 0 to 24 (default: 0 dB, max: 24 dB)"
@@ -1451,8 +1530,8 @@ async def leave_voice(interaction: discord.Interaction):
 @check_bot_admin()
 async def play_audio(
     interaction: discord.Interaction,
-    audio_file: discord.Attachment = None,
-    recording_name: str = None,
+    link_or_name: str = None,
+    file: discord.Attachment = None,
     volume: int = 100,
     gain: int = 0,
     bass: int = 0
@@ -1478,49 +1557,74 @@ async def play_audio(
             await interaction.followup.send("❌ You must be in a voice channel (or use `/join`) to play audio.")
             return
 
-    # 2. Determine file to play
+    # 2. Determine audio source to play
     audio_path = None
     display_title = ""
+    source_url = None
 
-    if audio_file:
-        # User uploaded a file in the command
-        filename = audio_file.filename
+    if file:
+        filename = file.filename
         safe_filename = "".join(c for c in filename if c.isalnum() or c in "._- ")
         audio_path = os.path.join(AUDIO_DIR, safe_filename)
-        await audio_file.save(audio_path)
+        await file.save(audio_path)
         display_title = safe_filename
-    elif recording_name:
-        # User requested a specific saved recording
-        candidate = os.path.join(AUDIO_DIR, recording_name)
-        if os.path.exists(candidate):
-            audio_path = candidate
-            display_title = recording_name
+
+    elif link_or_name:
+        clean_input = link_or_name.strip()
+        is_url = (
+            clean_input.startswith(("http://", "https://", "www."))
+            or "youtube.com" in clean_input
+            or "youtu.be" in clean_input
+        )
+
+        local_found = None
+        if not is_url:
+            candidate = os.path.join(AUDIO_DIR, clean_input)
+            if os.path.exists(candidate) and os.path.isfile(candidate):
+                local_found = candidate
+                display_title = clean_input
+            else:
+                for ext in [".mp3", ".wav", ".m4a", ".ogg", ".flac"]:
+                    test_path = os.path.join(AUDIO_DIR, f"{clean_input}{ext}")
+                    if os.path.exists(test_path) and os.path.isfile(test_path):
+                        local_found = test_path
+                        display_title = f"{clean_input}{ext}"
+                        break
+
+        if local_found:
+            audio_path = local_found
         else:
-            for ext in [".mp3", ".wav", ".m4a", ".ogg"]:
-                test_path = os.path.join(AUDIO_DIR, f"{recording_name}{ext}")
-                if os.path.exists(test_path):
-                    audio_path = test_path
-                    display_title = f"{recording_name}{ext}"
-                    break
-            if not audio_path:
-                await interaction.followup.send(f"❌ Could not find `{recording_name}` in the `audio/` folder.")
+            # YouTube Link or Search Query
+            try:
+                yt_info = await asyncio.to_thread(fetch_youtube_audio, clean_input)
+                audio_path = yt_info['path']
+                display_title = yt_info['title']
+                source_url = yt_info.get('url')
+            except Exception as e:
+                await interaction.followup.send(f"❌ Failed to fetch YouTube audio: {e}")
                 return
+
     else:
-        # Default: look for any audio in audio/ folder
+        # Default: pick any audio in audio/ folder
         files = [f for f in os.listdir(AUDIO_DIR) if f.lower().endswith(('.mp3', '.wav', '.m4a', '.ogg', '.flac'))]
         if files:
             chosen = "sample.wav" if "sample.wav" in files else files[0]
             audio_path = os.path.join(AUDIO_DIR, chosen)
             display_title = chosen
         else:
-            await interaction.followup.send("❌ No audio file specified and no saved recordings found in `audio/`. Please upload an audio file with `/play audio_file: [your_file]`.")
+            await interaction.followup.send("❌ Please provide a YouTube link or upload an audio file to play.")
             return
 
-    # 3. Check if audio is currently playing
+    # 3. Verify file exists
+    if not audio_path or not os.path.exists(audio_path):
+        await interaction.followup.send("❌ Audio file could not be prepared for playback.")
+        return
+
+    # 4. Stop current playback if active
     if vc.is_playing():
         vc.stop()
 
-    # 4. Construct FFmpeg Audio Filters (Volume, Gain, Bass Boost)
+    # 5. Construct FFmpeg Audio Filters (Volume, Gain, Bass Boost)
     filters = []
     if volume != 100:
         vol_multiplier = volume / 100.0
@@ -1534,7 +1638,7 @@ async def play_audio(
 
     ffmpeg_opts = f'-filter:a "{",".join(filters)}"' if filters else None
 
-    # 5. Play audio via FFmpeg
+    # 6. Play audio via FFmpeg
     try:
         ffmpeg_bin = get_ffmpeg_path()
         if ffmpeg_opts:
@@ -1555,6 +1659,8 @@ async def play_audio(
             description=f"Playing **`{display_title}`** in {vc.channel.mention}",
             color=discord.Color.green()
         )
+        if source_url:
+            embed.add_field(name="Source", value=f"[Watch on YouTube]({source_url})", inline=False)
         embed.add_field(name="Audio Settings", value=" • ".join(settings_info), inline=False)
         embed.set_footer(text=f"Requested by {interaction.user.display_name}")
 
@@ -1562,18 +1668,47 @@ async def play_audio(
     except Exception as e:
         await interaction.followup.send(f"❌ Failed to play audio: {e}")
 
-@bot.tree.command(name="stop", description="Stop currently playing audio in voice channel")
-@check_bot_admin()
-async def stop_audio(interaction: discord.Interaction):
-    vc = interaction.guild.voice_client
-    if not vc or not vc.is_connected():
-        await interaction.response.send_message("❌ The bot is not connected to any voice channel.", ephemeral=True)
+@bot.tree.command(name="stop", description="Stop voice audio playback and halt any active spam or background tasks")
+async def stop_all(interaction: discord.Interaction):
+    member = interaction.user if isinstance(interaction.user, discord.Member) else (interaction.guild.get_member(interaction.user.id) if interaction.guild else None)
+    if not (is_authorized_admin(interaction) or (member and is_spam_exempt(member))):
+        await interaction.response.send_message(
+            "🔒 **Access Denied**: You must be a bot administrator, have the **Monarch** role, or carry the server tag to use `/stop`.",
+            ephemeral=True
+        )
         return
-    if vc.is_playing():
+
+    guild_id = interaction.guild_id if interaction.guild else 0
+    stopped_actions = []
+
+    # 1. Stop voice audio playback
+    vc = interaction.guild.voice_client if interaction.guild else None
+    if vc and vc.is_connected() and vc.is_playing():
         vc.stop()
-        await interaction.response.send_message("⏹️ Audio playback stopped.")
+        stopped_actions.append(f"⏹️ **Audio Playback**: Stopped playing in {vc.channel.mention}")
+
+    # 2. Halt active message spamming
+    if active_spam_count.get(guild_id, 0) > 0 or not stop_spam_flag.get(guild_id, True):
+        stop_spam_flag[guild_id] = True
+        active_spam_count[guild_id] = 0
+        stopped_actions.append("🛑 **Spamming**: Halted active message spamming")
+
+    # 3. Halt active mass nickname formatting
+    if active_formatall_flag.get(guild_id, False):
+        stop_formatall_flag[guild_id] = True
+        active_formatall_flag[guild_id] = False
+        stopped_actions.append("🛑 **Format All**: Cancelled mass nickname formatting")
+
+    if stopped_actions:
+        embed = discord.Embed(
+            title="🛑 Stop Executed",
+            description="\n".join(stopped_actions),
+            color=discord.Color.red()
+        )
+        embed.set_footer(text=f"Requested by {interaction.user.display_name}")
+        await interaction.response.send_message(embed=embed)
     else:
-        await interaction.response.send_message("⚠️ No audio is currently playing.", ephemeral=True)
+        await interaction.response.send_message("ℹ️ No audio is currently playing and no tasks/spam are running in this server.", ephemeral=True)
 
 async def main():
     try:
