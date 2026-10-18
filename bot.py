@@ -653,7 +653,11 @@ async def formatall_nicks(
     elif skipped_count > 0:
         msg += f"\n*(Skipped {skipped_count} member(s) due to higher roles or server ownership)*"
 
-    await interaction.followup.send(msg)
+    try:
+        await interaction.followup.send(msg)
+    except Exception:
+        if interaction.channel:
+            await interaction.channel.send(f"{interaction.user.mention} {msg}")
 
 @bot.tree.command(name="resetallnicks", description="Reset all members' nicknames back to their default Discord usernames")
 @check_bot_admin()
