@@ -1062,39 +1062,44 @@ async def clear_messages(
             )
             return
 
-    await interaction.response.defer(ephemeral=True)
+    try:
+        await interaction.response.defer(ephemeral=True)
+    except Exception:
+        pass
 
     def check_target(msg: discord.Message):
         if target:
             return msg.author.id == target.id
         return True
 
+    async def send_clear_reply(msg_text):
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(msg_text, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg_text, ephemeral=True)
+        except Exception:
+            pass
+
     try:
         deleted = await channel.purge(limit=amount, check=check_target, bulk=True)
         actual = len(deleted)
 
         if actual == 0:
-            await interaction.followup.send(
-                f"⚠️ No messages found{f' from {target.mention}' if target else ''} to delete.",
-                ephemeral=True
-            )
+            await send_clear_reply(f"⚠️ No messages found{f' from {target.mention}' if target else ''} to delete.")
             return
 
-        await interaction.followup.send(
+        await send_clear_reply(
             f"🧹 Successfully deleted **{actual}** message(s)"
-            f"{f' from {target.mention}' if target else ''} in {channel.mention}.",
-            ephemeral=True
+            f"{f' from {target.mention}' if target else ''} in {channel.mention}."
         )
 
     except discord.Forbidden:
-        await interaction.followup.send(
-            "❌ Missing Permissions: Ensure the bot has **Manage Messages** permission in this channel.",
-            ephemeral=True
-        )
+        await send_clear_reply("❌ Missing Permissions: Ensure the bot has **Manage Messages** permission in this channel.")
     except discord.HTTPException as e:
-        await interaction.followup.send(f"❌ Failed to delete messages: {e}", ephemeral=True)
+        await send_clear_reply(f"❌ Failed to delete messages: {e}")
     except Exception as e:
-        await interaction.followup.send(f"❌ Unexpected error while deleting messages: {e}", ephemeral=True)
+        await send_clear_reply(f"❌ Unexpected error while deleting messages: {e}")
 
 # ==============================================================================
 # SERVER INFO — Full server dashboard with all statistics
@@ -1396,22 +1401,6 @@ async def cmd_slap(interaction: discord.Interaction, target: discord.Member, sou
     source="The member who is chasing (defaults to you)"
 )
 async def cmd_chase(interaction: discord.Interaction, target: discord.Member, source: discord.Member = None):
-    actor = source if source is not None else interaction.user
-    content, embed = make_action_payload("chase", actor, target)
-    try:
-        await interaction.response.send_message(content=content, embed=embed)
-    except (discord.NotFound, discord.HTTPException):
-        try:
-            await interaction.channel.send(content=content, embed=embed)
-        except Exception:
-            pass
-
-@bot.tree.command(name="chasing", description="Chase down another server member with a looping animated GIF")
-@app_commands.describe(
-    target="The member you want to chase",
-    source="The member who is chasing (defaults to you)"
-)
-async def cmd_chasing(interaction: discord.Interaction, target: discord.Member, source: discord.Member = None):
     actor = source if source is not None else interaction.user
     content, embed = make_action_payload("chase", actor, target)
     try:
@@ -2168,6 +2157,33 @@ def build_player_embed(guild_id: int) -> discord.Embed:
     embed.set_footer(text="Hellfire Sound System • Click 🔍 Search or buttons below")
     return embed
 
+if not discord.opus.is_loaded():
+    try:
+        discord.opus._load_default()
+    except Exception as e:
+        print(f"[Opus Load Warning] {e}", flush=True)
+
+def start_playback(guild_id: int, track: Track, vc: discord.VoiceClient):
+    state = get_music_state(guild_id)
+    state.current_track = track
+    state.played_history.append(track.title)
+    if len(state.played_history) > 25:
+        state.played_history.pop(0)
+
+    ffmpeg_bin = get_ffmpeg_path()
+    raw_source = discord.FFmpegPCMAudio(track.audio_path, executable=ffmpeg_bin, options="-vn")
+    pcm_source = discord.PCMVolumeTransformer(raw_source, volume=state.volume / 100.0)
+
+    def _after(e):
+        if e:
+            print(f"[Playback Callback Error] {e}", flush=True)
+        bot.loop.call_soon_threadsafe(lambda: asyncio.create_task(play_next_track(guild_id)))
+
+    state.is_advancing = False
+    if vc.is_playing() or vc.is_paused():
+        vc.stop()
+    vc.play(pcm_source, after=_after)
+
 class MusicSearchModal(discord.ui.Modal, title="🔍 Search & Play Music"):
     song_input = discord.ui.TextInput(
         label="Song Name or YouTube Link",
@@ -2240,7 +2256,7 @@ class MusicSearchModal(discord.ui.Modal, title="🔍 Search & Play Music"):
             is_autoplay=False
         )
 
-        if vc.is_playing():
+        if vc.is_playing() or vc.is_paused():
             state.queue.append(new_track)
             try:
                 await interaction.followup.send(f"📥 Added to queue: **[{display_title}]({source_url or ''})** (`#{len(state.queue)}`)", ephemeral=True)
@@ -2248,26 +2264,20 @@ class MusicSearchModal(discord.ui.Modal, title="🔍 Search & Play Music"):
                 pass
             await update_player_card(self.guild_id)
         else:
-            state.current_track = new_track
-            state.played_history.append(new_track.title)
-            if len(state.played_history) > 25:
-                state.played_history.pop(0)
-
-            ffmpeg_bin = get_ffmpeg_path()
-            raw_source = discord.FFmpegPCMAudio(audio_path, executable=ffmpeg_bin)
-            pcm_source = discord.PCMVolumeTransformer(raw_source, volume=state.volume / 100.0)
-
-            def _after(e):
-                if e:
-                    print(f"[Playback Callback Error] {e}", flush=True)
-                bot.loop.call_soon_threadsafe(lambda: asyncio.create_task(play_next_track(self.guild_id)))
-
-            vc.play(pcm_source, after=_after)
             try:
-                await interaction.followup.send(f"▶️ Now playing: **[{display_title}]({source_url or ''})**", ephemeral=True)
-            except Exception:
-                pass
-            await update_player_card(self.guild_id)
+                start_playback(self.guild_id, new_track, vc)
+                try:
+                    await interaction.followup.send(f"▶️ Now playing: **[{display_title}]({source_url or ''})**", ephemeral=True)
+                except Exception:
+                    pass
+                await update_player_card(self.guild_id)
+            except discord.ClientException:
+                state.queue.append(new_track)
+                try:
+                    await interaction.followup.send(f"📥 Added to queue: **[{display_title}]({source_url or ''})** (`#{len(state.queue)}`)", ephemeral=True)
+                except Exception:
+                    pass
+                await update_player_card(self.guild_id)
 
 class MusicControllerView(discord.ui.View):
     def __init__(self, guild_id: int):
@@ -2355,73 +2365,63 @@ async def play_next_track(guild_id: int):
         return
     state.is_advancing = True
 
-    guild = bot.get_guild(guild_id)
-    if not guild:
-        state.is_advancing = False
-        return
-
-    vc = guild.voice_client
-    if not vc or not vc.is_connected():
-        state.current_track = None
-        state.is_advancing = False
-        return
-
-    next_track = None
-    if state.queue:
-        next_track = state.queue.pop(0)
-    elif state.autoplay and state.current_track:
-        last_title = state.current_track.title
-        try:
-            yt_data = await asyncio.to_thread(fetch_similar_youtube_song, last_title, state.played_history)
-            if yt_data:
-                next_track = Track(
-                    title=yt_data['title'],
-                    audio_path=yt_data['path'],
-                    url=yt_data.get('url'),
-                    requester=None,
-                    is_autoplay=True
-                )
-        except Exception as e:
-            print(f"[Autoplay Error] {e}", flush=True)
-
-    if not next_track:
-        state.current_track = None
-        state.is_advancing = False
-        if state.card_message:
-            try:
-                idle_embed = discord.Embed(
-                    title="🎵 Music Queue Finished",
-                    description="Queue is empty and no more tracks to autoplay. Use `/play` to start playing music!",
-                    color=discord.Color.blue()
-                )
-                await state.card_message.edit(embed=idle_embed, view=None)
-            except Exception:
-                pass
-        return
-
-    state.current_track = next_track
-    state.played_history.append(next_track.title)
-    if len(state.played_history) > 25:
-        state.played_history.pop(0)
-
     try:
-        ffmpeg_bin = get_ffmpeg_path()
-        raw_source = discord.FFmpegPCMAudio(next_track.audio_path, executable=ffmpeg_bin)
-        pcm_source = discord.PCMVolumeTransformer(raw_source, volume=state.volume / 100.0)
+        guild = bot.get_guild(guild_id)
+        if not guild:
+            return
 
-        def _after(e):
-            if e:
-                print(f"[Playback Callback Error] {e}", flush=True)
-            bot.loop.call_soon_threadsafe(lambda: asyncio.create_task(play_next_track(guild_id)))
+        vc = guild.voice_client
+        if not vc or not vc.is_connected():
+            state.current_track = None
+            return
 
-        state.is_advancing = False
-        vc.play(pcm_source, after=_after)
+        next_track = None
+        if state.queue:
+            next_track = state.queue.pop(0)
+        elif state.autoplay and state.current_track:
+            last_title = state.current_track.title
+            try:
+                yt_data = await asyncio.to_thread(fetch_similar_youtube_song, last_title, state.played_history)
+                # Ensure /stop was not clicked while fetching
+                if yt_data and (state.current_track is not None or state.queue):
+                    next_track = Track(
+                        title=yt_data['title'],
+                        audio_path=yt_data['path'],
+                        url=yt_data.get('url'),
+                        requester=None,
+                        is_autoplay=True
+                    )
+            except Exception as e:
+                print(f"[Autoplay Error] {e}", flush=True)
 
+        if not next_track:
+            state.current_track = None
+            if state.card_message:
+                try:
+                    idle_embed = discord.Embed(
+                        title="🎧 𝐇𝐄𝐋𝐋𝐅𝐈𝐑𝐄 𝐀𝐔𝐃𝐈𝐎 𝐒𝐓𝐀𝐓𝐈𝐎𝐍",
+                        description="```yaml\nStatus: STANDBY (Queue completed)\nQueue:  Empty\n```\nClick **🔍 Search** below or use `/play` to drop a track!",
+                        color=0x2B2D31
+                    )
+                    idle_embed.set_footer(text="Hellfire Club • Music Engine v2.0")
+                    await state.card_message.edit(embed=idle_embed, view=MusicControllerView(guild_id))
+                except Exception:
+                    pass
+            return
+
+        if not os.path.exists(next_track.audio_path):
+            print(f"[Playback Error] File not found: {next_track.audio_path}", flush=True)
+            state.is_advancing = False
+            await play_next_track(guild_id)
+            return
+
+        start_playback(guild_id, next_track, vc)
         await update_player_card(guild_id)
     except Exception as e:
         print(f"[Playback Start Error] {e}", flush=True)
+        await update_player_card(guild_id)
+    finally:
         state.is_advancing = False
-        await play_next_track(guild_id)
 
 async def update_player_card(guild_id: int):
     state = get_music_state(guild_id)
@@ -2561,7 +2561,7 @@ async def play_audio(
     )
 
     # If audio is already playing, add to queue!
-    if vc.is_playing():
+    if vc.is_playing() or vc.is_paused():
         state.queue.append(new_track)
         queue_pos = len(state.queue)
         queue_embed = discord.Embed(
@@ -2571,40 +2571,22 @@ async def play_audio(
         )
         queue_embed.add_field(name="Position in Queue", value=f"#{queue_pos}", inline=True)
         queue_embed.add_field(name="Requested By", value=interaction.user.mention, inline=True)
-        queue_embed.set_footer(text="Use /skip to advance to the next song or use the player card buttons")
+        queue_embed.set_footer(text="Use the controller card buttons to control playback")
         await send_play_response(embed=queue_embed)
-
-        # Refresh existing player card to show the updated queue count
-        if state.card_message:
-            try:
-                await state.card_message.edit(embed=build_player_embed(interaction.guild_id), view=MusicControllerView(interaction.guild_id))
-            except Exception:
-                pass
+        await update_player_card(interaction.guild_id)
         return
 
     # Not currently playing: start playback immediately
-    state.current_track = new_track
-    state.played_history.append(new_track.title)
-    if len(state.played_history) > 25:
-        state.played_history.pop(0)
-
     try:
-        ffmpeg_bin = get_ffmpeg_path()
-        raw_source = discord.FFmpegPCMAudio(audio_path, executable=ffmpeg_bin)
-        pcm_source = discord.PCMVolumeTransformer(raw_source, volume=state.volume / 100.0)
-
-        def _after(e):
-            if e:
-                print(f"[Playback Callback Error] {e}", flush=True)
-            bot.loop.call_soon_threadsafe(lambda: asyncio.create_task(play_next_track(interaction.guild_id)))
-
-        vc.play(pcm_source, after=_after)
-
+        start_playback(interaction.guild_id, new_track, vc)
         card_embed = build_player_embed(interaction.guild_id)
         card_view = MusicControllerView(interaction.guild_id)
         sent_msg = await send_play_response(embed=card_embed, view=card_view)
         if sent_msg:
             state.card_message = sent_msg
+    except discord.ClientException:
+        state.queue.append(new_track)
+        await update_player_card(interaction.guild_id)
     except Exception as e:
         await send_play_response(f"❌ Failed to play audio: {e}")
 
@@ -2646,22 +2628,6 @@ async def show_queue(interaction: discord.Interaction):
     embed = build_player_embed(guild.id)
     view = MusicControllerView(guild.id)
     await interaction.response.send_message(embed=embed, view=view)
-
-@bot.tree.command(name="autoplay", description="Toggle smart autoplay on or off")
-async def toggle_autoplay_cmd(interaction: discord.Interaction):
-    guild = interaction.guild
-    if not guild:
-        await interaction.response.send_message("❌ This command must be used in a server.", ephemeral=True)
-        return
-    state = get_music_state(guild.id)
-    state.autoplay = not state.autoplay
-    status_str = "Enabled ✅ (Will auto-play familiar tracks when queue ends)" if state.autoplay else "Disabled ❌"
-    await interaction.response.send_message(f"🔁 Smart Autoplay is now **{status_str}**.")
-    if state.card_message:
-        try:
-            await state.card_message.edit(embed=build_player_embed(guild.id), view=MusicControllerView(guild.id))
-        except Exception:
-            pass
 
 @bot.tree.command(name="stop", description="Stop voice audio playback and halt any active spam or background tasks")
 async def stop_all(interaction: discord.Interaction):
