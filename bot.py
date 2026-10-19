@@ -262,7 +262,7 @@ async def on_member_join(member: discord.Member):
         print(f"[Auto-Prefix] Error editing nickname for {member.name}: {e}", flush=True)
 
 # ==============================================================================
-# ACTION & ROLEPLAY SYSTEM (kiss, hug, kill, chasing)
+# ACTION & ROLEPLAY SYSTEM (kiss, hug, slap, chase, kill)
 # ==============================================================================
 ACTION_GIFS = {
     "kiss": [
@@ -283,6 +283,17 @@ ACTION_GIFS = {
         "https://media.giphy.com/media/xjlC6nomocZhVXuZgM/giphy.gif",
         "https://media.giphy.com/media/sUIZWMnfd4Mb6/giphy.gif",
     ],
+    "slap": [
+        "https://media.giphy.com/media/Gf3AUz3eBNbTW/giphy.gif",
+        "https://media.giphy.com/media/jEY642MMzxsEH445Wn/giphy.gif",
+        "https://media.giphy.com/media/mEtSQlxqBtWWA/giphy.gif",
+        "https://media.giphy.com/media/Zau0yrl17uzdK/giphy.gif",
+        "https://media.giphy.com/media/xUO4t2gkWBxDi/giphy.gif",
+        "https://media.giphy.com/media/k1uEYPE9777k4/giphy.gif",
+        "https://media.giphy.com/media/AlsIdbROVJ2Lu/giphy.gif",
+        "https://media.giphy.com/media/tX29X2Dx3sAXS/giphy.gif",
+        "https://media.giphy.com/media/3XlEk2RxPS1m8/giphy.gif",
+    ],
     "kill": [
         "https://media.giphy.com/media/4eMkhdpa912i4/giphy.gif",
         "https://media.giphy.com/media/arbHBoiCW55JA8DSLm/giphy.gif",
@@ -300,6 +311,15 @@ ACTION_GIFS = {
         "https://media.giphy.com/media/2bUpP71bbVnZ3x7N24/giphy.gif",
         "https://media.giphy.com/media/3o6Zt9BZNiXLU8Mp9K/giphy.gif",
         "https://media.giphy.com/media/l0MYEqEzwMWFCg8rm/giphy.gif",
+    ],
+    "chase": [
+        "https://media.giphy.com/media/Sux3kjeP2ox1e/giphy.gif",
+        "https://media.giphy.com/media/3o7ZetIsjgoYKlVe9y/giphy.gif",
+        "https://media.giphy.com/media/26n6WywJyh39n1pBu/giphy.gif",
+        "https://media.giphy.com/media/l41JGlWa1xOjJSsV2/giphy.gif",
+        "https://media.giphy.com/media/2bUpP71bbVnZ3x7N24/giphy.gif",
+        "https://media.giphy.com/media/3o6Zt9BZNiXLU8Mp9K/giphy.gif",
+        "https://media.giphy.com/media/l0MYEqEzwMWFCg8rm/giphy.gif",
     ]
 }
 
@@ -307,57 +327,54 @@ ACTION_CONFIG = {
     "kiss": {
         "verb": "kissed",
         "emoji": "💋",
-        "color": discord.Color.magenta(),
-        "text": "{actor} gave {target} a sweet kiss! 💕"
+        "text": "{source} gave {target} a sweet kiss! 💕"
     },
     "hug": {
         "verb": "hugged",
         "emoji": "🤗",
-        "color": discord.Color.gold(),
-        "text": "{actor} gave {target} a warm, loving hug! ✨"
+        "text": "{source} wrapped {target} in a warm, loving hug! ✨"
+    },
+    "slap": {
+        "verb": "slapped",
+        "emoji": "👋",
+        "text": "{source} slapped {target} right across the face! 💥"
     },
     "kill": {
         "verb": "obliterated",
         "emoji": "⚔️",
-        "color": discord.Color.dark_red(),
-        "text": "{actor} ruthlessly obliterated {target}! 💥"
+        "text": "{source} ruthlessly obliterated {target}! 💥"
     },
     "chasing": {
         "verb": "is chasing",
         "emoji": "🏃💨",
-        "color": discord.Color.orange(),
-        "text": "{actor} is chasing after {target} at full speed! 💨"
+        "text": "{source} is chasing after {target} at full speed! 💨"
+    },
+    "chase": {
+        "verb": "is chasing",
+        "emoji": "🏃💨",
+        "text": "{source} is chasing after {target} at full speed! 💨"
     }
 }
 
 ACTION_WORDS = {
     "kiss": "kiss",
     "hug": "hug",
+    "slap": "slap",
     "kill": "kill",
-    "chasing": "chasing",
-    "chase": "chasing"
+    "chasing": "chase",
+    "chase": "chase"
 }
 
-def make_action_embed(action_key: str, actor, target) -> discord.Embed:
+def make_action_message(action_key: str, source, target) -> str:
     cfg = ACTION_CONFIG.get(action_key, ACTION_CONFIG["kiss"])
     gif_list = ACTION_GIFS.get(action_key, ACTION_GIFS["kiss"])
     gif_url = random.choice(gif_list)
 
-    actor_name = actor.display_name if hasattr(actor, "display_name") else getattr(actor, "name", "Someone")
-    target_name = target.display_name if hasattr(target, "display_name") else getattr(target, "name", "Someone")
+    source_mention = source.mention if hasattr(source, "mention") else f"@{getattr(source, 'display_name', getattr(source, 'name', 'Someone'))}"
+    target_mention = target.mention if hasattr(target, "mention") else f"@{getattr(target, 'display_name', getattr(target, 'name', 'Someone'))}"
 
-    actor_mention = actor.mention if hasattr(actor, "mention") else f"@{actor_name}"
-    target_mention = target.mention if hasattr(target, "mention") else f"@{target_name}"
-
-    desc = cfg["text"].format(actor=actor_mention, target=target_mention)
-    embed = discord.Embed(
-        title=f"{cfg['emoji']} {actor_name} {cfg['verb']} {target_name}!",
-        description=desc,
-        color=cfg["color"]
-    )
-    embed.set_image(url=gif_url)
-    embed.set_footer(text="Anime Roleplay Action • Random AI Animation")
-    return embed
+    text_line = cfg["text"].format(source=source_mention, target=target_mention)
+    return f"### {cfg['emoji']} {text_line}\n{gif_url}"
 
 # ==============================================================================
 # 1. AUTO-REACT ON MENTION & AUTOMATED ANTI-SPAM DETECTION
@@ -511,19 +528,19 @@ async def on_message(message: discord.Message):
             if len(message.mentions) >= 2:
                 act_user = message.mentions[0]
                 tgt_user = message.mentions[1]
-                embed = make_action_embed(matched_act, act_user, tgt_user)
+                msg_content = make_action_message(matched_act, act_user, tgt_user)
                 try:
-                    await message.channel.send(embed=embed)
+                    await message.channel.send(content=msg_content)
                 except Exception as e:
-                    print(f"[Action Error] Could not send action embed: {e}", flush=True)
+                    print(f"[Action Error] Could not send action message: {e}", flush=True)
             elif len(message.mentions) == 1:
                 act_user = message.author
                 tgt_user = message.mentions[0]
-                embed = make_action_embed(matched_act, act_user, tgt_user)
+                msg_content = make_action_message(matched_act, act_user, tgt_user)
                 try:
-                    await message.channel.send(embed=embed)
+                    await message.channel.send(content=msg_content)
                 except Exception as e:
-                    print(f"[Action Error] Could not send action embed: {e}", flush=True)
+                    print(f"[Action Error] Could not send action message: {e}", flush=True)
 
     # Check if any mentioned user is in our target_ids for auto-reactions
     target_ids = get_target_user_ids()
@@ -1317,37 +1334,67 @@ async def matchmaker(
     await interaction.response.send_message(embed=embed)
 
 # ==============================================================================
-# ACTION / ROLEPLAY SLASH COMMANDS (/kiss, /hug, /kill, /chasing, /chase)
+# ACTION / ROLEPLAY SLASH COMMANDS (/kiss, /hug, /slap, /chase, /chasing, /kill)
 # ==============================================================================
-@bot.tree.command(name="kiss", description="Kiss another server member with an animated gif")
-@app_commands.describe(target="The member you want to kiss")
-async def cmd_kiss(interaction: discord.Interaction, target: discord.Member):
-    embed = make_action_embed("kiss", interaction.user, target)
-    await interaction.response.send_message(embed=embed)
+@bot.tree.command(name="kiss", description="Kiss another server member with a looping animated GIF")
+@app_commands.describe(
+    target="The member you want to kiss",
+    source="The member who is kissing (defaults to you)"
+)
+async def cmd_kiss(interaction: discord.Interaction, target: discord.Member, source: discord.Member = None):
+    actor = source if source is not None else interaction.user
+    msg = make_action_message("kiss", actor, target)
+    await interaction.response.send_message(content=msg)
 
-@bot.tree.command(name="hug", description="Give another server member a warm hug with an animated gif")
-@app_commands.describe(target="The member you want to hug")
-async def cmd_hug(interaction: discord.Interaction, target: discord.Member):
-    embed = make_action_embed("hug", interaction.user, target)
-    await interaction.response.send_message(embed=embed)
+@bot.tree.command(name="hug", description="Give another server member a warm hug with a looping animated GIF")
+@app_commands.describe(
+    target="The member you want to hug",
+    source="The member who is hugging (defaults to you)"
+)
+async def cmd_hug(interaction: discord.Interaction, target: discord.Member, source: discord.Member = None):
+    actor = source if source is not None else interaction.user
+    msg = make_action_message("hug", actor, target)
+    await interaction.response.send_message(content=msg)
 
-@bot.tree.command(name="kill", description="Obliterate another server member with an anime attack gif")
-@app_commands.describe(target="The member you want to kill")
-async def cmd_kill(interaction: discord.Interaction, target: discord.Member):
-    embed = make_action_embed("kill", interaction.user, target)
-    await interaction.response.send_message(embed=embed)
+@bot.tree.command(name="slap", description="Slap another server member with a looping animated GIF")
+@app_commands.describe(
+    target="The member you want to slap",
+    source="The member who is slapping (defaults to you)"
+)
+async def cmd_slap(interaction: discord.Interaction, target: discord.Member, source: discord.Member = None):
+    actor = source if source is not None else interaction.user
+    msg = make_action_message("slap", actor, target)
+    await interaction.response.send_message(content=msg)
 
-@bot.tree.command(name="chasing", description="Chase down another server member with an animated gif")
-@app_commands.describe(target="The member you want to chase")
-async def cmd_chasing(interaction: discord.Interaction, target: discord.Member):
-    embed = make_action_embed("chasing", interaction.user, target)
-    await interaction.response.send_message(embed=embed)
+@bot.tree.command(name="chase", description="Chase down another server member with a looping animated GIF")
+@app_commands.describe(
+    target="The member you want to chase",
+    source="The member who is chasing (defaults to you)"
+)
+async def cmd_chase(interaction: discord.Interaction, target: discord.Member, source: discord.Member = None):
+    actor = source if source is not None else interaction.user
+    msg = make_action_message("chase", actor, target)
+    await interaction.response.send_message(content=msg)
 
-@bot.tree.command(name="chase", description="Chase down another server member (alias for /chasing)")
-@app_commands.describe(target="The member you want to chase")
-async def cmd_chase(interaction: discord.Interaction, target: discord.Member):
-    embed = make_action_embed("chasing", interaction.user, target)
-    await interaction.response.send_message(embed=embed)
+@bot.tree.command(name="chasing", description="Chase down another server member with a looping animated GIF")
+@app_commands.describe(
+    target="The member you want to chase",
+    source="The member who is chasing (defaults to you)"
+)
+async def cmd_chasing(interaction: discord.Interaction, target: discord.Member, source: discord.Member = None):
+    actor = source if source is not None else interaction.user
+    msg = make_action_message("chase", actor, target)
+    await interaction.response.send_message(content=msg)
+
+@bot.tree.command(name="kill", description="Obliterate another server member with an anime attack GIF")
+@app_commands.describe(
+    target="The member you want to kill",
+    source="The member who is attacking (defaults to you)"
+)
+async def cmd_kill(interaction: discord.Interaction, target: discord.Member, source: discord.Member = None):
+    actor = source if source is not None else interaction.user
+    msg = make_action_message("kill", actor, target)
+    await interaction.response.send_message(content=msg)
 
 # ==============================================================================
 @bot.tree.command(name="vmute", description="Server mute or unmute a member in voice chat")
@@ -1728,6 +1775,47 @@ async def unlock_vc(interaction: discord.Interaction, channel: discord.VoiceChan
         await interaction.response.send_message(f"❌ Failed to unlock voice channel: {e}", ephemeral=True)
 
 
+def find_local_audio(input_str: str) -> tuple:
+    clean = input_str.strip()
+    if not clean:
+        return None, None
+
+    # 1. Exact file match in AUDIO_DIR
+    exact = os.path.join(AUDIO_DIR, clean)
+    if os.path.isfile(exact):
+        return exact, clean
+
+    # 2. Check standard audio extensions in AUDIO_DIR
+    for ext in [".mp3", ".wav", ".m4a", ".ogg", ".flac", ".mp4"]:
+        test_p = os.path.join(AUDIO_DIR, f"{clean}{ext}")
+        if os.path.isfile(test_p):
+            return test_p, f"{clean}{ext}"
+
+    # 3. Case-insensitive or stem match in AUDIO_DIR
+    clean_lower = clean.lower()
+    if os.path.exists(AUDIO_DIR):
+        for f in os.listdir(AUDIO_DIR):
+            f_path = os.path.join(AUDIO_DIR, f)
+            if os.path.isfile(f_path):
+                f_low = f.lower()
+                stem, _ = os.path.splitext(f_low)
+                if f_low == clean_lower or stem == clean_lower:
+                    return f_path, f
+
+    # 4. Check yt_cache directory
+    yt_cache = os.path.join(AUDIO_DIR, "yt_cache")
+    if os.path.exists(yt_cache):
+        for f in os.listdir(yt_cache):
+            f_path = os.path.join(yt_cache, f)
+            if os.path.isfile(f_path):
+                f_low = f.lower()
+                stem, _ = os.path.splitext(f_low)
+                if f_low == clean_lower or stem == clean_lower or f_low.startswith(clean_lower):
+                    return f_path, f
+
+    return None, None
+
+
 def fetch_youtube_audio(query_or_url: str) -> dict:
     import yt_dlp
 
@@ -1740,18 +1828,30 @@ def fetch_youtube_audio(query_or_url: str) -> dict:
         or "youtube.com" in clean_target
         or "youtu.be" in clean_target
     )
-    target = clean_target if is_url else f"ytsearch1:{clean_target}"
+
+    # Recognize 11-char YouTube video ID (e.g. H9KDjW3MV4U) directly as URL
+    if re.match(r'^[a-zA-Z0-9_-]{11}$', clean_target):
+        target = f"https://www.youtube.com/watch?v={clean_target}"
+    elif is_url:
+        target = clean_target
+    else:
+        target = f"ytsearch1:{clean_target}"
 
     ffmpeg_bin = get_ffmpeg_path()
 
     ydl_opts = {
-        'format': 'bestaudio/best',
+        'format': 'bestaudio/best/18/22',
         'outtmpl': os.path.join(yt_cache_dir, '%(id)s.%(ext)s'),
         'ffmpeg_location': ffmpeg_bin,
         'noplaylist': True,
         'quiet': True,
         'no_warnings': True,
         'default_search': 'ytsearch',
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['mweb', 'android', 'ios'],
+            }
+        },
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
@@ -1835,6 +1935,11 @@ def fetch_similar_youtube_song(last_title: str, history: list[str]) -> dict:
         'extract_flat': True,
         'default_search': 'ytsearch',
         'noplaylist': True,
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['mweb', 'android', 'ios'],
+            }
+        },
     }
 
     history_lower = [h.lower() for h in history]
@@ -2079,9 +2184,9 @@ async def update_player_card(guild_id: int):
         except Exception as e:
             print(f"[Player Card Send Error] {e}", flush=True)
 
-@bot.tree.command(name="play", description="Play audio from a YouTube link, video search, or uploaded file")
+@bot.tree.command(name="play", description="Play audio from YouTube, video search, uploaded file, or local audio folder")
 @app_commands.describe(
-    link_or_name="YouTube link (https://...), search terms, or saved audio file name",
+    link_or_name="YouTube link (https://...), search terms, or local audio file name (e.g. 1.mp3)",
     file="Upload an audio file (.mp3, .wav, .m4a, .ogg) to play directly"
 )
 async def play_audio(
@@ -2091,18 +2196,43 @@ async def play_audio(
 ):
     await interaction.response.defer()
 
-    # 1. Connect to voice channel if not already connected
+    # 1. Connect or move to voice channel
+    target_vc = interaction.user.voice.channel if (interaction.user.voice and interaction.user.voice.channel) else None
+    if not target_vc:
+        await interaction.followup.send("❌ You must be in a voice channel (or use `/join`) to play audio.")
+        return
+
     vc = interaction.guild.voice_client
-    if not vc or not vc.is_connected():
-        if interaction.user.voice and interaction.user.voice.channel:
-            target_vc = interaction.user.voice.channel
+    if vc is not None:
+        try:
+            if not vc.is_connected():
+                await vc.disconnect(force=True)
+                vc = await target_vc.connect(reconnect=True, timeout=10.0)
+            elif vc.channel.id != target_vc.id:
+                await vc.move_to(target_vc)
+        except Exception:
             try:
-                vc = await target_vc.connect()
+                await vc.disconnect(force=True)
+            except Exception:
+                pass
+            try:
+                vc = await target_vc.connect(reconnect=True, timeout=10.0)
             except Exception as e:
                 await interaction.followup.send(f"❌ Could not connect to {target_vc.mention}: {e}")
                 return
-        else:
-            await interaction.followup.send("❌ You must be in a voice channel (or use `/join`) to play audio.")
+    else:
+        try:
+            vc = await target_vc.connect(reconnect=True, timeout=10.0)
+        except discord.ClientException:
+            vc = interaction.guild.voice_client
+            if vc and vc.channel.id != target_vc.id:
+                try:
+                    await vc.move_to(target_vc)
+                except Exception as e:
+                    await interaction.followup.send(f"❌ Could not move to {target_vc.mention}: {e}")
+                    return
+        except Exception as e:
+            await interaction.followup.send(f"❌ Could not connect to {target_vc.mention}: {e}")
             return
 
     # 2. Determine audio source
@@ -2119,28 +2249,10 @@ async def play_audio(
 
     elif link_or_name:
         clean_input = link_or_name.strip()
-        is_url = (
-            clean_input.startswith(("http://", "https://", "www."))
-            or "youtube.com" in clean_input
-            or "youtu.be" in clean_input
-        )
-
-        local_found = None
-        if not is_url:
-            candidate = os.path.join(AUDIO_DIR, clean_input)
-            if os.path.exists(candidate) and os.path.isfile(candidate):
-                local_found = candidate
-                display_title = clean_input
-            else:
-                for ext in [".mp3", ".wav", ".m4a", ".ogg", ".flac"]:
-                    test_path = os.path.join(AUDIO_DIR, f"{clean_input}{ext}")
-                    if os.path.exists(test_path) and os.path.isfile(test_path):
-                        local_found = test_path
-                        display_title = f"{clean_input}{ext}"
-                        break
-
-        if local_found:
-            audio_path = local_found
+        local_path, local_name = find_local_audio(clean_input)
+        if local_path:
+            audio_path = local_path
+            display_title = local_name
         else:
             try:
                 yt_info = await asyncio.to_thread(fetch_youtube_audio, clean_input)
@@ -2148,16 +2260,16 @@ async def play_audio(
                 display_title = yt_info['title']
                 source_url = yt_info.get('url')
             except Exception as e:
-                await interaction.followup.send(f"❌ Failed to fetch YouTube audio: {e}")
+                await interaction.followup.send(f"❌ Failed to fetch audio: {e}")
                 return
     else:
-        files = [f for f in os.listdir(AUDIO_DIR) if f.lower().endswith(('.mp3', '.wav', '.m4a', '.ogg', '.flac'))]
+        files = [f for f in os.listdir(AUDIO_DIR) if f.lower().endswith(('.mp3', '.wav', '.m4a', '.ogg', '.flac')) and os.path.isfile(os.path.join(AUDIO_DIR, f))]
         if files:
             chosen = "sample.wav" if "sample.wav" in files else files[0]
             audio_path = os.path.join(AUDIO_DIR, chosen)
             display_title = chosen
         else:
-            await interaction.followup.send("❌ Please provide a YouTube link or search query to play.")
+            await interaction.followup.send("❌ Please provide a YouTube link, video name, or local file name to play.")
             return
 
     if not audio_path or not os.path.exists(audio_path):
@@ -2221,6 +2333,19 @@ async def play_audio(
         state.card_message = sent_msg
     except Exception as e:
         await interaction.followup.send(f"❌ Failed to play audio: {e}")
+
+@play_audio.autocomplete("link_or_name")
+async def play_audio_autocomplete(interaction: discord.Interaction, current: str):
+    choices = []
+    current_lower = current.lower()
+    if os.path.exists(AUDIO_DIR):
+        for f in os.listdir(AUDIO_DIR):
+            if f.lower().endswith(('.mp3', '.wav', '.m4a', '.ogg', '.flac')) and os.path.isfile(os.path.join(AUDIO_DIR, f)):
+                if not current or current_lower in f.lower():
+                    choices.append(app_commands.Choice(name=f"📁 Local Audio: {f}", value=f))
+            if len(choices) >= 20:
+                break
+    return choices[:25]
 
 @bot.tree.command(name="skip", description="Skip the currently playing song in voice chat")
 async def skip_track(interaction: discord.Interaction):
