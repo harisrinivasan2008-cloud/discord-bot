@@ -4,6 +4,8 @@ import json
 import time
 import asyncio
 import traceback
+import random
+import re
 from collections import defaultdict
 import discord
 from discord.ext import commands
@@ -260,6 +262,104 @@ async def on_member_join(member: discord.Member):
         print(f"[Auto-Prefix] Error editing nickname for {member.name}: {e}", flush=True)
 
 # ==============================================================================
+# ACTION & ROLEPLAY SYSTEM (kiss, hug, kill, chasing)
+# ==============================================================================
+ACTION_GIFS = {
+    "kiss": [
+        "https://media.giphy.com/media/G3va31oEEnIkM/giphy.gif",
+        "https://media.giphy.com/media/FqBTvSNjNzeZG/giphy.gif",
+        "https://media.giphy.com/media/nyGFcsP0kAobm/giphy.gif",
+        "https://media.giphy.com/media/bm2O3nXTcKJeU/giphy.gif",
+        "https://media.giphy.com/media/OSq9JVzsacLXG/giphy.gif",
+        "https://media.giphy.com/media/hnNyVPIXgLdle/giphy.gif",
+        "https://media.giphy.com/media/jR22gdcPiOLaE/giphy.gif",
+    ],
+    "hug": [
+        "https://media.giphy.com/media/od5H3PmEG5EVq/giphy.gif",
+        "https://media.giphy.com/media/l2QDM9Jnim1YVjTQA/giphy.gif",
+        "https://media.giphy.com/media/u9BxQbM5bxvwY/giphy.gif",
+        "https://media.giphy.com/media/PHZ7vmgmgZcss/giphy.gif",
+        "https://media.giphy.com/media/VGACXbkf0AeGs/giphy.gif",
+        "https://media.giphy.com/media/xjlC6nomocZhVXuZgM/giphy.gif",
+        "https://media.giphy.com/media/sUIZWMnfd4Mb6/giphy.gif",
+    ],
+    "kill": [
+        "https://media.giphy.com/media/4eMkhdpa912i4/giphy.gif",
+        "https://media.giphy.com/media/arbHBoiCW55JA8DSLm/giphy.gif",
+        "https://media.giphy.com/media/11HeubLHnHgaVG/giphy.gif",
+        "https://media.giphy.com/media/ebITvSXYKNvEc/giphy.gif",
+        "https://media.giphy.com/media/xT39D4GSIcBwuelKTe/giphy.gif",
+        "https://media.giphy.com/media/9r4GF7750wF04iZ8qB/giphy.gif",
+        "https://media.giphy.com/media/okECPQqhxukVC/giphy.gif",
+    ],
+    "chasing": [
+        "https://media.giphy.com/media/Sux3kjeP2ox1e/giphy.gif",
+        "https://media.giphy.com/media/3o7ZetIsjgoYKlVe9y/giphy.gif",
+        "https://media.giphy.com/media/26n6WywJyh39n1pBu/giphy.gif",
+        "https://media.giphy.com/media/l41JGlWa1xOjJSsV2/giphy.gif",
+        "https://media.giphy.com/media/2bUpP71bbVnZ3x7N24/giphy.gif",
+        "https://media.giphy.com/media/3o6Zt9BZNiXLU8Mp9K/giphy.gif",
+        "https://media.giphy.com/media/l0MYEqEzwMWFCg8rm/giphy.gif",
+    ]
+}
+
+ACTION_CONFIG = {
+    "kiss": {
+        "verb": "kissed",
+        "emoji": "💋",
+        "color": discord.Color.magenta(),
+        "text": "{actor} gave {target} a sweet kiss! 💕"
+    },
+    "hug": {
+        "verb": "hugged",
+        "emoji": "🤗",
+        "color": discord.Color.gold(),
+        "text": "{actor} gave {target} a warm, loving hug! ✨"
+    },
+    "kill": {
+        "verb": "obliterated",
+        "emoji": "⚔️",
+        "color": discord.Color.dark_red(),
+        "text": "{actor} ruthlessly obliterated {target}! 💥"
+    },
+    "chasing": {
+        "verb": "is chasing",
+        "emoji": "🏃💨",
+        "color": discord.Color.orange(),
+        "text": "{actor} is chasing after {target} at full speed! 💨"
+    }
+}
+
+ACTION_WORDS = {
+    "kiss": "kiss",
+    "hug": "hug",
+    "kill": "kill",
+    "chasing": "chasing",
+    "chase": "chasing"
+}
+
+def make_action_embed(action_key: str, actor, target) -> discord.Embed:
+    cfg = ACTION_CONFIG.get(action_key, ACTION_CONFIG["kiss"])
+    gif_list = ACTION_GIFS.get(action_key, ACTION_GIFS["kiss"])
+    gif_url = random.choice(gif_list)
+
+    actor_name = actor.display_name if hasattr(actor, "display_name") else getattr(actor, "name", "Someone")
+    target_name = target.display_name if hasattr(target, "display_name") else getattr(target, "name", "Someone")
+
+    actor_mention = actor.mention if hasattr(actor, "mention") else f"@{actor_name}"
+    target_mention = target.mention if hasattr(target, "mention") else f"@{target_name}"
+
+    desc = cfg["text"].format(actor=actor_mention, target=target_mention)
+    embed = discord.Embed(
+        title=f"{cfg['emoji']} {actor_name} {cfg['verb']} {target_name}!",
+        description=desc,
+        color=cfg["color"]
+    )
+    embed.set_image(url=gif_url)
+    embed.set_footer(text="Anime Roleplay Action • Random AI Animation")
+    return embed
+
+# ==============================================================================
 # 1. AUTO-REACT ON MENTION & AUTOMATED ANTI-SPAM DETECTION
 # ==============================================================================
 @bot.event
@@ -397,6 +497,33 @@ async def on_message(message: discord.Message):
                     await message.channel.send(content=message.author.mention, embed=warning_embed)
                 except discord.HTTPException as e:
                     print(f"Failed to send spam warning card: {e}", flush=True)
+
+    # Roleplay / Action Detection in Chat (e.g. "@someone kill @someone2", "hug @someone", etc.)
+    if message.guild and message.mentions and not message.mention_everyone:
+        content_lower = message.content.lower()
+        matched_act = None
+        for word, key in ACTION_WORDS.items():
+            if re.search(rf"\b{word}\b", content_lower):
+                matched_act = key
+                break
+
+        if matched_act:
+            if len(message.mentions) >= 2:
+                act_user = message.mentions[0]
+                tgt_user = message.mentions[1]
+                embed = make_action_embed(matched_act, act_user, tgt_user)
+                try:
+                    await message.channel.send(embed=embed)
+                except Exception as e:
+                    print(f"[Action Error] Could not send action embed: {e}", flush=True)
+            elif len(message.mentions) == 1:
+                act_user = message.author
+                tgt_user = message.mentions[0]
+                embed = make_action_embed(matched_act, act_user, tgt_user)
+                try:
+                    await message.channel.send(embed=embed)
+                except Exception as e:
+                    print(f"[Action Error] Could not send action embed: {e}", flush=True)
 
     # Check if any mentioned user is in our target_ids for auto-reactions
     target_ids = get_target_user_ids()
@@ -1190,6 +1317,39 @@ async def matchmaker(
     await interaction.response.send_message(embed=embed)
 
 # ==============================================================================
+# ACTION / ROLEPLAY SLASH COMMANDS (/kiss, /hug, /kill, /chasing, /chase)
+# ==============================================================================
+@bot.tree.command(name="kiss", description="Kiss another server member with an animated gif")
+@app_commands.describe(target="The member you want to kiss")
+async def cmd_kiss(interaction: discord.Interaction, target: discord.Member):
+    embed = make_action_embed("kiss", interaction.user, target)
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="hug", description="Give another server member a warm hug with an animated gif")
+@app_commands.describe(target="The member you want to hug")
+async def cmd_hug(interaction: discord.Interaction, target: discord.Member):
+    embed = make_action_embed("hug", interaction.user, target)
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="kill", description="Obliterate another server member with an anime attack gif")
+@app_commands.describe(target="The member you want to kill")
+async def cmd_kill(interaction: discord.Interaction, target: discord.Member):
+    embed = make_action_embed("kill", interaction.user, target)
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="chasing", description="Chase down another server member with an animated gif")
+@app_commands.describe(target="The member you want to chase")
+async def cmd_chasing(interaction: discord.Interaction, target: discord.Member):
+    embed = make_action_embed("chasing", interaction.user, target)
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="chase", description="Chase down another server member (alias for /chasing)")
+@app_commands.describe(target="The member you want to chase")
+async def cmd_chase(interaction: discord.Interaction, target: discord.Member):
+    embed = make_action_embed("chasing", interaction.user, target)
+    await interaction.response.send_message(embed=embed)
+
+# ==============================================================================
 @bot.tree.command(name="vmute", description="Server mute or unmute a member in voice chat")
 @app_commands.describe(
     member="The member currently in a voice channel",
@@ -1621,29 +1781,315 @@ def fetch_youtube_audio(query_or_url: str) -> dict:
             'url': webpage_url
         }
 
-@bot.tree.command(name="play", description="Play audio from a YouTube link, video search, uploaded file, or saved audio")
+# ==============================================================================
+# MUSIC QUEUE, SMART AUTOPLAY, AND INTERACTIVE CONTROLLER CARD SYSTEM
+# ==============================================================================
+class Track:
+    def __init__(self, title: str, audio_path: str, url: str = None, requester: discord.Member = None, is_autoplay: bool = False):
+        self.title = title
+        self.audio_path = audio_path
+        self.url = url
+        self.requester = requester
+        self.is_autoplay = is_autoplay
+
+class GuildMusicState:
+    def __init__(self, guild_id: int):
+        self.guild_id = guild_id
+        self.queue: list[Track] = []
+        self.current_track: Track = None
+        self.volume: int = 100
+        self.autoplay: bool = True  # Autoplay enabled by default
+        self.played_history: list[str] = []
+        self.text_channel: discord.TextChannel = None
+        self.card_message: discord.Message = None
+        self.is_advancing: bool = False
+
+guild_music_states: dict[int, GuildMusicState] = {}
+
+def get_music_state(guild_id: int) -> GuildMusicState:
+    if guild_id not in guild_music_states:
+        guild_music_states[guild_id] = GuildMusicState(guild_id)
+    return guild_music_states[guild_id]
+
+def make_volume_bar(volume: int) -> str:
+    blocks = 10
+    clamped = max(0, min(volume, 200))
+    filled = int(round((clamped / 200.0) * blocks))
+    bar = "█" * filled + "░" * (blocks - filled)
+    return f"`[{bar}]` **{volume}%**"
+
+def clean_song_title(title: str) -> str:
+    cleaned = re.sub(r'(?i)\(?(official\s*(music\s*)?video|audio|lyrics|hd|4k|visualizer|remastered|explicit)\)?', '', title)
+    cleaned = re.sub(r'\[.*?\]|\(.*?\)', '', cleaned)
+    return ' '.join(cleaned.split())
+
+def fetch_similar_youtube_song(last_title: str, history: list[str]) -> dict:
+    import yt_dlp
+    cleaned = clean_song_title(last_title)
+    if not cleaned:
+        cleaned = last_title
+    search_query = f"{cleaned} similar music"
+
+    ydl_opts = {
+        'quiet': True,
+        'extract_flat': True,
+        'default_search': 'ytsearch',
+        'noplaylist': True,
+    }
+
+    history_lower = [h.lower() for h in history]
+    last_title_lower = last_title.lower()
+
+    found_url = None
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        try:
+            res = ydl.extract_info(f"ytsearch8:{search_query}", download=False)
+            for e in res.get('entries', []):
+                t = e.get('title', '')
+                u = e.get('url') or e.get('webpage_url')
+                if not u:
+                    continue
+                t_low = t.lower()
+                if t_low != last_title_lower and t_low not in history_lower:
+                    found_url = u if u.startswith(('http://', 'https://')) else f"https://www.youtube.com/watch?v={u}"
+                    break
+        except Exception as e:
+            print(f"[Autoplay Search Warning] {e}", flush=True)
+
+    if not found_url:
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                res = ydl.extract_info(f"ytsearch6:{cleaned} music", download=False)
+                for e in res.get('entries', []):
+                    t = e.get('title', '')
+                    u = e.get('url') or e.get('webpage_url')
+                    if u and t.lower() not in history_lower:
+                        found_url = u if u.startswith(('http://', 'https://')) else f"https://www.youtube.com/watch?v={u}"
+                        break
+        except Exception:
+            pass
+
+    if not found_url:
+        return None
+
+    return fetch_youtube_audio(found_url)
+
+def build_player_embed(guild_id: int) -> discord.Embed:
+    state = get_music_state(guild_id)
+    track = state.current_track
+    if not track:
+        embed = discord.Embed(
+            title="🎵 Music Player",
+            description="Nothing is currently playing. Use `/play` to start music!",
+            color=discord.Color.blue()
+        )
+        return embed
+
+    is_auto = track.is_autoplay
+    color = discord.Color.purple() if is_auto else discord.Color.green()
+    status_title = "📻 Smart Autoplay (Playing)" if is_auto else "🎶 Now Playing"
+
+    embed = discord.Embed(
+        title=status_title,
+        description=f"**[{track.title}]({track.url})**" if track.url else f"**{track.title}**",
+        color=color
+    )
+
+    if track.requester:
+        embed.add_field(name="Requested By", value=track.requester.mention, inline=True)
+    else:
+        embed.add_field(name="Source", value="🤖 Smart Autoplay (Familiar Track)", inline=True)
+
+    embed.add_field(name="Volume", value=make_volume_bar(state.volume), inline=True)
+    embed.add_field(name="Autoplay", value="🟢 **ON**" if state.autoplay else "🔴 **OFF**", inline=True)
+
+    # Queue preview
+    if state.queue:
+        queue_lines = []
+        for i, q_track in enumerate(state.queue[:5], 1):
+            req_name = q_track.requester.display_name if q_track.requester else "Autoplay"
+            clean_q_title = q_track.title[:38] + "..." if len(q_track.title) > 40 else q_track.title
+            t_link = f"[{clean_q_title}]({q_track.url})" if q_track.url else clean_q_title
+            queue_lines.append(f"`{i}.` {t_link} • *{req_name}*")
+        if len(state.queue) > 5:
+            queue_lines.append(f"*...and {len(state.queue) - 5} more song(s) in queue*")
+        embed.add_field(name=f"📜 Upcoming Queue ({len(state.queue)})", value="\n".join(queue_lines), inline=False)
+    else:
+        autoplay_note = "Smart Autoplay will find and play a familiar song next." if state.autoplay else "Queue is empty. Use `/play` to add songs."
+        embed.add_field(name="📜 Upcoming Queue (0)", value=f"*{autoplay_note}*", inline=False)
+
+    embed.set_footer(text="Music Controller Card • Use buttons below to control playback")
+    return embed
+
+class MusicControllerView(discord.ui.View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=None)
+        self.guild_id = guild_id
+        state = get_music_state(guild_id)
+        for child in self.children:
+            if getattr(child, "custom_id", "") == "music_autoplay":
+                child.style = discord.ButtonStyle.success if state.autoplay else discord.ButtonStyle.secondary
+                child.label = f"🔁 Autoplay: {'ON' if state.autoplay else 'OFF'}"
+
+    @discord.ui.button(label="🔉 Vol -", style=discord.ButtonStyle.secondary, custom_id="music_vol_down")
+    async def vol_down(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = get_music_state(self.guild_id)
+        state.volume = max(10, state.volume - 20)
+        vc = interaction.guild.voice_client if interaction.guild else None
+        if vc and vc.source and hasattr(vc.source, 'volume'):
+            vc.source.volume = state.volume / 100.0
+        embed = build_player_embed(self.guild_id)
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="⏭️ Skip", style=discord.ButtonStyle.primary, custom_id="music_skip")
+    async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = get_music_state(self.guild_id)
+        vc = interaction.guild.voice_client if interaction.guild else None
+        if vc and vc.is_playing():
+            await interaction.response.send_message("⏭️ Skipped current song!", ephemeral=True)
+            vc.stop()
+        else:
+            await interaction.response.send_message("⚠️ No track is currently playing to skip.", ephemeral=True)
+
+    @discord.ui.button(label="🔊 Vol +", style=discord.ButtonStyle.secondary, custom_id="music_vol_up")
+    async def vol_up(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = get_music_state(self.guild_id)
+        state.volume = min(200, state.volume + 20)
+        vc = interaction.guild.voice_client if interaction.guild else None
+        if vc and vc.source and hasattr(vc.source, 'volume'):
+            vc.source.volume = state.volume / 100.0
+        embed = build_player_embed(self.guild_id)
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="🔁 Autoplay: ON", style=discord.ButtonStyle.success, custom_id="music_autoplay")
+    async def toggle_autoplay(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = get_music_state(self.guild_id)
+        state.autoplay = not state.autoplay
+        button.style = discord.ButtonStyle.success if state.autoplay else discord.ButtonStyle.secondary
+        button.label = f"🔁 Autoplay: {'ON' if state.autoplay else 'OFF'}"
+        embed = build_player_embed(self.guild_id)
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="⏹️ Stop", style=discord.ButtonStyle.danger, custom_id="music_stop")
+    async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = get_music_state(self.guild_id)
+        state.queue.clear()
+        state.current_track = None
+        vc = interaction.guild.voice_client if interaction.guild else None
+        if vc and vc.is_playing():
+            vc.stop()
+        stop_embed = discord.Embed(
+            title="⏹️ Music Playback Stopped",
+            description=f"Playback halted and queue cleared by {interaction.user.mention}.",
+            color=discord.Color.red()
+        )
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(embed=stop_embed, view=self)
+
+async def play_next_track(guild_id: int):
+    state = get_music_state(guild_id)
+    if state.is_advancing:
+        return
+    state.is_advancing = True
+
+    guild = bot.get_guild(guild_id)
+    if not guild:
+        state.is_advancing = False
+        return
+
+    vc = guild.voice_client
+    if not vc or not vc.is_connected():
+        state.current_track = None
+        state.is_advancing = False
+        return
+
+    next_track = None
+    if state.queue:
+        next_track = state.queue.pop(0)
+    elif state.autoplay and state.current_track:
+        last_title = state.current_track.title
+        try:
+            yt_data = await asyncio.to_thread(fetch_similar_youtube_song, last_title, state.played_history)
+            if yt_data:
+                next_track = Track(
+                    title=yt_data['title'],
+                    audio_path=yt_data['path'],
+                    url=yt_data.get('url'),
+                    requester=None,
+                    is_autoplay=True
+                )
+        except Exception as e:
+            print(f"[Autoplay Error] {e}", flush=True)
+
+    if not next_track:
+        state.current_track = None
+        state.is_advancing = False
+        if state.card_message:
+            try:
+                idle_embed = discord.Embed(
+                    title="🎵 Music Queue Finished",
+                    description="Queue is empty and no more tracks to autoplay. Use `/play` to start playing music!",
+                    color=discord.Color.blue()
+                )
+                await state.card_message.edit(embed=idle_embed, view=None)
+            except Exception:
+                pass
+        return
+
+    state.current_track = next_track
+    state.played_history.append(next_track.title)
+    if len(state.played_history) > 25:
+        state.played_history.pop(0)
+
+    try:
+        ffmpeg_bin = get_ffmpeg_path()
+        raw_source = discord.FFmpegPCMAudio(next_track.audio_path, executable=ffmpeg_bin)
+        pcm_source = discord.PCMVolumeTransformer(raw_source, volume=state.volume / 100.0)
+
+        def _after(e):
+            if e:
+                print(f"[Playback Callback Error] {e}", flush=True)
+            bot.loop.call_soon_threadsafe(lambda: asyncio.create_task(play_next_track(guild_id)))
+
+        state.is_advancing = False
+        vc.play(pcm_source, after=_after)
+
+        await update_player_card(guild_id)
+    except Exception as e:
+        print(f"[Playback Start Error] {e}", flush=True)
+        state.is_advancing = False
+        await play_next_track(guild_id)
+
+async def update_player_card(guild_id: int):
+    state = get_music_state(guild_id)
+    embed = build_player_embed(guild_id)
+    view = MusicControllerView(guild_id)
+    if state.card_message:
+        try:
+            await state.card_message.edit(embed=embed, view=view)
+            return
+        except (discord.NotFound, discord.HTTPException):
+            state.card_message = None
+
+    if state.text_channel:
+        try:
+            msg = await state.text_channel.send(embed=embed, view=view)
+            state.card_message = msg
+        except Exception as e:
+            print(f"[Player Card Send Error] {e}", flush=True)
+
+@bot.tree.command(name="play", description="Play audio from a YouTube link, video search, or uploaded file")
 @app_commands.describe(
     link_or_name="YouTube link (https://...), search terms, or saved audio file name",
-    file="Upload an audio file (.mp3, .wav, .m4a, .ogg) to play directly",
-    volume="Volume level from 1 to 1000 (default: 100, 1000 is 10x max amplification)",
-    gain="Audio gain in dB from 0 to 24 (default: 0 dB, max: 24 dB)",
-    bass="Bass boost in dB from 0 to 24 (default: 0 dB, max: 24 dB)"
+    file="Upload an audio file (.mp3, .wav, .m4a, .ogg) to play directly"
 )
-@check_bot_admin()
 async def play_audio(
     interaction: discord.Interaction,
     link_or_name: str = None,
-    file: discord.Attachment = None,
-    volume: int = 100,
-    gain: int = 0,
-    bass: int = 0
+    file: discord.Attachment = None
 ):
     await interaction.response.defer()
-
-    # Clamp parameters to safe boundaries
-    volume = max(1, min(volume, 1000))
-    gain = max(0, min(gain, 24))
-    bass = max(0, min(bass, 24))
 
     # 1. Connect to voice channel if not already connected
     vc = interaction.guild.voice_client
@@ -1659,7 +2105,7 @@ async def play_audio(
             await interaction.followup.send("❌ You must be in a voice channel (or use `/join`) to play audio.")
             return
 
-    # 2. Determine audio source to play
+    # 2. Determine audio source
     audio_path = None
     display_title = ""
     source_url = None
@@ -1696,7 +2142,6 @@ async def play_audio(
         if local_found:
             audio_path = local_found
         else:
-            # YouTube Link or Search Query
             try:
                 yt_info = await asyncio.to_thread(fetch_youtube_audio, clean_input)
                 audio_path = yt_info['path']
@@ -1705,70 +2150,119 @@ async def play_audio(
             except Exception as e:
                 await interaction.followup.send(f"❌ Failed to fetch YouTube audio: {e}")
                 return
-
     else:
-        # Default: pick any audio in audio/ folder
         files = [f for f in os.listdir(AUDIO_DIR) if f.lower().endswith(('.mp3', '.wav', '.m4a', '.ogg', '.flac'))]
         if files:
             chosen = "sample.wav" if "sample.wav" in files else files[0]
             audio_path = os.path.join(AUDIO_DIR, chosen)
             display_title = chosen
         else:
-            await interaction.followup.send("❌ Please provide a YouTube link or upload an audio file to play.")
+            await interaction.followup.send("❌ Please provide a YouTube link or search query to play.")
             return
 
-    # 3. Verify file exists
     if not audio_path or not os.path.exists(audio_path):
         await interaction.followup.send("❌ Audio file could not be prepared for playback.")
         return
 
-    # 4. Stop current playback if active
+    state = get_music_state(interaction.guild_id)
+    state.text_channel = interaction.channel
+
+    new_track = Track(
+        title=display_title,
+        audio_path=audio_path,
+        url=source_url,
+        requester=interaction.user,
+        is_autoplay=False
+    )
+
+    # If audio is already playing, add to queue!
     if vc.is_playing():
-        vc.stop()
+        state.queue.append(new_track)
+        queue_pos = len(state.queue)
+        queue_embed = discord.Embed(
+            title="📥 Added to Queue",
+            description=f"**[{new_track.title}]({new_track.url})**" if new_track.url else f"**{new_track.title}**",
+            color=discord.Color.blue()
+        )
+        queue_embed.add_field(name="Position in Queue", value=f"#{queue_pos}", inline=True)
+        queue_embed.add_field(name="Requested By", value=interaction.user.mention, inline=True)
+        queue_embed.set_footer(text="Use /skip to advance to the next song or use the player card buttons")
+        await interaction.followup.send(embed=queue_embed)
 
-    # 5. Construct FFmpeg Audio Filters (Volume, Gain, Bass Boost)
-    filters = []
-    if volume != 100:
-        vol_multiplier = volume / 100.0
-        filters.append(f"volume={vol_multiplier:.2f}")
+        # Refresh existing player card to show the updated queue count
+        if state.card_message:
+            try:
+                await state.card_message.edit(embed=build_player_embed(interaction.guild_id), view=MusicControllerView(interaction.guild_id))
+            except Exception:
+                pass
+        return
 
-    if bass > 0:
-        filters.append(f"bass=g={bass}:f=100")
+    # Not currently playing: start playback immediately
+    state.current_track = new_track
+    state.played_history.append(new_track.title)
+    if len(state.played_history) > 25:
+        state.played_history.pop(0)
 
-    if gain > 0:
-        filters.append(f"volume={gain}dB")
-
-    ffmpeg_opts = f'-filter:a "{",".join(filters)}"' if filters else None
-
-    # 6. Play audio via FFmpeg
     try:
         ffmpeg_bin = get_ffmpeg_path()
-        if ffmpeg_opts:
-            audio_source = discord.FFmpegPCMAudio(audio_path, executable=ffmpeg_bin, options=ffmpeg_opts)
-        else:
-            audio_source = discord.FFmpegPCMAudio(audio_path, executable=ffmpeg_bin)
+        raw_source = discord.FFmpegPCMAudio(audio_path, executable=ffmpeg_bin)
+        pcm_source = discord.PCMVolumeTransformer(raw_source, volume=state.volume / 100.0)
 
-        vc.play(audio_source)
+        def _after(e):
+            if e:
+                print(f"[Playback Callback Error] {e}", flush=True)
+            bot.loop.call_soon_threadsafe(lambda: asyncio.create_task(play_next_track(interaction.guild_id)))
 
-        settings_info = [f"🔊 Volume: **{volume}%**"]
-        if gain > 0:
-            settings_info.append(f"⚡ Gain: **+{gain}dB**")
-        if bass > 0:
-            settings_info.append(f"🎛️ Bass: **+{bass}dB**")
+        vc.play(pcm_source, after=_after)
 
-        embed = discord.Embed(
-            title="🎶 Now Playing",
-            description=f"Playing **`{display_title}`** in {vc.channel.mention}",
-            color=discord.Color.green()
-        )
-        if source_url:
-            embed.add_field(name="Source", value=f"[Watch on YouTube]({source_url})", inline=False)
-        embed.add_field(name="Audio Settings", value=" • ".join(settings_info), inline=False)
-        embed.set_footer(text=f"Requested by {interaction.user.display_name}")
-
-        await interaction.followup.send(embed=embed)
+        card_embed = build_player_embed(interaction.guild_id)
+        card_view = MusicControllerView(interaction.guild_id)
+        sent_msg = await interaction.followup.send(embed=card_embed, view=card_view)
+        state.card_message = sent_msg
     except Exception as e:
         await interaction.followup.send(f"❌ Failed to play audio: {e}")
+
+@bot.tree.command(name="skip", description="Skip the currently playing song in voice chat")
+async def skip_track(interaction: discord.Interaction):
+    guild = interaction.guild
+    if not guild or not guild.voice_client:
+        await interaction.response.send_message("❌ I am not connected to any voice channel in this server.", ephemeral=True)
+        return
+    vc = guild.voice_client
+    if not vc.is_playing():
+        await interaction.response.send_message("⚠️ There is no song currently playing to skip.", ephemeral=True)
+        return
+
+    state = get_music_state(guild.id)
+    current_title = state.current_track.title if state.current_track else "Current track"
+    vc.stop()
+    await interaction.response.send_message(f"⏭️ Skipped **`{current_title}`**!")
+
+@bot.tree.command(name="queue", description="Display the current music queue and upcoming songs")
+async def show_queue(interaction: discord.Interaction):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("❌ This command must be used in a server.", ephemeral=True)
+        return
+    embed = build_player_embed(guild.id)
+    view = MusicControllerView(guild.id)
+    await interaction.response.send_message(embed=embed, view=view)
+
+@bot.tree.command(name="autoplay", description="Toggle smart autoplay on or off")
+async def toggle_autoplay_cmd(interaction: discord.Interaction):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("❌ This command must be used in a server.", ephemeral=True)
+        return
+    state = get_music_state(guild.id)
+    state.autoplay = not state.autoplay
+    status_str = "Enabled ✅ (Will auto-play familiar tracks when queue ends)" if state.autoplay else "Disabled ❌"
+    await interaction.response.send_message(f"🔁 Smart Autoplay is now **{status_str}**.")
+    if state.card_message:
+        try:
+            await state.card_message.edit(embed=build_player_embed(guild.id), view=MusicControllerView(guild.id))
+        except Exception:
+            pass
 
 @bot.tree.command(name="stop", description="Stop voice audio playback and halt any active spam or background tasks")
 async def stop_all(interaction: discord.Interaction):
@@ -1783,11 +2277,25 @@ async def stop_all(interaction: discord.Interaction):
     guild_id = interaction.guild_id if interaction.guild else 0
     stopped_actions = []
 
-    # 1. Stop voice audio playback
+    # 1. Stop voice audio playback and clear queue
+    state = get_music_state(guild_id)
+    state.queue.clear()
+    state.current_track = None
+    if state.card_message:
+        try:
+            stop_embed = discord.Embed(
+                title="⏹️ Music Playback Stopped",
+                description=f"Playback stopped and queue cleared by {interaction.user.mention}.",
+                color=discord.Color.red()
+            )
+            await state.card_message.edit(embed=stop_embed, view=None)
+        except Exception:
+            pass
+
     vc = interaction.guild.voice_client if interaction.guild else None
     if vc and vc.is_connected() and vc.is_playing():
         vc.stop()
-        stopped_actions.append(f"⏹️ **Audio Playback**: Stopped playing in {vc.channel.mention}")
+        stopped_actions.append(f"⏹️ **Audio Playback**: Stopped playing in {vc.channel.mention} and cleared queue")
 
     # 2. Halt active message spamming
     if active_spam_count.get(guild_id, 0) > 0 or not stop_spam_flag.get(guild_id, True):
