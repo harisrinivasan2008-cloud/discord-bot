@@ -1879,8 +1879,9 @@ def fetch_youtube_audio(query_or_url: str) -> dict:
 
     clean_target = query_or_url.strip()
     video_id = get_youtube_video_id(clean_target)
+    resolved_title = None
 
-    # 1. Instant Cache Check: If already downloaded, return immediately
+    # 1. Instant Cache Check: If direct video ID or URL with video ID is already downloaded
     if video_id:
         cache_file = os.path.join(yt_cache_dir, f"{video_id}.mp3")
         if os.path.exists(cache_file) and os.path.getsize(cache_file) > 1000:
@@ -1896,7 +1897,39 @@ def fetch_youtube_audio(query_or_url: str) -> dict:
         or "youtube.com" in clean_target
         or "youtu.be" in clean_target
     )
+
+    # 3. For search queries (e.g. "aaluma doluma"), resolve quickly via flat search to get ID & check cache
+    if not is_url and not video_id:
+        flat_opts = {
+            'quiet': True,
+            'extract_flat': True,
+            'default_search': 'ytsearch',
+            'noplaylist': True,
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['android'],
+                }
+            }
+        }
+        try:
+            with yt_dlp.YoutubeDL(flat_opts) as ydl:
+                search_res = ydl.extract_info(f"ytsearch1:{clean_target}", download=False)
+                if 'entries' in search_res and search_res['entries']:
+                    first_entry = search_res['entries'][0]
+                    video_id = first_entry.get('id')
+                    resolved_title = first_entry.get('title')
+        except Exception as e:
+            print(f"[Search Resolution Warning] {e}", flush=True)
+
+    # 4. If video_id is now known, check instant cache again before downloading
     if video_id:
+        cache_file = os.path.join(yt_cache_dir, f"{video_id}.mp3")
+        if os.path.exists(cache_file) and os.path.getsize(cache_file) > 1000:
+            return {
+                'path': cache_file,
+                'title': resolved_title or f"YouTube Track ({video_id})",
+                'url': f"https://www.youtube.com/watch?v={video_id}"
+            }
         target = f"https://www.youtube.com/watch?v={video_id}"
     elif is_url:
         target = clean_target
@@ -1905,11 +1938,11 @@ def fetch_youtube_audio(query_or_url: str) -> dict:
 
     ffmpeg_bin = get_ffmpeg_path()
 
-    # Fallback client combos to bypass bot detection and player response extraction errors
+    # Prioritize mobile/embedded clients that do not trigger bot verification
     client_combos = [
-        ['android', 'ios'],
-        ['mweb', 'android'],
-        ['web', 'android'],
+        ['android'],
+        ['tv_embedded'],
+        ['android_creator'],
     ]
 
     last_error = None
@@ -1941,7 +1974,7 @@ def fetch_youtube_audio(query_or_url: str) -> dict:
                     info = info['entries'][0]
 
                 v_id = info.get('id', video_id or 'audio')
-                title = info.get('title', 'YouTube Video')
+                title = info.get('title', resolved_title or 'YouTube Track')
                 webpage_url = info.get('webpage_url', f"https://www.youtube.com/watch?v={v_id}")
 
                 final_path = os.path.join(yt_cache_dir, f"{v_id}.mp3")
@@ -2020,7 +2053,7 @@ def fetch_similar_youtube_song(last_title: str, history: list[str]) -> dict:
         'noplaylist': True,
         'extractor_args': {
             'youtube': {
-                'player_client': ['mweb', 'android', 'ios'],
+                'player_client': ['android'],
             }
         },
     }
@@ -2067,47 +2100,174 @@ def build_player_embed(guild_id: int) -> discord.Embed:
     track = state.current_track
     if not track:
         embed = discord.Embed(
-            title="🎵 Music Player",
-            description="Nothing is currently playing. Use `/play` to start music!",
-            color=discord.Color.blue()
+            title="🎧 𝐇𝐄𝐋𝐋𝐅𝐈𝐑𝐄 𝐀𝐔𝐃𝐈𝐎 𝐒𝐓𝐀𝐓𝐈𝐎𝐍",
+            description="```yaml\nStatus: STANDBY (Ready for playback)\nQueue:  Empty\n```\nClick **🔍 Search** below or use `/play` to drop a track!",
+            color=0x2B2D31
         )
+        embed.set_footer(text="Hellfire Club • Music Engine v2.0")
         return embed
 
     is_auto = track.is_autoplay
-    color = discord.Color.purple() if is_auto else discord.Color.green()
-    status_title = "📻 Smart Autoplay (Playing)" if is_auto else "🎶 Now Playing"
+    theme_color = 0x9B59B6 if is_auto else 0xED4245
+    status_badge = "🟣 SMART AUTOPLAY" if is_auto else "🔴 LIVE PLAYBACK"
 
     embed = discord.Embed(
-        title=status_title,
-        description=f"**[{track.title}]({track.url})**" if track.url else f"**{track.title}**",
-        color=color
+        color=theme_color,
+        timestamp=discord.utils.utcnow()
     )
 
-    if track.requester:
-        embed.add_field(name="Requested By", value=track.requester.mention, inline=True)
-    else:
-        embed.add_field(name="Source", value="🤖 Smart Autoplay (Familiar Track)", inline=True)
+    embed.set_author(
+        name=f"HELLFIRE JUKEBOX • {status_badge}",
+        icon_url="https://cdn.discordapp.com/emojis/853304564887355412.gif"
+    )
 
-    embed.add_field(name="Volume", value=make_volume_bar(state.volume), inline=True)
-    embed.add_field(name="Autoplay", value="🟢 **ON**" if state.autoplay else "🔴 **OFF**", inline=True)
+    t_url = track.url if track.url else "https://youtube.com"
+    clean_t_title = track.title[:80] + ("..." if len(track.title) > 80 else "")
 
-    # Queue preview
+    embed.description = (
+        f"### 🎵 [{clean_t_title}]({t_url})\n"
+        f"`ılıılı|̲̅l̲̅|̲̅l̲̅|̲̅l̲̅|̲̅|̲̅l̲̅|̲̅l̲̅|̲̅l̲̅|ılıılı`\n"
+    )
+
+    req_text = track.requester.mention if track.requester else "🤖 *Autoplay AI*"
+    source_label = "🌐 YouTube Stream" if track.url else "📁 Local Audio File"
+
+    embed.add_field(name="👤 Requested By", value=req_text, inline=True)
+    embed.add_field(name="📡 Audio Source", value=f"`{source_label}`", inline=True)
+    embed.add_field(name="🔁 Autoplay Mode", value="`🟢 ENABLED`" if state.autoplay else "`⚪ DISABLED`", inline=True)
+
+    vol_pct = state.volume
+    blocks = 10
+    clamped = max(0, min(vol_pct, 200))
+    filled = int(round((clamped / 200.0) * blocks))
+    vol_bar = "█" * filled + "░" * (blocks - filled)
+    embed.add_field(name="🔊 Master Volume", value=f"`[{vol_bar}]` **{vol_pct}%**", inline=False)
+
     if state.queue:
-        queue_lines = []
-        for i, q_track in enumerate(state.queue[:5], 1):
-            req_name = q_track.requester.display_name if q_track.requester else "Autoplay"
-            clean_q_title = q_track.title[:38] + "..." if len(q_track.title) > 40 else q_track.title
-            t_link = f"[{clean_q_title}]({q_track.url})" if q_track.url else clean_q_title
-            queue_lines.append(f"`{i}.` {t_link} • *{req_name}*")
-        if len(state.queue) > 5:
-            queue_lines.append(f"*...and {len(state.queue) - 5} more song(s) in queue*")
-        embed.add_field(name=f"📜 Upcoming Queue ({len(state.queue)})", value="\n".join(queue_lines), inline=False)
+        queue_text_lines = []
+        for i, q_track in enumerate(state.queue[:4], 1):
+            q_req = q_track.requester.display_name if q_track.requester else "Autoplay"
+            q_title_short = q_track.title[:32] + "..." if len(q_track.title) > 35 else q_track.title
+            q_link = f"[{q_title_short}]({q_track.url})" if q_track.url else q_title_short
+            queue_text_lines.append(f"`{i}.` {q_link} `({q_req})`")
+        if len(state.queue) > 4:
+            queue_text_lines.append(f"*...and +{len(state.queue) - 4} more track(s)*")
+        embed.add_field(
+            name=f"📑 Next in Queue ({len(state.queue)})",
+            value="\n".join(queue_text_lines),
+            inline=False
+        )
     else:
-        autoplay_note = "Smart Autoplay will find and play a familiar song next." if state.autoplay else "Queue is empty. Use `/play` to add songs."
-        embed.add_field(name="📜 Upcoming Queue (0)", value=f"*{autoplay_note}*", inline=False)
+        autoplay_status = "Autoplay active: familiar songs will follow automatically." if state.autoplay else "Queue is empty. Click 🔍 Search to add tracks."
+        embed.add_field(
+            name="📑 Next in Queue (0)",
+            value=f"*{autoplay_status}*",
+            inline=False
+        )
 
-    embed.set_footer(text="Music Controller Card • Use buttons below to control playback")
+    embed.set_footer(text="Hellfire Sound System • Click 🔍 Search or buttons below")
     return embed
+
+class MusicSearchModal(discord.ui.Modal, title="🔍 Search & Play Music"):
+    song_input = discord.ui.TextInput(
+        label="Song Name or YouTube Link",
+        placeholder="e.g. Aaluma Doluma, Believer, or https://...",
+        required=True,
+        max_length=200
+    )
+
+    def __init__(self, guild_id: int):
+        super().__init__()
+        self.guild_id = guild_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except Exception:
+            pass
+
+        target_vc = interaction.user.voice.channel if (interaction.user.voice and interaction.user.voice.channel) else None
+        if not target_vc:
+            try:
+                await interaction.followup.send("❌ You must be in a voice channel to search and play music.", ephemeral=True)
+            except Exception:
+                pass
+            return
+
+        vc = interaction.guild.voice_client
+        if not vc:
+            try:
+                vc = await target_vc.connect(reconnect=True, timeout=10.0)
+            except Exception as e:
+                try:
+                    await interaction.followup.send(f"❌ Could not connect to {target_vc.mention}: {e}", ephemeral=True)
+                except Exception:
+                    pass
+                return
+        elif vc.channel != target_vc:
+            try:
+                await vc.move_to(target_vc)
+            except Exception:
+                pass
+
+        clean_query = self.song_input.value.strip()
+        local_path, local_name = find_local_audio(clean_query)
+        if local_path:
+            audio_path = local_path
+            display_title = local_name
+            source_url = None
+        else:
+            try:
+                yt_info = await asyncio.to_thread(fetch_youtube_audio, clean_query)
+                audio_path = yt_info['path']
+                display_title = yt_info['title']
+                source_url = yt_info.get('url')
+            except Exception as e:
+                try:
+                    await interaction.followup.send(f"❌ Failed to fetch audio: {e}", ephemeral=True)
+                except Exception:
+                    pass
+                return
+
+        state = get_music_state(self.guild_id)
+        state.text_channel = interaction.channel
+
+        new_track = Track(
+            title=display_title,
+            audio_path=audio_path,
+            url=source_url,
+            requester=interaction.user,
+            is_autoplay=False
+        )
+
+        if vc.is_playing():
+            state.queue.append(new_track)
+            try:
+                await interaction.followup.send(f"📥 Added to queue: **[{display_title}]({source_url or ''})** (`#{len(state.queue)}`)", ephemeral=True)
+            except Exception:
+                pass
+            await update_player_card(self.guild_id)
+        else:
+            state.current_track = new_track
+            state.played_history.append(new_track.title)
+            if len(state.played_history) > 25:
+                state.played_history.pop(0)
+
+            ffmpeg_bin = get_ffmpeg_path()
+            raw_source = discord.FFmpegPCMAudio(audio_path, executable=ffmpeg_bin)
+            pcm_source = discord.PCMVolumeTransformer(raw_source, volume=state.volume / 100.0)
+
+            def _after(e):
+                if e:
+                    print(f"[Playback Callback Error] {e}", flush=True)
+                bot.loop.call_soon_threadsafe(lambda: asyncio.create_task(play_next_track(self.guild_id)))
+
+            vc.play(pcm_source, after=_after)
+            try:
+                await interaction.followup.send(f"▶️ Now playing: **[{display_title}]({source_url or ''})**", ephemeral=True)
+            except Exception:
+                pass
+            await update_player_card(self.guild_id)
 
 class MusicControllerView(discord.ui.View):
     def __init__(self, guild_id: int):
@@ -2119,7 +2279,7 @@ class MusicControllerView(discord.ui.View):
                 child.style = discord.ButtonStyle.success if state.autoplay else discord.ButtonStyle.secondary
                 child.label = f"🔁 Autoplay: {'ON' if state.autoplay else 'OFF'}"
 
-    @discord.ui.button(label="🔉 Vol -", style=discord.ButtonStyle.secondary, custom_id="music_vol_down")
+    @discord.ui.button(label="🔉 Vol -", style=discord.ButtonStyle.secondary, custom_id="music_vol_down", row=0)
     async def vol_down(self, interaction: discord.Interaction, button: discord.ui.Button):
         state = get_music_state(self.guild_id)
         state.volume = max(10, state.volume - 20)
@@ -2129,7 +2289,7 @@ class MusicControllerView(discord.ui.View):
         embed = build_player_embed(self.guild_id)
         await interaction.response.edit_message(embed=embed, view=self)
 
-    @discord.ui.button(label="⏭️ Skip", style=discord.ButtonStyle.primary, custom_id="music_skip")
+    @discord.ui.button(label="⏭️ Skip", style=discord.ButtonStyle.primary, custom_id="music_skip", row=0)
     async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
         state = get_music_state(self.guild_id)
         vc = interaction.guild.voice_client if interaction.guild else None
@@ -2139,7 +2299,7 @@ class MusicControllerView(discord.ui.View):
         else:
             await interaction.response.send_message("⚠️ No track is currently playing to skip.", ephemeral=True)
 
-    @discord.ui.button(label="🔊 Vol +", style=discord.ButtonStyle.secondary, custom_id="music_vol_up")
+    @discord.ui.button(label="🔊 Vol +", style=discord.ButtonStyle.secondary, custom_id="music_vol_up", row=0)
     async def vol_up(self, interaction: discord.Interaction, button: discord.ui.Button):
         state = get_music_state(self.guild_id)
         state.volume = min(200, state.volume + 20)
@@ -2149,7 +2309,11 @@ class MusicControllerView(discord.ui.View):
         embed = build_player_embed(self.guild_id)
         await interaction.response.edit_message(embed=embed, view=self)
 
-    @discord.ui.button(label="🔁 Autoplay: ON", style=discord.ButtonStyle.success, custom_id="music_autoplay")
+    @discord.ui.button(label="🔍 Search", style=discord.ButtonStyle.success, custom_id="music_search", row=0)
+    async def search_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(MusicSearchModal(self.guild_id))
+
+    @discord.ui.button(label="🔁 Autoplay: ON", style=discord.ButtonStyle.success, custom_id="music_autoplay", row=1)
     async def toggle_autoplay(self, interaction: discord.Interaction, button: discord.ui.Button):
         state = get_music_state(self.guild_id)
         state.autoplay = not state.autoplay
@@ -2158,7 +2322,16 @@ class MusicControllerView(discord.ui.View):
         embed = build_player_embed(self.guild_id)
         await interaction.response.edit_message(embed=embed, view=self)
 
-    @discord.ui.button(label="⏹️ Stop", style=discord.ButtonStyle.danger, custom_id="music_stop")
+    @discord.ui.button(label="📜 Queue", style=discord.ButtonStyle.secondary, custom_id="music_queue", row=1)
+    async def queue_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = get_music_state(self.guild_id)
+        if not state.queue:
+            await interaction.response.send_message("📜 Queue is currently empty.", ephemeral=True)
+            return
+        lines = [f"`{idx}.` {t.title} (by {t.requester.display_name if t.requester else 'Autoplay'})" for idx, t in enumerate(state.queue[:15], 1)]
+        await interaction.response.send_message("### 📜 Upcoming Queue:\n" + "\n".join(lines), ephemeral=True)
+
+    @discord.ui.button(label="⏹️ Stop", style=discord.ButtonStyle.danger, custom_id="music_stop", row=1)
     async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         state = get_music_state(self.guild_id)
         state.queue.clear()
@@ -2167,10 +2340,11 @@ class MusicControllerView(discord.ui.View):
         if vc and vc.is_playing():
             vc.stop()
         stop_embed = discord.Embed(
-            title="⏹️ Music Playback Stopped",
-            description=f"Playback halted and queue cleared by {interaction.user.mention}.",
+            title="⏹️ HELLFIRE AUDIO • PLAYBACK STOPPED",
+            description=f"Playback stopped and queue cleared by {interaction.user.mention}.",
             color=discord.Color.red()
         )
+        stop_embed.set_footer(text="Hellfire Sound System • Ready for next session")
         for child in self.children:
             child.disabled = True
         await interaction.response.edit_message(embed=stop_embed, view=self)
