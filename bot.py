@@ -365,16 +365,22 @@ ACTION_WORDS = {
     "chase": "chase"
 }
 
-def make_action_message(action_key: str, source, target) -> str:
+def make_action_payload(action_key: str, source, target):
     cfg = ACTION_CONFIG.get(action_key, ACTION_CONFIG["kiss"])
     gif_list = ACTION_GIFS.get(action_key, ACTION_GIFS["kiss"])
     gif_url = random.choice(gif_list)
 
-    source_mention = source.mention if hasattr(source, "mention") else f"@{getattr(source, 'display_name', getattr(source, 'name', 'Someone'))}"
-    target_mention = target.mention if hasattr(target, "mention") else f"@{getattr(target, 'display_name', getattr(target, 'name', 'Someone'))}"
+    # Clean mention formatting without deprecated '!'
+    source_mention = f"<@{source.id}>" if hasattr(source, "id") else f"@{getattr(source, 'display_name', getattr(source, 'name', 'Someone'))}"
+    target_mention = f"<@{target.id}>" if hasattr(target, "id") else f"@{getattr(target, 'display_name', getattr(target, 'name', 'Someone'))}"
 
     text_line = cfg["text"].format(source=source_mention, target=target_mention)
-    return f"### {cfg['emoji']} {text_line}\n{gif_url}"
+    content = f"### {cfg['emoji']} {text_line}"
+
+    embed = discord.Embed()
+    embed.set_image(url=gif_url)
+
+    return content, embed
 
 # ==============================================================================
 # 1. AUTO-REACT ON MENTION & AUTOMATED ANTI-SPAM DETECTION
@@ -528,17 +534,17 @@ async def on_message(message: discord.Message):
             if len(message.mentions) >= 2:
                 act_user = message.mentions[0]
                 tgt_user = message.mentions[1]
-                msg_content = make_action_message(matched_act, act_user, tgt_user)
+                content, embed = make_action_payload(matched_act, act_user, tgt_user)
                 try:
-                    await message.channel.send(content=msg_content)
+                    await message.channel.send(content=content, embed=embed)
                 except Exception as e:
                     print(f"[Action Error] Could not send action message: {e}", flush=True)
             elif len(message.mentions) == 1:
                 act_user = message.author
                 tgt_user = message.mentions[0]
-                msg_content = make_action_message(matched_act, act_user, tgt_user)
+                content, embed = make_action_payload(matched_act, act_user, tgt_user)
                 try:
-                    await message.channel.send(content=msg_content)
+                    await message.channel.send(content=content, embed=embed)
                 except Exception as e:
                     print(f"[Action Error] Could not send action message: {e}", flush=True)
 
@@ -1343,8 +1349,14 @@ async def matchmaker(
 )
 async def cmd_kiss(interaction: discord.Interaction, target: discord.Member, source: discord.Member = None):
     actor = source if source is not None else interaction.user
-    msg = make_action_message("kiss", actor, target)
-    await interaction.response.send_message(content=msg)
+    content, embed = make_action_payload("kiss", actor, target)
+    try:
+        await interaction.response.send_message(content=content, embed=embed)
+    except (discord.NotFound, discord.HTTPException):
+        try:
+            await interaction.channel.send(content=content, embed=embed)
+        except Exception:
+            pass
 
 @bot.tree.command(name="hug", description="Give another server member a warm hug with a looping animated GIF")
 @app_commands.describe(
@@ -1353,8 +1365,14 @@ async def cmd_kiss(interaction: discord.Interaction, target: discord.Member, sou
 )
 async def cmd_hug(interaction: discord.Interaction, target: discord.Member, source: discord.Member = None):
     actor = source if source is not None else interaction.user
-    msg = make_action_message("hug", actor, target)
-    await interaction.response.send_message(content=msg)
+    content, embed = make_action_payload("hug", actor, target)
+    try:
+        await interaction.response.send_message(content=content, embed=embed)
+    except (discord.NotFound, discord.HTTPException):
+        try:
+            await interaction.channel.send(content=content, embed=embed)
+        except Exception:
+            pass
 
 @bot.tree.command(name="slap", description="Slap another server member with a looping animated GIF")
 @app_commands.describe(
@@ -1363,8 +1381,14 @@ async def cmd_hug(interaction: discord.Interaction, target: discord.Member, sour
 )
 async def cmd_slap(interaction: discord.Interaction, target: discord.Member, source: discord.Member = None):
     actor = source if source is not None else interaction.user
-    msg = make_action_message("slap", actor, target)
-    await interaction.response.send_message(content=msg)
+    content, embed = make_action_payload("slap", actor, target)
+    try:
+        await interaction.response.send_message(content=content, embed=embed)
+    except (discord.NotFound, discord.HTTPException):
+        try:
+            await interaction.channel.send(content=content, embed=embed)
+        except Exception:
+            pass
 
 @bot.tree.command(name="chase", description="Chase down another server member with a looping animated GIF")
 @app_commands.describe(
@@ -1373,8 +1397,14 @@ async def cmd_slap(interaction: discord.Interaction, target: discord.Member, sou
 )
 async def cmd_chase(interaction: discord.Interaction, target: discord.Member, source: discord.Member = None):
     actor = source if source is not None else interaction.user
-    msg = make_action_message("chase", actor, target)
-    await interaction.response.send_message(content=msg)
+    content, embed = make_action_payload("chase", actor, target)
+    try:
+        await interaction.response.send_message(content=content, embed=embed)
+    except (discord.NotFound, discord.HTTPException):
+        try:
+            await interaction.channel.send(content=content, embed=embed)
+        except Exception:
+            pass
 
 @bot.tree.command(name="chasing", description="Chase down another server member with a looping animated GIF")
 @app_commands.describe(
@@ -1383,8 +1413,14 @@ async def cmd_chase(interaction: discord.Interaction, target: discord.Member, so
 )
 async def cmd_chasing(interaction: discord.Interaction, target: discord.Member, source: discord.Member = None):
     actor = source if source is not None else interaction.user
-    msg = make_action_message("chase", actor, target)
-    await interaction.response.send_message(content=msg)
+    content, embed = make_action_payload("chase", actor, target)
+    try:
+        await interaction.response.send_message(content=content, embed=embed)
+    except (discord.NotFound, discord.HTTPException):
+        try:
+            await interaction.channel.send(content=content, embed=embed)
+        except Exception:
+            pass
 
 @bot.tree.command(name="kill", description="Obliterate another server member with an anime attack GIF")
 @app_commands.describe(
@@ -1393,8 +1429,14 @@ async def cmd_chasing(interaction: discord.Interaction, target: discord.Member, 
 )
 async def cmd_kill(interaction: discord.Interaction, target: discord.Member, source: discord.Member = None):
     actor = source if source is not None else interaction.user
-    msg = make_action_message("kill", actor, target)
-    await interaction.response.send_message(content=msg)
+    content, embed = make_action_payload("kill", actor, target)
+    try:
+        await interaction.response.send_message(content=content, embed=embed)
+    except (discord.NotFound, discord.HTTPException):
+        try:
+            await interaction.channel.send(content=content, embed=embed)
+        except Exception:
+            pass
 
 # ==============================================================================
 @bot.tree.command(name="vmute", description="Server mute or unmute a member in voice chat")
@@ -1780,13 +1822,19 @@ def find_local_audio(input_str: str) -> tuple:
     if not clean:
         return None, None
 
+    # Do not treat URLs or YouTube links as local audio files
+    if clean.startswith(('http://', 'https://', 'www.')) or 'youtube.com' in clean or 'youtu.be' in clean:
+        return None, None
+
+    valid_exts = ('.mp3', '.wav', '.m4a', '.ogg', '.flac')
+
     # 1. Exact file match in AUDIO_DIR
     exact = os.path.join(AUDIO_DIR, clean)
-    if os.path.isfile(exact):
+    if os.path.isfile(exact) and clean.lower().endswith(valid_exts):
         return exact, clean
 
     # 2. Check standard audio extensions in AUDIO_DIR
-    for ext in [".mp3", ".wav", ".m4a", ".ogg", ".flac", ".mp4"]:
+    for ext in valid_exts:
         test_p = os.path.join(AUDIO_DIR, f"{clean}{ext}")
         if os.path.isfile(test_p):
             return test_p, f"{clean}{ext}"
@@ -1796,24 +1844,31 @@ def find_local_audio(input_str: str) -> tuple:
     if os.path.exists(AUDIO_DIR):
         for f in os.listdir(AUDIO_DIR):
             f_path = os.path.join(AUDIO_DIR, f)
-            if os.path.isfile(f_path):
+            if os.path.isfile(f_path) and f.lower().endswith(valid_exts):
                 f_low = f.lower()
                 stem, _ = os.path.splitext(f_low)
                 if f_low == clean_lower or stem == clean_lower:
                     return f_path, f
 
-    # 4. Check yt_cache directory
+    # 4. Check yt_cache directory (only complete valid audio files)
     yt_cache = os.path.join(AUDIO_DIR, "yt_cache")
     if os.path.exists(yt_cache):
         for f in os.listdir(yt_cache):
             f_path = os.path.join(yt_cache, f)
-            if os.path.isfile(f_path):
+            if os.path.isfile(f_path) and f.lower().endswith(valid_exts):
                 f_low = f.lower()
                 stem, _ = os.path.splitext(f_low)
-                if f_low == clean_lower or stem == clean_lower or f_low.startswith(clean_lower):
+                if f_low == clean_lower or stem == clean_lower:
                     return f_path, f
 
     return None, None
+
+
+
+def get_youtube_video_id(url_or_id: str) -> str:
+    clean = url_or_id.strip()
+    m = re.search(r'(?:v=|\/|youtu\.be\/|^)([a-zA-Z0-9_-]{11})(?:[&?]|$)', clean)
+    return m.group(1) if m else None
 
 
 def fetch_youtube_audio(query_or_url: str) -> dict:
@@ -1823,15 +1878,26 @@ def fetch_youtube_audio(query_or_url: str) -> dict:
     os.makedirs(yt_cache_dir, exist_ok=True)
 
     clean_target = query_or_url.strip()
+    video_id = get_youtube_video_id(clean_target)
+
+    # 1. Instant Cache Check: If already downloaded, return immediately
+    if video_id:
+        cache_file = os.path.join(yt_cache_dir, f"{video_id}.mp3")
+        if os.path.exists(cache_file) and os.path.getsize(cache_file) > 1000:
+            return {
+                'path': cache_file,
+                'title': f"YouTube Track ({video_id})",
+                'url': f"https://www.youtube.com/watch?v={video_id}"
+            }
+
+    # 2. Determine target query or direct video URL
     is_url = (
         clean_target.startswith(("http://", "https://", "www."))
         or "youtube.com" in clean_target
         or "youtu.be" in clean_target
     )
-
-    # Recognize 11-char YouTube video ID (e.g. H9KDjW3MV4U) directly as URL
-    if re.match(r'^[a-zA-Z0-9_-]{11}$', clean_target):
-        target = f"https://www.youtube.com/watch?v={clean_target}"
+    if video_id:
+        target = f"https://www.youtube.com/watch?v={video_id}"
     elif is_url:
         target = clean_target
     else:
@@ -1839,47 +1905,64 @@ def fetch_youtube_audio(query_or_url: str) -> dict:
 
     ffmpeg_bin = get_ffmpeg_path()
 
-    ydl_opts = {
-        'format': 'bestaudio/best/18/22',
-        'outtmpl': os.path.join(yt_cache_dir, '%(id)s.%(ext)s'),
-        'ffmpeg_location': ffmpeg_bin,
-        'noplaylist': True,
-        'quiet': True,
-        'no_warnings': True,
-        'default_search': 'ytsearch',
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['mweb', 'android', 'ios'],
-            }
-        },
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '192',
-        }],
-    }
+    # Fallback client combos to bypass bot detection and player response extraction errors
+    client_combos = [
+        ['android', 'ios'],
+        ['mweb', 'android'],
+        ['web', 'android'],
+    ]
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(target, download=True)
-        if 'entries' in info and info['entries']:
-            info = info['entries'][0]
-
-        video_id = info.get('id', 'audio')
-        title = info.get('title', 'YouTube Video')
-        webpage_url = info.get('webpage_url', clean_target)
-
-        final_path = os.path.join(yt_cache_dir, f"{video_id}.mp3")
-        if not os.path.exists(final_path):
-            for fname in os.listdir(yt_cache_dir):
-                if fname.startswith(video_id):
-                    final_path = os.path.join(yt_cache_dir, fname)
-                    break
-
-        return {
-            'path': final_path,
-            'title': title,
-            'url': webpage_url
+    last_error = None
+    for clients in client_combos:
+        ydl_opts = {
+            'format': 'bestaudio/best/18/22',
+            'outtmpl': os.path.join(yt_cache_dir, '%(id)s.%(ext)s'),
+            'ffmpeg_location': ffmpeg_bin,
+            'noplaylist': True,
+            'quiet': True,
+            'no_warnings': True,
+            'default_search': 'ytsearch',
+            'extractor_args': {
+                'youtube': {
+                    'player_client': clients,
+                }
+            },
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }],
         }
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(target, download=True)
+                if 'entries' in info and info['entries']:
+                    info = info['entries'][0]
+
+                v_id = info.get('id', video_id or 'audio')
+                title = info.get('title', 'YouTube Video')
+                webpage_url = info.get('webpage_url', f"https://www.youtube.com/watch?v={v_id}")
+
+                final_path = os.path.join(yt_cache_dir, f"{v_id}.mp3")
+                if not os.path.exists(final_path):
+                    for fname in os.listdir(yt_cache_dir):
+                        if fname.startswith(v_id) and fname.endswith('.mp3'):
+                            final_path = os.path.join(yt_cache_dir, fname)
+                            break
+
+                return {
+                    'path': final_path,
+                    'title': title,
+                    'url': webpage_url
+                }
+        except Exception as e:
+            last_error = e
+            continue
+
+    if last_error:
+        raise last_error
+    raise RuntimeError("Failed to extract YouTube audio.")
 
 # ==============================================================================
 # MUSIC QUEUE, SMART AUTOPLAY, AND INTERACTIVE CONTROLLER CARD SYSTEM
@@ -2194,12 +2277,28 @@ async def play_audio(
     link_or_name: str = None,
     file: discord.Attachment = None
 ):
-    await interaction.response.defer()
+    async def send_play_response(content=None, embed=None, view=None):
+        try:
+            if interaction.response.is_done():
+                return await interaction.followup.send(content=content, embed=embed, view=view)
+            else:
+                return await interaction.response.send_message(content=content, embed=embed, view=view)
+        except Exception:
+            if interaction.channel:
+                try:
+                    return await interaction.channel.send(content=content, embed=embed, view=view)
+                except Exception:
+                    pass
+
+    try:
+        await interaction.response.defer()
+    except Exception:
+        pass
 
     # 1. Connect or move to voice channel
     target_vc = interaction.user.voice.channel if (interaction.user.voice and interaction.user.voice.channel) else None
     if not target_vc:
-        await interaction.followup.send("❌ You must be in a voice channel (or use `/join`) to play audio.")
+        await send_play_response("❌ You must be in a voice channel (or use `/join`) to play audio.")
         return
 
     vc = interaction.guild.voice_client
@@ -2218,7 +2317,7 @@ async def play_audio(
             try:
                 vc = await target_vc.connect(reconnect=True, timeout=10.0)
             except Exception as e:
-                await interaction.followup.send(f"❌ Could not connect to {target_vc.mention}: {e}")
+                await send_play_response(f"❌ Could not connect to {target_vc.mention}: {e}")
                 return
     else:
         try:
@@ -2229,10 +2328,10 @@ async def play_audio(
                 try:
                     await vc.move_to(target_vc)
                 except Exception as e:
-                    await interaction.followup.send(f"❌ Could not move to {target_vc.mention}: {e}")
+                    await send_play_response(f"❌ Could not move to {target_vc.mention}: {e}")
                     return
         except Exception as e:
-            await interaction.followup.send(f"❌ Could not connect to {target_vc.mention}: {e}")
+            await send_play_response(f"❌ Could not connect to {target_vc.mention}: {e}")
             return
 
     # 2. Determine audio source
@@ -2260,7 +2359,7 @@ async def play_audio(
                 display_title = yt_info['title']
                 source_url = yt_info.get('url')
             except Exception as e:
-                await interaction.followup.send(f"❌ Failed to fetch audio: {e}")
+                await send_play_response(f"❌ Failed to fetch audio: {e}")
                 return
     else:
         files = [f for f in os.listdir(AUDIO_DIR) if f.lower().endswith(('.mp3', '.wav', '.m4a', '.ogg', '.flac')) and os.path.isfile(os.path.join(AUDIO_DIR, f))]
@@ -2269,11 +2368,11 @@ async def play_audio(
             audio_path = os.path.join(AUDIO_DIR, chosen)
             display_title = chosen
         else:
-            await interaction.followup.send("❌ Please provide a YouTube link, video name, or local file name to play.")
+            await send_play_response("❌ Please provide a YouTube link, video name, or local file name to play.")
             return
 
     if not audio_path or not os.path.exists(audio_path):
-        await interaction.followup.send("❌ Audio file could not be prepared for playback.")
+        await send_play_response("❌ Audio file could not be prepared for playback.")
         return
 
     state = get_music_state(interaction.guild_id)
@@ -2299,7 +2398,7 @@ async def play_audio(
         queue_embed.add_field(name="Position in Queue", value=f"#{queue_pos}", inline=True)
         queue_embed.add_field(name="Requested By", value=interaction.user.mention, inline=True)
         queue_embed.set_footer(text="Use /skip to advance to the next song or use the player card buttons")
-        await interaction.followup.send(embed=queue_embed)
+        await send_play_response(embed=queue_embed)
 
         # Refresh existing player card to show the updated queue count
         if state.card_message:
@@ -2329,10 +2428,11 @@ async def play_audio(
 
         card_embed = build_player_embed(interaction.guild_id)
         card_view = MusicControllerView(interaction.guild_id)
-        sent_msg = await interaction.followup.send(embed=card_embed, view=card_view)
-        state.card_message = sent_msg
+        sent_msg = await send_play_response(embed=card_embed, view=card_view)
+        if sent_msg:
+            state.card_message = sent_msg
     except Exception as e:
-        await interaction.followup.send(f"❌ Failed to play audio: {e}")
+        await send_play_response(f"❌ Failed to play audio: {e}")
 
 @play_audio.autocomplete("link_or_name")
 async def play_audio_autocomplete(interaction: discord.Interaction, current: str):
