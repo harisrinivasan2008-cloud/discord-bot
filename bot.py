@@ -262,7 +262,7 @@ async def on_member_join(member: discord.Member):
         print(f"[Auto-Prefix] Error editing nickname for {member.name}: {e}", flush=True)
 
 # ==============================================================================
-# ACTION & ROLEPLAY SYSTEM (kiss, hug, slap, chase, kill)
+# ACTION & ROLEPLAY SYSTEM (kiss, hug, slap, chase, challenge)
 # ==============================================================================
 ACTION_GIFS = {
     "kiss": [
@@ -294,15 +294,6 @@ ACTION_GIFS = {
         "https://media.giphy.com/media/tX29X2Dx3sAXS/giphy.gif",
         "https://media.giphy.com/media/3XlEk2RxPS1m8/giphy.gif",
     ],
-    "kill": [
-        "https://media.giphy.com/media/4eMkhdpa912i4/giphy.gif",
-        "https://media.giphy.com/media/arbHBoiCW55JA8DSLm/giphy.gif",
-        "https://media.giphy.com/media/11HeubLHnHgaVG/giphy.gif",
-        "https://media.giphy.com/media/ebITvSXYKNvEc/giphy.gif",
-        "https://media.giphy.com/media/xT39D4GSIcBwuelKTe/giphy.gif",
-        "https://media.giphy.com/media/9r4GF7750wF04iZ8qB/giphy.gif",
-        "https://media.giphy.com/media/okECPQqhxukVC/giphy.gif",
-    ],
     "chasing": [
         "https://media.giphy.com/media/Sux3kjeP2ox1e/giphy.gif",
         "https://media.giphy.com/media/3o7ZetIsjgoYKlVe9y/giphy.gif",
@@ -320,6 +311,15 @@ ACTION_GIFS = {
         "https://media.giphy.com/media/2bUpP71bbVnZ3x7N24/giphy.gif",
         "https://media.giphy.com/media/3o6Zt9BZNiXLU8Mp9K/giphy.gif",
         "https://media.giphy.com/media/l0MYEqEzwMWFCg8rm/giphy.gif",
+    ],
+    "challenge": [
+        "https://media.giphy.com/media/13HgwGsXF0aiGY/giphy.gif",
+        "https://media.giphy.com/media/2y98KScHKeaQM/giphy.gif",
+        "https://media.giphy.com/media/arbHBDAq954qY/giphy.gif",
+        "https://media.giphy.com/media/k59Be2mUb0sa4/giphy.gif",
+        "https://media.giphy.com/media/uCow7L41IL0zS/giphy.gif",
+        "https://media.giphy.com/media/bDWdJRY2IZCX6/giphy.gif",
+        "https://media.giphy.com/media/yXVO50FJIJMSQ/giphy.gif",
     ]
 }
 
@@ -339,11 +339,6 @@ ACTION_CONFIG = {
         "emoji": "👋",
         "text": "{source} slapped {target} right across the face! 💥"
     },
-    "kill": {
-        "verb": "obliterated",
-        "emoji": "⚔️",
-        "text": "{source} ruthlessly obliterated {target}! 💥"
-    },
     "chasing": {
         "verb": "is chasing",
         "emoji": "🏃💨",
@@ -353,6 +348,11 @@ ACTION_CONFIG = {
         "verb": "is chasing",
         "emoji": "🏃💨",
         "text": "{source} is chasing after {target} at full speed! 💨"
+    },
+    "challenge": {
+        "verb": "challenged",
+        "emoji": "⚔️",
+        "text": "{source} has stepped up and challenged {target} to a battle! 💥"
     }
 }
 
@@ -360,10 +360,27 @@ ACTION_WORDS = {
     "kiss": "kiss",
     "hug": "hug",
     "slap": "slap",
-    "kill": "kill",
     "chasing": "chase",
-    "chase": "chase"
+    "chase": "chase",
+    "challenge": "challenge",
+    "fight": "challenge"
 }
+
+# Deduplication cache to prevent any double-sending of actions
+recent_action_events = {}
+
+def is_duplicate_action(channel_id: int, action_key: str, actor_id: int, target_id: int) -> bool:
+    now = time.time()
+    # Expire entries older than 8 seconds
+    expired = [k for k, t in recent_action_events.items() if now - t > 8.0]
+    for k in expired:
+        recent_action_events.pop(k, None)
+
+    key = (channel_id, action_key, actor_id, target_id)
+    if key in recent_action_events and now - recent_action_events[key] < 3.5:
+        return True
+    recent_action_events[key] = now
+    return False
 
 def make_action_payload(action_key: str, source, target):
     cfg = ACTION_CONFIG.get(action_key, ACTION_CONFIG["kiss"])
@@ -381,6 +398,89 @@ def make_action_payload(action_key: str, source, target):
     embed.set_image(url=gif_url)
 
     return content, embed
+
+def make_challenge_payload(source, target, custom_shout: str = None):
+    shout = custom_shout.strip() if custom_shout and custom_shout.strip() else "COME LETS FIGHT"
+    shout = shout.strip('"`')
+    gif_list = ACTION_GIFS.get("challenge", [
+        "https://media.giphy.com/media/13HgwGsXF0aiGY/giphy.gif",
+        "https://media.giphy.com/media/2y98KScHKeaQM/giphy.gif",
+        "https://media.giphy.com/media/arbHBDAq954qY/giphy.gif",
+        "https://media.giphy.com/media/k59Be2mUb0sa4/giphy.gif",
+        "https://media.giphy.com/media/uCow7L41IL0zS/giphy.gif",
+        "https://media.giphy.com/media/bDWdJRY2IZCX6/giphy.gif",
+        "https://media.giphy.com/media/yXVO50FJIJMSQ/giphy.gif",
+    ])
+    gif_url = random.choice(gif_list)
+
+    source_mention = f"<@{source.id}>" if hasattr(source, "id") else f"@{getattr(source, 'display_name', getattr(source, 'name', 'Someone'))}"
+    target_mention = f"<@{target.id}>" if hasattr(target, "id") else f"@{getattr(target, 'display_name', getattr(target, 'name', 'Someone'))}"
+
+    content = f"### ⚔️ {source_mention} HAS CHALLENGED {target_mention} TO A DUEL! 🥊\n> 💥 **\"{shout.upper()}\"**"
+
+    embed = discord.Embed(
+        title="⚔️ COMBAT CHALLENGE ISSUED ⚔️",
+        description=f"### 🥊 {source_mention} ⚔️ **VS** ⚔️ {target_mention} 🥊\n\n> 🔥 **\"{shout.upper()}\"**\n\n*Will {target_mention} step into the arena or flee? Respond below!*",
+        color=discord.Color.brand_red()
+    )
+    embed.set_author(name="𝐇𝐄𝐋𝐋𝐅𝐈𝐑𝐄 𝐀𝐑𝐄𝐍𝐀 • DUEL SHOWDOWN", icon_url="https://cdn.discordapp.com/emojis/853304564887355412.gif")
+    embed.set_image(url=gif_url)
+    embed.set_footer(text="Hellfire Combat Arena • Targeted member has 2 minutes to respond")
+
+    return content, embed
+
+class ChallengeResponseView(discord.ui.View):
+    def __init__(self, challenger_id: int, target_id: int, shout: str = "COME LETS FIGHT"):
+        super().__init__(timeout=120)
+        self.challenger_id = challenger_id
+        self.target_id = target_id
+        self.shout = shout
+
+    @discord.ui.button(label="⚔️ Accept Battle", style=discord.ButtonStyle.danger, custom_id="challenge_accept")
+    async def accept_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.target_id:
+            await interaction.response.send_message("❌ Only the challenged opponent can accept this battle!", ephemeral=True)
+            return
+
+        for child in self.children:
+            child.disabled = True
+
+        embed = interaction.message.embeds[0] if interaction.message.embeds else discord.Embed()
+        embed.color = discord.Color.dark_gold()
+        embed.title = "⚔️ BATTLE ACCEPTED • FIGHT IN PROGRESS! 💥"
+        embed.set_footer(text="Hellfire Combat Arena • Challenge Accepted")
+
+        result_content = (
+            f"### 🔥 CHALLENGE ACCEPTED! 🥊\n"
+            f"{interaction.user.mention} stepped into the ring to fight <@{self.challenger_id}>!\n"
+            f"> 💥 **LET THE BATTLE COMMENCE!** ⚔️"
+        )
+        await interaction.response.edit_message(content=result_content, embed=embed, view=self)
+
+    @discord.ui.button(label="🏳️ Decline / Flee", style=discord.ButtonStyle.secondary, custom_id="challenge_decline")
+    async def decline_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.target_id:
+            await interaction.response.send_message("❌ Only the challenged opponent can decline this battle!", ephemeral=True)
+            return
+
+        for child in self.children:
+            child.disabled = True
+
+        embed = interaction.message.embeds[0] if interaction.message.embeds else discord.Embed()
+        embed.color = discord.Color.light_grey()
+        embed.title = "🏳️ CHALLENGE DECLINED"
+        embed.set_footer(text="Hellfire Combat Arena • Opponent Fled")
+
+        result_content = (
+            f"### 🏳️ CHALLENGE DECLINED\n"
+            f"{interaction.user.mention} backed down and fled from <@{self.challenger_id}>! 🏃💨\n"
+            f"> *Maybe next time...*"
+        )
+        await interaction.response.edit_message(content=result_content, embed=embed, view=self)
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
 
 # ==============================================================================
 # 1. AUTO-REACT ON MENTION & AUTOMATED ANTI-SPAM DETECTION
@@ -521,32 +621,43 @@ async def on_message(message: discord.Message):
                 except discord.HTTPException as e:
                     print(f"Failed to send spam warning card: {e}", flush=True)
 
-    # Roleplay / Action Detection in Chat (e.g. "@someone kill @someone2", "hug @someone", etc.)
+    # Roleplay / Action Detection in Chat (e.g. "@someone challenge @someone2", "hug @someone", etc.)
     if message.guild and message.mentions and not message.mention_everyone:
-        content_lower = message.content.lower()
-        matched_act = None
-        for word, key in ACTION_WORDS.items():
-            if re.search(rf"\b{word}\b", content_lower):
-                matched_act = key
-                break
+        # Ignore messages starting with "/" as they are intended as slash commands
+        if not message.content.strip().startswith("/"):
+            content_lower = message.content.lower()
+            matched_act = None
+            for word, key in ACTION_WORDS.items():
+                if re.search(rf"\b{word}\b", content_lower):
+                    matched_act = key
+                    break
 
-        if matched_act:
-            if len(message.mentions) >= 2:
-                act_user = message.mentions[0]
-                tgt_user = message.mentions[1]
-                content, embed = make_action_payload(matched_act, act_user, tgt_user)
-                try:
-                    await message.channel.send(content=content, embed=embed)
-                except Exception as e:
-                    print(f"[Action Error] Could not send action message: {e}", flush=True)
-            elif len(message.mentions) == 1:
-                act_user = message.author
-                tgt_user = message.mentions[0]
-                content, embed = make_action_payload(matched_act, act_user, tgt_user)
-                try:
-                    await message.channel.send(content=content, embed=embed)
-                except Exception as e:
-                    print(f"[Action Error] Could not send action message: {e}", flush=True)
+            if matched_act:
+                act_user = None
+                tgt_user = None
+                if len(message.mentions) >= 2:
+                    act_user = message.mentions[0]
+                    tgt_user = message.mentions[1]
+                elif len(message.mentions) == 1:
+                    act_user = message.author
+                    tgt_user = message.mentions[0]
+
+                if act_user and tgt_user:
+                    # Prevent double-sending
+                    if not is_duplicate_action(message.channel.id, matched_act, act_user.id, tgt_user.id):
+                        if matched_act == "challenge":
+                            content, embed = make_challenge_payload(act_user, tgt_user, "COME LETS FIGHT")
+                            view = ChallengeResponseView(act_user.id, tgt_user.id, "COME LETS FIGHT")
+                            try:
+                                await message.channel.send(content=content, embed=embed, view=view)
+                            except Exception as e:
+                                print(f"[Challenge Error] Could not send challenge message: {e}", flush=True)
+                        else:
+                            content, embed = make_action_payload(matched_act, act_user, tgt_user)
+                            try:
+                                await message.channel.send(content=content, embed=embed)
+                            except Exception as e:
+                                print(f"[Action Error] Could not send action message: {e}", flush=True)
 
     # Check if any mentioned user is in our target_ids for auto-reactions
     target_ids = get_target_user_ids()
@@ -1345,7 +1456,7 @@ async def matchmaker(
     await interaction.response.send_message(embed=embed)
 
 # ==============================================================================
-# ACTION / ROLEPLAY SLASH COMMANDS (/kiss, /hug, /slap, /chase, /chasing, /kill)
+# ACTION / ROLEPLAY SLASH COMMANDS (/kiss, /hug, /slap, /chase, /challenge)
 # ==============================================================================
 @bot.tree.command(name="kiss", description="Kiss another server member with a looping animated GIF")
 @app_commands.describe(
@@ -1354,14 +1465,19 @@ async def matchmaker(
 )
 async def cmd_kiss(interaction: discord.Interaction, target: discord.Member, source: discord.Member = None):
     actor = source if source is not None else interaction.user
+    if is_duplicate_action(interaction.channel_id, "kiss", actor.id, target.id):
+        if not interaction.response.is_done():
+            await interaction.response.send_message("⚠️ Action already sent!", ephemeral=True)
+        return
     content, embed = make_action_payload("kiss", actor, target)
     try:
         await interaction.response.send_message(content=content, embed=embed)
-    except (discord.NotFound, discord.HTTPException):
-        try:
-            await interaction.channel.send(content=content, embed=embed)
-        except Exception:
-            pass
+    except Exception:
+        if not interaction.response.is_done() and interaction.channel:
+            try:
+                await interaction.channel.send(content=content, embed=embed)
+            except Exception:
+                pass
 
 @bot.tree.command(name="hug", description="Give another server member a warm hug with a looping animated GIF")
 @app_commands.describe(
@@ -1370,14 +1486,19 @@ async def cmd_kiss(interaction: discord.Interaction, target: discord.Member, sou
 )
 async def cmd_hug(interaction: discord.Interaction, target: discord.Member, source: discord.Member = None):
     actor = source if source is not None else interaction.user
+    if is_duplicate_action(interaction.channel_id, "hug", actor.id, target.id):
+        if not interaction.response.is_done():
+            await interaction.response.send_message("⚠️ Action already sent!", ephemeral=True)
+        return
     content, embed = make_action_payload("hug", actor, target)
     try:
         await interaction.response.send_message(content=content, embed=embed)
-    except (discord.NotFound, discord.HTTPException):
-        try:
-            await interaction.channel.send(content=content, embed=embed)
-        except Exception:
-            pass
+    except Exception:
+        if not interaction.response.is_done() and interaction.channel:
+            try:
+                await interaction.channel.send(content=content, embed=embed)
+            except Exception:
+                pass
 
 @bot.tree.command(name="slap", description="Slap another server member with a looping animated GIF")
 @app_commands.describe(
@@ -1386,14 +1507,19 @@ async def cmd_hug(interaction: discord.Interaction, target: discord.Member, sour
 )
 async def cmd_slap(interaction: discord.Interaction, target: discord.Member, source: discord.Member = None):
     actor = source if source is not None else interaction.user
+    if is_duplicate_action(interaction.channel_id, "slap", actor.id, target.id):
+        if not interaction.response.is_done():
+            await interaction.response.send_message("⚠️ Action already sent!", ephemeral=True)
+        return
     content, embed = make_action_payload("slap", actor, target)
     try:
         await interaction.response.send_message(content=content, embed=embed)
-    except (discord.NotFound, discord.HTTPException):
-        try:
-            await interaction.channel.send(content=content, embed=embed)
-        except Exception:
-            pass
+    except Exception:
+        if not interaction.response.is_done() and interaction.channel:
+            try:
+                await interaction.channel.send(content=content, embed=embed)
+            except Exception:
+                pass
 
 @bot.tree.command(name="chase", description="Chase down another server member with a looping animated GIF")
 @app_commands.describe(
@@ -1402,30 +1528,43 @@ async def cmd_slap(interaction: discord.Interaction, target: discord.Member, sou
 )
 async def cmd_chase(interaction: discord.Interaction, target: discord.Member, source: discord.Member = None):
     actor = source if source is not None else interaction.user
+    if is_duplicate_action(interaction.channel_id, "chase", actor.id, target.id):
+        if not interaction.response.is_done():
+            await interaction.response.send_message("⚠️ Action already sent!", ephemeral=True)
+        return
     content, embed = make_action_payload("chase", actor, target)
     try:
         await interaction.response.send_message(content=content, embed=embed)
-    except (discord.NotFound, discord.HTTPException):
-        try:
-            await interaction.channel.send(content=content, embed=embed)
-        except Exception:
-            pass
+    except Exception:
+        if not interaction.response.is_done() and interaction.channel:
+            try:
+                await interaction.channel.send(content=content, embed=embed)
+            except Exception:
+                pass
 
-@bot.tree.command(name="kill", description="Obliterate another server member with an anime attack GIF")
+@bot.tree.command(name="challenge", description="Challenge another server member to an animated battle duel with a fighting shout card")
 @app_commands.describe(
-    target="The member you want to kill",
-    source="The member who is attacking (defaults to you)"
+    target="The member you want to challenge to a fight",
+    source="The challenger (defaults to you)",
+    shout="Custom battle shout (defaults to: 'COME LETS FIGHT')"
 )
-async def cmd_kill(interaction: discord.Interaction, target: discord.Member, source: discord.Member = None):
+async def cmd_challenge(interaction: discord.Interaction, target: discord.Member, source: discord.Member = None, shout: str = "COME LETS FIGHT"):
     actor = source if source is not None else interaction.user
-    content, embed = make_action_payload("kill", actor, target)
+    if is_duplicate_action(interaction.channel_id, "challenge", actor.id, target.id):
+        if not interaction.response.is_done():
+            await interaction.response.send_message("⚠️ A challenge was just issued! Please wait a moment.", ephemeral=True)
+        return
+
+    content, embed = make_challenge_payload(actor, target, shout)
+    view = ChallengeResponseView(actor.id, target.id, shout)
     try:
-        await interaction.response.send_message(content=content, embed=embed)
-    except (discord.NotFound, discord.HTTPException):
-        try:
-            await interaction.channel.send(content=content, embed=embed)
-        except Exception:
-            pass
+        await interaction.response.send_message(content=content, embed=embed, view=view)
+    except Exception:
+        if not interaction.response.is_done() and interaction.channel:
+            try:
+                await interaction.channel.send(content=content, embed=embed, view=view)
+            except Exception:
+                pass
 
 # ==============================================================================
 @bot.tree.command(name="vmute", description="Server mute or unmute a member in voice chat")
