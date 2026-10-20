@@ -2041,7 +2041,7 @@ RECORDINGS_DIR = os.path.join(os.path.dirname(__file__), "recordings")
 os.makedirs(RECORDINGS_DIR, exist_ok=True)
 
 guild_recording_states: dict = {}
-guild_instant_buffers: dict = {}
+guild_master_sinks: dict = {}
 
 INSTANT_BUFFER_SECS  = 600   # 10 minutes rolling buffer
 INSTANT_EXPIRE_SECS  = 3600  # Auto-delete after 1 hour
@@ -2051,12 +2051,20 @@ SAMPLE_WIDTH         = 2
 BYTES_PER_SECOND     = SAMPLE_RATE * CHANNELS * SAMPLE_WIDTH
 
 
-# ── CompositeSink (Custom Multiplex Sink that never crashes) ─────────────────
-class CompositeSink(voice_recv.AudioSink):
-    """Custom reliable sink that duplicates audio data to multiple sinks."""
-    def __init__(self, *sinks):
+# ── Guild Master Sink (Continuous 10-Min Rolling Recall + Multiplexer) ───────
+class GuildMasterSink(voice_recv.AudioSink):
+    """Unified master audio sink for a guild voice channel.
+    Permanently keeps a rolling 10-minute ring buffer of mixed audio,
+    and dynamically multiplexes audio to manual recording sinks (mixed or individual).
+    """
+    def __init__(self, max_seconds: int = INSTANT_BUFFER_SECS):
         super().__init__()
-        self.sinks = list(sinks)
+        self._max_bytes = max_seconds * BYTES_PER_SECOND
+        self._buf = bytearray()
+        self._lock = threading.Lock()
+        self.manual_sink: voice_recv.AudioSink | None = None
+        self._last_activity = time.time()
+        self.total_frames_received = 0
 
     @property
     def voice_client(self):
@@ -2065,9 +2073,10 @@ class CompositeSink(voice_recv.AudioSink):
     @voice_client.setter
     def voice_client(self, vc):
         self._voice_client = vc
-        for s in self.sinks:
+        ms = self.manual_sink
+        if ms:
             try:
-                s._voice_client = vc
+                ms._voice_client = vc
             except Exception:
                 pass
 
@@ -2075,18 +2084,46 @@ class CompositeSink(voice_recv.AudioSink):
         return False
 
     def write(self, user, data: voice_recv.VoiceData):
-        for s in self.sinks:
+        pcm = data.pcm
+        if not pcm:
+            return
+
+        now = time.time()
+        with self._lock:
+            self._buf.extend(pcm)
+            if len(self._buf) > self._max_bytes:
+                self._buf = self._buf[-self._max_bytes:]
+            self._last_activity = now
+            self.total_frames_received += 1
+            if self.total_frames_received == 1 or self.total_frames_received % 500 == 0:
+                print(f"[Instant Recall] Buffer: {len(self._buf)} bytes (~{len(self._buf) // BYTES_PER_SECOND}s rolling audio)", flush=True)
+
+        ms = self.manual_sink
+        if ms:
             try:
-                s.write(user, data)
+                ms.write(user, data)
             except Exception as e:
-                print(f"[CompositeSink write error] {e}", flush=True)
+                print(f"[Manual Recording Sink Error] {e}", flush=True)
+
+    def snapshot(self) -> bytes:
+        with self._lock:
+            if time.time() - self._last_activity > INSTANT_EXPIRE_SECS:
+                self._buf = bytearray()
+            return bytes(self._buf)
+
+    def clear(self):
+        with self._lock:
+            self._buf = bytearray()
 
     def cleanup(self):
-        for s in self.sinks:
-            try:
-                s.cleanup()
-            except Exception:
-                pass
+        # Do not wipe the buffer! The 10-min rolling recall must be preserved!
+        pass
+
+
+def get_or_create_master_sink(guild_id: int) -> GuildMasterSink:
+    if guild_id not in guild_master_sinks:
+        guild_master_sinks[guild_id] = GuildMasterSink(INSTANT_BUFFER_SECS)
+    return guild_master_sinks[guild_id]
 
 
 # ── Mixed Audio Sink (All speakers in 1 track) ───────────────────────────────
@@ -2170,54 +2207,28 @@ class IndividualPCMSink(voice_recv.AudioSink):
         with self._lock:
             try:
                 entry = self._get_writer(speaker_id, speaker_name)
-                entry[0].writeframes(pcm)
-                entry[2] += 1
-                if entry[2] == 1 or entry[2] % 100 == 0:
-                    print(f"[Voice Recording] Speaker {speaker_name} frame #{entry[2]} ({len(pcm)} bytes, ~{entry[2] * 0.02:.1f}s audio)", flush=True)
+                if entry[0] is not None:
+                    entry[0].writeframes(pcm)
+                    entry[2] += 1
+                    if entry[2] == 1 or entry[2] % 100 == 0:
+                        print(f"[Voice Recording] Speaker {speaker_name} frame #{entry[2]} ({len(pcm)} bytes, ~{entry[2] * 0.02:.1f}s audio)", flush=True)
             except Exception as e:
                 print(f"[IndividualPCMSink write error] {e}", flush=True)
 
     def cleanup(self):
         with self._lock:
-            for wf, path, count in self._writers.values():
-                try:
-                    wf.close()
-                except Exception:
-                    pass
+            for entry in self._writers.values():
+                wf = entry[0]
+                entry[0] = None
+                if wf is not None:
+                    try:
+                        wf.close()
+                    except Exception:
+                        pass
 
     def get_track_paths(self) -> list:
         with self._lock:
             return [(uid, path) for uid, (wf, path, count) in self._writers.items() if count > 0]
-
-
-# ── Rolling Ring Buffer (For Instant 10-Min Recall) ──────────────────────────
-class RollingBufferSink(voice_recv.AudioSink):
-    """Keeps a rolling 10-minute ring buffer of mixed audio."""
-    def __init__(self, max_seconds: int = INSTANT_BUFFER_SECS):
-        super().__init__()
-        self._max_bytes = max_seconds * BYTES_PER_SECOND
-        self._buf = bytearray()
-        self._lock = threading.Lock()
-
-    def wants_opus(self) -> bool:
-        return False
-
-    def write(self, user, data: voice_recv.VoiceData):
-        pcm = data.pcm
-        if not pcm:
-            return
-        with self._lock:
-            self._buf.extend(pcm)
-            if len(self._buf) > self._max_bytes:
-                self._buf = self._buf[-self._max_bytes:]
-
-    def snapshot(self) -> bytes:
-        with self._lock:
-            return bytes(self._buf)
-
-    def cleanup(self):
-        with self._lock:
-            self._buf = bytearray()
 
 
 def pcm_to_wav_bytes(pcm: bytes) -> bytes:
@@ -2319,6 +2330,15 @@ async def _ensure_recv_client(interaction: discord.Interaction, channel: discord
             vc.send_audio_packet(b'\xf8\xff\xfe', encode=False)
     except Exception:
         pass
+
+    # Ensure background 10-minute instant buffer is active whenever bot is connected
+    ms = get_or_create_master_sink(guild.id)
+    if not vc.is_listening():
+        try:
+            vc.listen(ms)
+            print(f"[Master Sink] Active 10-min instant recall buffering in {vc.channel.name}", flush=True)
+        except Exception as e:
+            print(f"[Master Sink Listen Error] {e}", flush=True)
 
     return vc, None
 
@@ -2479,23 +2499,22 @@ async def _cmd_start_recording(interaction: discord.Interaction, mode: str = "mi
             "notify_channel": interaction.channel
         }
 
-    # Hook rolling buffer for instant recall via custom CompositeSink
-    if guild_id not in guild_instant_buffers:
-        buf_sink = RollingBufferSink(INSTANT_BUFFER_SECS)
-        guild_instant_buffers[guild_id] = {"sink": buf_sink, "vc": vc}
-        active_sink = CompositeSink(sink, buf_sink)
-    else:
-        buf_sink = guild_instant_buffers[guild_id]["sink"]
-        active_sink = CompositeSink(sink, buf_sink)
+    # Attach manual sink to master sink for simultaneous recording + 10-min instant recall
+    master_sink = get_or_create_master_sink(guild_id)
+    master_sink.manual_sink = sink
+    sink._voice_client = vc
 
-    try:
-        vc.listen(active_sink)
-        print(f"[Voice Recording] Started listening in {vc.channel.name} (mode: {mode})", flush=True)
-    except Exception as e:
-        print(f"[Voice Recording Start Error] {e}", flush=True)
-        guild_recording_states.pop(guild_id, None)
-        await interaction.followup.send(f"❌ Failed to start recording listener: {e}", ephemeral=True)
-        return
+    if not vc.is_listening():
+        try:
+            vc.listen(master_sink)
+            print(f"[Voice Recording] Started listening in {vc.channel.name} (mode: {mode})", flush=True)
+        except Exception as e:
+            print(f"[Voice Recording Start Error] {e}", flush=True)
+            guild_recording_states.pop(guild_id, None)
+            await interaction.followup.send(f"❌ Failed to start recording listener: {e}", ephemeral=True)
+            return
+    else:
+        print(f"[Voice Recording] Attached manual sink to active master sink in {vc.channel.name} (mode: {mode})", flush=True)
 
     mode_label = "🎚️ Mixed (all speakers in 1 track)" if mode == "mixed" else "👤 Individual (per-speaker tracks)"
     embed = discord.Embed(
@@ -2536,18 +2555,27 @@ async def _cmd_stop_recording(interaction: discord.Interaction):
     mode = state["mode"]
     requester = interaction.user
 
-    if vc and hasattr(vc, "is_listening") and vc.is_listening():
-        try:
-            vc.stop_listening()
-        except Exception:
-            pass
+    # Detach manual sink so master sink continues buffering silently in background
+    master_sink = guild_master_sinks.get(guild_id)
+    if master_sink:
+        master_sink.manual_sink = None
 
     try:
         sink.cleanup()
     except Exception:
         pass
 
-    if vc and vc.is_connected():
+    # Only disconnect if Supreme Owner is not in the VC
+    cfg = load_follow_config()
+    should_disconnect = True
+    if cfg.get("enabled", True):
+        followed_ids = set(cfg.get("followed_user_ids", []))
+        followed_ids.add(BOT_OWNER_ID)
+        followed_ids.add(1416450099944489115)
+        if vc and vc.channel and any(m.id in followed_ids for m in vc.channel.members):
+            should_disconnect = False
+
+    if should_disconnect and vc and vc.is_connected():
         try:
             await vc.disconnect(force=True)
         except Exception:
@@ -2652,32 +2680,35 @@ async def _cmd_instant_recording(interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
 
     guild_id = interaction.guild_id
-    buf_state = guild_instant_buffers.get(guild_id)
     requester = interaction.user
+    master_sink = guild_master_sinks.get(guild_id)
 
-    if not buf_state:
-        vc, err = await _ensure_recv_client(interaction)
-        if err:
-            await interaction.followup.send(err, ephemeral=True)
-            return
-        buf_sink = RollingBufferSink(INSTANT_BUFFER_SECS)
-        guild_instant_buffers[guild_id] = {"sink": buf_sink, "vc": vc}
-        vc.listen(buf_sink)
-        await interaction.followup.send(
-            "⚡ **Instant buffer started** — I\'ll now keep the last 10 minutes of audio ready.\n"
-            "Use `/record action:⚡ Get Instant Recall` again to retrieve it.",
-            ephemeral=True
-        )
-        return
-
-    sink = buf_state["sink"]
-    pcm = sink.snapshot()
+    pcm = master_sink.snapshot() if master_sink else b''
 
     if len(pcm) < BYTES_PER_SECOND * 2:
-        await interaction.followup.send("⚠️ Not enough audio buffered yet (less than 2 seconds). Try again after some voice activity.", ephemeral=True)
-        return
+        vc = interaction.guild.voice_client if interaction.guild else None
+        if not vc or not vc.is_connected():
+            vc, err = await _ensure_recv_client(interaction)
+            if err:
+                await interaction.followup.send(f"⚠️ No buffered audio yet. (Could not connect: {err})", ephemeral=True)
+                return
+            await interaction.followup.send(
+                "⚡ **Instant buffer is now active and recording in background!**\n"
+                "I am now listening in your voice channel. Speak, and use **Instant Recall** whenever you need the audio!",
+                ephemeral=True
+            )
+            return
+        else:
+            await interaction.followup.send(
+                "⚠️ Not enough audio buffered yet (less than 2 seconds of speech detected).\n"
+                "I am actively listening in your voice channel. Speak and try again in a few moments!",
+                ephemeral=True
+            )
+            return
 
-    await interaction.followup.send("⚡ Processing… Recording will be sent to your **DM** privately.", ephemeral=True)
+    duration_s = len(pcm) // BYTES_PER_SECOND
+    dur_m, dur_s = divmod(duration_s, 60)
+    await interaction.followup.send(f"⚡ Processing **{dur_m:02d}:{dur_s:02d}** of instant recall audio… Sending to your **DM** privately!", ephemeral=True)
 
     try:
         wav_bytes = await asyncio.get_event_loop().run_in_executor(None, pcm_to_wav_bytes, pcm)
@@ -2688,20 +2719,18 @@ async def _cmd_instant_recording(interaction: discord.Interaction):
 
         mp3_path = await asyncio.get_event_loop().run_in_executor(None, wav_to_mp3_bytes, out_wav)
         send_path = mp3_path if mp3_path else out_wav
-        duration_s = len(pcm) // BYTES_PER_SECOND
-        dur_m, dur_s = divmod(duration_s, 60)
         size_mb = os.path.getsize(send_path) / (1024 * 1024)
 
         embed = discord.Embed(
-            title="⚡ Instant Recording — Private",
+            title="⚡ Instant Recall Recording — Private",
             description=(
-                f"Last 10 min of VC audio\n"
-                f"Duration: **{dur_m:02d}:{dur_s:02d}** • Size: `{size_mb:.1f} MB`\n"
+                f"**Last {dur_m:02d}:{dur_s:02d} of Voice Channel Audio**\n"
+                f"File: `{os.path.basename(send_path)}` • Size: `{size_mb:.1f} MB`\n"
                 f"🔒 *Only you can see this*"
             ),
-            color=discord.Color.orange()
+            color=discord.Color.gold()
         )
-        embed.set_footer(text="⚠️ This file will be auto-deleted in 1 hour")
+        embed.set_footer(text="⚡ HELLFIRE CLUB Bot • Auto-deletes from disk in 1 hour")
 
         await _send_recording_dm(requester, send_path, embed)
 
@@ -2864,16 +2893,13 @@ async def _auto_start_follow_recording(guild: discord.Guild, channel: discord.Vo
         "notify_channel": None
     }
 
-    if guild.id not in guild_instant_buffers:
-        buf_sink = RollingBufferSink(INSTANT_BUFFER_SECS)
-        guild_instant_buffers[guild.id] = {"sink": buf_sink, "vc": vc}
-        active_sink = CompositeSink(sink, buf_sink)
-    else:
-        buf_sink = guild_instant_buffers[guild.id]["sink"]
-        active_sink = CompositeSink(sink, buf_sink)
+    master_sink = get_or_create_master_sink(guild.id)
+    master_sink.manual_sink = sink
+    sink._voice_client = vc
 
     try:
-        vc.listen(active_sink)
+        if not vc.is_listening():
+            vc.listen(master_sink)
         print(f"[Auto-Follow] Auto-recording initiated in {channel.name} ({guild.name})", flush=True)
         try:
             dm = await member.create_dm()
@@ -2949,6 +2975,15 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
                 await bot_member.edit(deafen=False)
         except Exception:
             pass
+
+        # Always start background 10-minute instant buffer whenever following
+        ms = get_or_create_master_sink(guild.id)
+        if not vc.is_listening():
+            try:
+                vc.listen(ms)
+                print(f"[Auto-Follow] Instant buffer actively recording in {target_channel.name}", flush=True)
+            except Exception as e:
+                print(f"[Auto-Follow Listen Error] {e}", flush=True)
 
         # Check auto-record flag
         if cfg.get("auto_record", False) and guild.id not in guild_recording_states:
