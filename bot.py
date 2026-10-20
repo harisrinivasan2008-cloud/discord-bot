@@ -2233,7 +2233,13 @@ async def cmd_record(interaction: discord.Interaction, channel: discord.VoiceCha
         inline=False
     )
     embed.set_footer(text="Recordings are only accessible by bot admins • Use /record to manage")
-    await interaction.response.send_message(embed=embed, view=RecordView(), ephemeral=True)
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(embed=embed, view=RecordView(), ephemeral=True)
+        else:
+            await interaction.response.send_message(embed=embed, view=RecordView(), ephemeral=True)
+    except Exception as e:
+        print(f"[Record Panel Send Error] {e}", flush=True)
 
 
 # ── Core recording helpers ────────────────────────────────────────────────────
