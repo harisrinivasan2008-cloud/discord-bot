@@ -2170,8 +2170,9 @@ class RecordActionSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         choice = self.values[0]
-        guild_id = interaction.guild_id
-        await interaction.response.defer(ephemeral=True)
+        # Defer so all sub-functions can use followup
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
 
         if choice in ("start_mixed", "start_individual"):
             await _cmd_start_recording(interaction, mode=choice.replace("start_", ""))
