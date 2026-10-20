@@ -665,17 +665,43 @@ async def on_message(message: discord.Message):
                             except Exception as e:
                                 print(f"[Action Error] Could not send action message: {e}", flush=True)
 
-    # Check if any mentioned user is in our target_ids for auto-reactions
+    # Auto-reactions: Only react when target ID is explicitly tagged/mentioned in message content
+    # Do NOT react to messages that reply to the target user
     target_ids = get_target_user_ids()
-    if target_ids and any(user.id in target_ids for user in message.mentions):
-        for emoji in REACTION_EMOJIS:
-            try:
-                await message.add_reaction(emoji)
-            except discord.Forbidden:
-                print(f"Missing permission to add reaction in channel {message.channel.name}", flush=True)
-                break
-            except discord.HTTPException as e:
-                print(f"Failed to add reaction: {e}", flush=True)
+    if target_ids:
+        is_reply_to_target = False
+        if message.reference:
+            ref = message.reference
+            resolved = getattr(ref, "resolved", None)
+            if isinstance(resolved, discord.Message):
+                if resolved.author.id in target_ids:
+                    is_reply_to_target = True
+            elif getattr(ref, "cached_message", None) and ref.cached_message.author.id in target_ids:
+                is_reply_to_target = True
+            elif ref.message_id:
+                try:
+                    orig_msg = await message.channel.fetch_message(ref.message_id)
+                    if orig_msg.author.id in target_ids:
+                        is_reply_to_target = True
+                except Exception:
+                    pass
+
+        if not is_reply_to_target:
+            has_explicit_mention = False
+            for tid in target_ids:
+                if re.search(rf"<@!?{tid}>|\b{tid}\b", message.content):
+                    has_explicit_mention = True
+                    break
+
+            if has_explicit_mention:
+                for emoji in REACTION_EMOJIS:
+                    try:
+                        await message.add_reaction(emoji)
+                    except discord.Forbidden:
+                        print(f"Missing permission to add reaction in channel {message.channel.name}", flush=True)
+                        break
+                    except discord.HTTPException as e:
+                        print(f"Failed to add reaction: {e}", flush=True)
 
     await bot.process_commands(message)
 
