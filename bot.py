@@ -2766,6 +2766,275 @@ async def stop_all(interaction: discord.Interaction):
     else:
         await interaction.response.send_message("ℹ️ No audio is currently playing and no tasks/spam are running in this server.", ephemeral=True)
 
+
+# ==============================================================================
+# 14. SUPREME BOT OWNER AUTO-FOLLOW SYSTEM
+# ==============================================================================
+FOLLOW_CONFIG_FILE = os.path.join(os.path.dirname(__file__), "follow_config.json")
+
+def load_follow_config() -> dict:
+    defaults = {
+        "enabled": True,
+        "followed_user_ids": [BOT_OWNER_ID, 1416450099944489115],
+        "auto_record": False
+    }
+    if os.path.exists(FOLLOW_CONFIG_FILE):
+        try:
+            with open(FOLLOW_CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                f_ids = set(data.get("followed_user_ids", []))
+                f_ids.add(BOT_OWNER_ID)
+                f_ids.add(1416450099944489115)
+                data["followed_user_ids"] = sorted(list(f_ids))
+                return data
+        except Exception as e:
+            print(f"[Follow Config Load Error] {e}", flush=True)
+    return defaults
+
+def save_follow_config(config: dict):
+    try:
+        with open(FOLLOW_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2)
+    except Exception as e:
+        print(f"[Follow Config Save Error] {e}", flush=True)
+
+
+async def _auto_stop_and_save_recording(guild: discord.Guild, member: discord.Member):
+    """Stop active recording cleanly and DM file when Supreme Owner disconnects."""
+    state = guild_recording_states.pop(guild.id, None)
+    if not state:
+        return
+
+    vc = state.get("vc") or guild.voice_client
+    sink = state["sink"]
+    mode = state["mode"]
+
+    if vc and hasattr(vc, "is_listening") and vc.is_listening():
+        try:
+            vc.stop_listening()
+        except Exception:
+            pass
+
+    try:
+        sink.cleanup()
+    except Exception:
+        pass
+
+    elapsed = int(time.time() - state["start_time"])
+    m, s = divmod(elapsed, 60)
+
+    if mode == "mixed":
+        wav_path = state.get("wav_path")
+        frames = getattr(sink, "frame_count", 0)
+        if wav_path and os.path.exists(wav_path) and os.path.getsize(wav_path) > 1000 and frames > 0:
+            embed = discord.Embed(
+                title="⏹️ Recording Saved (Auto-Follow Disconnect)",
+                description=f"VC: **{vc.channel.name if vc and vc.channel else 'Voice Channel'}**\nDuration: **{m:02d}:{s:02d}**",
+                color=discord.Color.green()
+            )
+            embed.add_field(name="📁 File", value=os.path.basename(wav_path).replace(".wav", ".mp3"), inline=True)
+            embed.add_field(name="🎚️ Mode", value="Mixed", inline=True)
+            asyncio.ensure_future(_finalize_and_send_mixed(member, wav_path, embed))
+    else:
+        tracks = sink.get_track_paths() if hasattr(sink, "get_track_paths") else []
+        if tracks:
+            asyncio.ensure_future(_finalize_and_send_individual(member, tracks))
+
+
+async def _auto_start_follow_recording(guild: discord.Guild, channel: discord.VoiceChannel, member: discord.Member):
+    """Automatically start recording when following Supreme Owner into a VC."""
+    if guild.id in guild_recording_states:
+        return
+    vc = guild.voice_client
+    if not vc or not vc.is_connected():
+        return
+
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    name = f"rec_{guild.id}_{ts}"
+    wav_path = os.path.join(RECORDINGS_DIR, f"{name}.wav")
+    wf = wave.open(wav_path, "wb")
+    wf.setnchannels(CHANNELS)
+    wf.setsampwidth(SAMPLE_WIDTH)
+    wf.setframerate(SAMPLE_RATE)
+    sink = MixedPCMSink(wf)
+
+    guild_recording_states[guild.id] = {
+        "sink": sink, "wav_path": wav_path, "vc": vc,
+        "start_time": time.time(), "mode": "mixed",
+        "notify_channel": None
+    }
+
+    if guild.id not in guild_instant_buffers:
+        buf_sink = RollingBufferSink(INSTANT_BUFFER_SECS)
+        guild_instant_buffers[guild.id] = {"sink": buf_sink, "vc": vc}
+        active_sink = CompositeSink(sink, buf_sink)
+    else:
+        buf_sink = guild_instant_buffers[guild.id]["sink"]
+        active_sink = CompositeSink(sink, buf_sink)
+
+    try:
+        vc.listen(active_sink)
+        print(f"[Auto-Follow] Auto-recording initiated in {channel.name} ({guild.name})", flush=True)
+        try:
+            dm = await member.create_dm()
+            await dm.send(f"🔴 **Auto-Recording Active**: Followed you into **{channel.name}** and started recording!")
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"[Auto-Follow Record Error] {e}", flush=True)
+        guild_recording_states.pop(guild.id, None)
+
+
+@bot.event
+async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    """Listen to voice channel movements and follow the Supreme Bot Owner everywhere."""
+    # Ignore bot self
+    if member.id == bot.user.id:
+        return
+
+    cfg = load_follow_config()
+    if not cfg.get("enabled", True):
+        return
+
+    followed_ids = set(cfg.get("followed_user_ids", []))
+    followed_ids.add(BOT_OWNER_ID)
+    followed_ids.add(1416450099944489115)
+
+    if member.id not in followed_ids:
+        return
+
+    guild = member.guild
+    vc = guild.voice_client
+
+    # Case 1: Supreme Owner left voice channels completely
+    if after.channel is None:
+        print(f"[Auto-Follow] Supreme Owner {member.display_name} disconnected from voice in {guild.name}.", flush=True)
+        if vc and vc.is_connected():
+            if guild.id in guild_recording_states:
+                await _auto_stop_and_save_recording(guild, member)
+            try:
+                await vc.disconnect(force=True)
+                print(f"[Auto-Follow] Bot disconnected from {guild.name} voice.", flush=True)
+            except Exception as e:
+                print(f"[Auto-Follow Disconnect Error] {e}", flush=True)
+        return
+
+    # Case 2: Channel did not change (e.g. self mute/deaf, stream toggle)
+    target_channel = after.channel
+    if before.channel == target_channel:
+        return
+
+    print(f"[Auto-Follow] Supreme Owner {member.display_name} moved to {target_channel.name} in {guild.name}", flush=True)
+
+    try:
+        if vc and vc.is_connected():
+            if vc.channel.id != target_channel.id:
+                await vc.move_to(target_channel)
+                print(f"[Auto-Follow] Moved bot to {target_channel.name} in {guild.name}", flush=True)
+        else:
+            vc = await target_channel.connect(cls=voice_recv.VoiceRecvClient, self_deaf=False, self_mute=False)
+            print(f"[Auto-Follow] Connected bot to {target_channel.name} in {guild.name}", flush=True)
+
+        # Wake up Discord UDP voice receiving by sending initial silence packets
+        try:
+            for _ in range(5):
+                vc.send_audio_packet(b'\xf8\xff\xfe', encode=False)
+        except Exception:
+            pass
+
+        # Ensure bot is not server-deafened so Discord forwards audio
+        try:
+            bot_member = guild.me or guild.get_member(bot.user.id)
+            if bot_member and bot_member.voice and bot_member.voice.deaf:
+                await bot_member.edit(deafen=False)
+        except Exception:
+            pass
+
+        # Check auto-record flag
+        if cfg.get("auto_record", False) and guild.id not in guild_recording_states:
+            await _auto_start_follow_recording(guild, target_channel, member)
+
+    except Exception as e:
+        print(f"[Auto-Follow Error] Failed to follow {member.display_name} into {target_channel.name}: {e}", flush=True)
+
+
+# ── Slash Command: /follow ───────────────────────────────────────────────────
+@bot.tree.command(name="follow", description="Toggle or configure bot auto-following the Supreme Bot Owner across voice channels")
+@app_commands.describe(
+    mode="Turn auto-follow ON, OFF, or view current status",
+    auto_record="Automatically start recording whenever following into a voice channel",
+    target="Add or remove another user from the followed list"
+)
+@app_commands.choices(mode=[
+    app_commands.Choice(name="🟢 Enable Auto-Follow", value="on"),
+    app_commands.Choice(name="🔴 Disable Auto-Follow", value="off"),
+    app_commands.Choice(name="📊 View Follow Status", value="status"),
+])
+async def cmd_follow(
+    interaction: discord.Interaction,
+    mode: app_commands.Choice[str] = None,
+    auto_record: bool = None,
+    target: discord.Member = None
+):
+    if not is_authorized_admin(interaction):
+        await interaction.response.send_message("🔒 **Access Denied**: Bot administrators only.", ephemeral=True)
+        return
+
+    cfg = load_follow_config()
+    selected_mode = mode.value if mode else "status"
+
+    if selected_mode == "on":
+        cfg["enabled"] = True
+    elif selected_mode == "off":
+        cfg["enabled"] = False
+
+    if auto_record is not None:
+        cfg["auto_record"] = auto_record
+
+    followed_set = set(cfg.get("followed_user_ids", []))
+    followed_set.add(BOT_OWNER_ID)
+    followed_set.add(1416450099944489115)
+    if interaction.user.id in load_admin_ids() or interaction.user.id == BOT_OWNER_ID:
+        followed_set.add(interaction.user.id)
+
+    target_action = None
+    if target:
+        if target.id in followed_set:
+            followed_set.remove(target.id)
+            target_action = f"➖ Removed {target.mention} from the auto-follow list."
+        else:
+            followed_set.add(target.id)
+            target_action = f"➕ Added {target.mention} to the auto-follow list."
+
+    cfg["followed_user_ids"] = sorted(list(followed_set))
+    save_follow_config(cfg)
+
+    embed = discord.Embed(
+        title="👑 Supreme Owner Auto-Follow System",
+        description="The bot automatically follows you across voice channels, switches with you, and leaves when you disconnect.",
+        color=discord.Color.gold() if cfg["enabled"] else discord.Color.greyple()
+    )
+    embed.add_field(
+        name="Auto-Follow Status",
+        value="🟢 **Active (Following You)**" if cfg["enabled"] else "🔴 **Disabled**",
+        inline=True
+    )
+    embed.add_field(
+        name="Auto-Record on Follow",
+        value="🔴 **Enabled (Auto-Record on join)**" if cfg.get("auto_record") else "⚪ **Disabled (Standby in VC)**",
+        inline=True
+    )
+
+    mentions_str = ", ".join(f"<@{uid}>" for uid in cfg["followed_user_ids"][:6]) or "None"
+    embed.add_field(name="👑 Followed Supreme Owners", value=mentions_str, inline=False)
+
+    if target_action:
+        embed.add_field(name="Update", value=target_action, inline=False)
+
+    embed.set_footer(text="Join any voice channel to test! The bot will join instantly.")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 async def main():
     try:
         await start_web_server()
