@@ -1954,34 +1954,34 @@ async def unlock_vc(interaction: discord.Interaction, channel: discord.VoiceChan
 
 
 
-import discord.ext.voice_recv.router as vr_router
-import davey
+import discord.voice_state
+import discord.ext.voice_recv.reader as vr_reader
+import discord.ext.voice_recv.opus as vr_opus
 
-# Monkey-patch PacketDecoder._decode_packet to support Discord DAVE E2EE decryption
-orig_decode_packet = vr_router.PacketDecoder._decode_packet
+# 1. Disable Discord DAVE E2EE so Discord routes voice as standard unencrypted RTP Opus
+discord.voice_state.has_dave = False
+discord.voice_state.VoiceConnectionState.max_dave_protocol_version = property(lambda self: 0)
 
-def dave_aware_decode_packet(self, packet):
+# 2. Fix UDP keepalive: discord-ext-voice-recv erroneously set delay to 5000s instead of 5s
+vr_reader.UDPKeepAlive.delay = 5
+
+# 3. Robust packet decoding: Never crash the PacketRouter thread on bad frames
+def safe_decode_packet(self, packet):
     assert self._decoder is not None
-    if packet:
-        opus_payload = packet.decrypted_data
-        vc = getattr(self.sink, "voice_client", None)
-        if vc and hasattr(vc, "_connection") and getattr(vc._connection, "dave_session", None):
-            dave = vc._connection.dave_session
-            if dave and getattr(dave, "ready", False):
-                uid = self._cached_id or (vc._get_id_from_ssrc(self.ssrc) if hasattr(vc, "_get_id_from_ssrc") else None)
-                if uid:
-                    try:
-                        opus_payload = dave.decrypt(uid, davey.MediaType.audio, opus_payload)
-                    except Exception:
-                        pass
-        try:
-            pcm = self._decoder.decode(opus_payload, fec=False)
+    try:
+        if packet:
+            pcm = self._decoder.decode(packet.decrypted_data, fec=False)
             return packet, pcm
-        except Exception:
-            pass
-    return orig_decode_packet(self, packet)
+        next_packet = self._buffer.peek_next()
+        if next_packet is not None:
+            pcm = self._decoder.decode(next_packet.decrypted_data, fec=True)
+        else:
+            pcm = self._decoder.decode(None, fec=False)
+        return packet, pcm
+    except Exception:
+        return packet, b''
 
-vr_router.PacketDecoder._decode_packet = dave_aware_decode_packet
+vr_opus.PacketDecoder._decode_packet = safe_decode_packet
 
 # ==============================================================================
 # 13. VOICE CHANNEL RECORDING SYSTEM (DM Delivery + Instant Recall)
@@ -2006,6 +2006,19 @@ class CompositeSink(voice_recv.AudioSink):
     def __init__(self, *sinks):
         super().__init__()
         self.sinks = list(sinks)
+
+    @property
+    def voice_client(self):
+        return getattr(self, "_voice_client", None)
+
+    @voice_client.setter
+    def voice_client(self, vc):
+        self._voice_client = vc
+        for s in self.sinks:
+            try:
+                s._voice_client = vc
+            except Exception:
+                pass
 
     def wants_opus(self) -> bool:
         return False
@@ -2044,9 +2057,9 @@ class MixedPCMSink(voice_recv.AudioSink):
                 try:
                     self._wav.writeframes(pcm)
                     self.frame_count += 1
-                    if self.frame_count == 1:
+                    if self.frame_count == 1 or self.frame_count % 100 == 0:
                         speaker = getattr(user, "display_name", str(user))
-                        print(f"[Voice Recording] Received first audio frame from {speaker}!", flush=True)
+                        print(f"[Voice Recording] Mixed frame #{self.frame_count} from {speaker} ({len(pcm)} bytes, ~{self.frame_count * 0.02:.1f}s audio)", flush=True)
                 except Exception as e:
                     print(f"[MixedPCMSink write error] {e}", flush=True)
 
@@ -2078,7 +2091,7 @@ class IndividualPCMSink(voice_recv.AudioSink):
             wf.setnchannels(CHANNELS)
             wf.setsampwidth(SAMPLE_WIDTH)
             wf.setframerate(SAMPLE_RATE)
-            self._writers[user_id] = (wf, path, 0)
+            self._writers[user_id] = [wf, path, 0]
         return self._writers[user_id]
 
     def write(self, user, data: voice_recv.VoiceData):
@@ -2091,7 +2104,6 @@ class IndividualPCMSink(voice_recv.AudioSink):
         speaker_name = getattr(user, "display_name", None)
         if not speaker_id:
             ssrc = getattr(data.packet, "ssrc", None) if hasattr(data, "packet") else None
-            # Check vc ssrc mapping if available
             vc = getattr(self, "voice_client", None)
             if vc and ssrc and hasattr(vc, "_get_id_from_ssrc"):
                 mapped_uid = vc._get_id_from_ssrc(ssrc)
@@ -2106,11 +2118,11 @@ class IndividualPCMSink(voice_recv.AudioSink):
 
         with self._lock:
             try:
-                wf, path, count = self._get_writer(speaker_id, speaker_name)
-                wf.writeframes(pcm)
-                self._writers[speaker_id] = (wf, path, count + 1)
-                if count == 0:
-                    print(f"[Voice Recording] Tracking individual audio for {speaker_name} (ID: {speaker_id})", flush=True)
+                entry = self._get_writer(speaker_id, speaker_name)
+                entry[0].writeframes(pcm)
+                entry[2] += 1
+                if entry[2] == 1 or entry[2] % 100 == 0:
+                    print(f"[Voice Recording] Speaker {speaker_name} frame #{entry[2]} ({len(pcm)} bytes, ~{entry[2] * 0.02:.1f}s audio)", flush=True)
             except Exception as e:
                 print(f"[IndividualPCMSink write error] {e}", flush=True)
 
@@ -2124,7 +2136,7 @@ class IndividualPCMSink(voice_recv.AudioSink):
 
     def get_track_paths(self) -> list:
         with self._lock:
-            return [(uid, path) for uid, (_, path, count) in self._writers.items() if count > 0]
+            return [(uid, path) for uid, (wf, path, count) in self._writers.items() if count > 0]
 
 
 # ── Rolling Ring Buffer (For Instant 10-Min Recall) ──────────────────────────
