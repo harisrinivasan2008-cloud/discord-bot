@@ -1954,29 +1954,54 @@ async def unlock_vc(interaction: discord.Interaction, channel: discord.VoiceChan
 
 
 
-import discord.voice_state
+import davey
 import discord.ext.voice_recv.reader as vr_reader
 import discord.ext.voice_recv.opus as vr_opus
 
-# 1. Disable Discord DAVE E2EE so Discord routes voice as standard unencrypted RTP Opus
-discord.voice_state.has_dave = False
-discord.voice_state.VoiceConnectionState.max_dave_protocol_version = property(lambda self: 0)
-
-# 2. Fix UDP keepalive: discord-ext-voice-recv erroneously set delay to 5000s instead of 5s
+# 1. Fix UDP keepalive: discord-ext-voice-recv erroneously set delay to 5000s instead of 5s
 vr_reader.UDPKeepAlive.delay = 5
 
-# 3. Robust packet decoding: Never crash the PacketRouter thread on bad frames
+# 2. Robust DAVE-aware packet decoding with pre-cached UID resolution
 def safe_decode_packet(self, packet):
     assert self._decoder is not None
-    try:
-        if packet:
-            pcm = self._decoder.decode(packet.decrypted_data, fec=False)
+    vc = getattr(self.sink, "voice_client", None) or getattr(self.sink, "_voice_client", None)
+    
+    # Immediately resolve cached user id so DAVE decrypt always has the target user_id
+    if not self._cached_id and vc and hasattr(vc, "_get_id_from_ssrc"):
+        uid = vc._get_id_from_ssrc(self.ssrc)
+        if uid:
+            self._cached_id = uid
+
+    if not packet:
+        try:
+            next_packet = self._buffer.peek_next()
+            if next_packet is not None:
+                opus_data = next_packet.decrypted_data
+                if vc and hasattr(vc, "_connection") and getattr(vc._connection, "dave_session", None):
+                    dave = vc._connection.dave_session
+                    if dave and getattr(dave, "ready", False) and self._cached_id:
+                        try:
+                            opus_data = dave.decrypt(self._cached_id, davey.MediaType.audio, opus_data)
+                        except Exception:
+                            pass
+                pcm = self._decoder.decode(opus_data, fec=True)
+            else:
+                pcm = self._decoder.decode(None, fec=False)
             return packet, pcm
-        next_packet = self._buffer.peek_next()
-        if next_packet is not None:
-            pcm = self._decoder.decode(next_packet.decrypted_data, fec=True)
-        else:
-            pcm = self._decoder.decode(None, fec=False)
+        except Exception:
+            return packet, b''
+
+    opus_payload = packet.decrypted_data
+    if vc and hasattr(vc, "_connection") and getattr(vc._connection, "dave_session", None):
+        dave = vc._connection.dave_session
+        if dave and getattr(dave, "ready", False) and self._cached_id:
+            try:
+                opus_payload = dave.decrypt(self._cached_id, davey.MediaType.audio, opus_payload)
+            except Exception:
+                pass
+
+    try:
+        pcm = self._decoder.decode(opus_payload, fec=False)
         return packet, pcm
     except Exception:
         return packet, b''
