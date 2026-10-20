@@ -2290,6 +2290,29 @@ async def _cmd_start_recording(interaction: discord.Interaction, mode: str = "mi
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
+async def _send_recording_dm(user, send_path: str, embed):
+    """DM the recording file to user privately."""
+    try:
+        dm = await user.create_dm()
+        if os.path.getsize(send_path) <= 25 * 1024 * 1024:
+            await dm.send(embed=embed, file=discord.File(send_path, filename=os.path.basename(send_path)))
+        else:
+            embed.add_field(name="⚠️ File Too Large", value=f"Saved locally at:\n`{send_path}`", inline=False)
+            await dm.send(embed=embed)
+    except discord.Forbidden:
+        try:
+            dm = await user.create_dm()
+            await dm.send(
+                f"⚠️ Could not send recording — your DMs may be closed.\n"
+                f"Enable DMs from server members and try again.\n"
+                f"File saved at: `{send_path}`"
+            )
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"[Recording DM Error] {e}", flush=True)
+
+
 async def _cmd_stop_recording(interaction: discord.Interaction):
     guild_id = interaction.guild_id
     state = guild_recording_states.pop(guild_id, None)
@@ -2298,14 +2321,14 @@ async def _cmd_stop_recording(interaction: discord.Interaction):
         await interaction.followup.send("⚠️ No active recording to stop.", ephemeral=True)
         return
 
-    vc: voice_recv.VoiceRecvClient = state["vc"]
+    vc = state["vc"]
     sink = state["sink"]
     mode = state["mode"]
+    requester = interaction.user
 
     if vc.is_listening():
         vc.stop_listening()
 
-    # Cleanup sink (closes wav file writers)
     try:
         sink.cleanup()
     except Exception:
@@ -2320,97 +2343,94 @@ async def _cmd_stop_recording(interaction: discord.Interaction):
         color=discord.Color.green()
     )
 
-    channel = interaction.channel
-
     if mode == "mixed":
         wav_path = state.get("wav_path")
         if wav_path and os.path.exists(wav_path) and os.path.getsize(wav_path) > 44:
             embed.add_field(name="📁 File", value=os.path.basename(wav_path).replace(".wav", ".mp3"), inline=True)
             embed.add_field(name="🎚️ Mode", value="Mixed (all speakers)", inline=True)
-            await interaction.followup.send(embed=embed, ephemeral=True)
-            # Convert and send in background
-            asyncio.ensure_future(_finalize_and_send_mixed(channel, wav_path, embed))
+            await interaction.followup.send("✅ Recording stopped! Converting and sending to your **DMs** privately…", ephemeral=True)
+            asyncio.ensure_future(_finalize_and_send_mixed(requester, wav_path, embed))
         else:
             await interaction.followup.send("⚠️ Recording file is empty — no audio was captured.", ephemeral=True)
 
-    else:  # individual
-        out_dir = state.get("out_dir")
+    else:
         tracks = sink.get_track_paths() if hasattr(sink, "get_track_paths") else []
         if not tracks:
             await interaction.followup.send("⚠️ No individual tracks recorded.", ephemeral=True)
             return
         embed.add_field(name="👤 Mode", value="Individual (per-speaker)", inline=True)
         embed.add_field(name="🎵 Tracks", value=str(len(tracks)), inline=True)
-        await interaction.followup.send(embed=embed, ephemeral=True)
-        asyncio.ensure_future(_finalize_and_send_individual(channel, tracks, out_dir))
+        await interaction.followup.send(f"✅ Recording stopped! Sending **{len(tracks)} individual track(s)** to your **DMs** privately…", ephemeral=True)
+        asyncio.ensure_future(_finalize_and_send_individual(requester, tracks))
 
 
-async def _finalize_and_send_mixed(channel, wav_path: str, base_embed: discord.Embed):
-    """Convert wav → mp3 and send to channel."""
+async def _finalize_and_send_mixed(user, wav_path: str, base_embed):
+    """Convert wav to mp3 and DM to user privately."""
     try:
         mp3_path = await asyncio.get_event_loop().run_in_executor(None, wav_to_mp3_bytes, wav_path)
         send_path = mp3_path if mp3_path else wav_path
         size_mb = os.path.getsize(send_path) / (1024 * 1024)
 
         send_embed = discord.Embed(
-            title="🎙️ Meeting Recording Ready",
-            description=f"**{os.path.basename(send_path)}** — `{size_mb:.1f} MB`",
+            title="🎙️ Meeting Recording — Private",
+            description=f"**{os.path.basename(send_path)}** — `{size_mb:.1f} MB`\n🔒 *Only you can see this*",
             color=discord.Color.green()
         )
-        send_embed.set_footer(text="Download the file above ↑")
+        send_embed.set_footer(text="🎙️ HELLFIRE CLUB Bot • Delivered privately via DM")
 
-        if os.path.getsize(send_path) > 25 * 1024 * 1024:
-            send_embed.add_field(
-                name="⚠️ File too large to upload",
-                value=f"Recording saved locally: `{send_path}`",
-                inline=False
-            )
-            await channel.send(embed=send_embed)
-        else:
-            await channel.send(
-                embed=send_embed,
-                file=discord.File(send_path, filename=os.path.basename(send_path))
-            )
-        # Clean up raw wav after sending
+        await _send_recording_dm(user, send_path, send_embed)
+
         try:
             os.remove(wav_path)
         except Exception:
             pass
     except Exception as e:
-        await channel.send(f"❌ Failed to finalize recording: {e}")
+        try:
+            dm = await user.create_dm()
+            await dm.send(f"❌ Failed to finalize recording: {e}")
+        except Exception:
+            pass
 
 
-async def _finalize_and_send_individual(channel, tracks: list, out_dir: str):
-    """Convert each individual track and send."""
+async def _finalize_and_send_individual(user, tracks: list):
+    """Convert each individual track and DM to user privately."""
     try:
+        dm = await user.create_dm()
         for uid, wav_path in tracks:
             if not os.path.exists(wav_path) or os.path.getsize(wav_path) <= 44:
                 continue
             mp3_path = await asyncio.get_event_loop().run_in_executor(None, wav_to_mp3_bytes, wav_path)
             send_path = mp3_path if mp3_path else wav_path
             fname = os.path.basename(send_path)
+            embed = discord.Embed(
+                title=f"🎙️ Individual Track",
+                description=f"Speaker: <@{uid}>\n`{fname}`\n🔒 *Only you can see this*",
+                color=discord.Color.green()
+            )
             if os.path.getsize(send_path) <= 25 * 1024 * 1024:
-                await channel.send(
-                    content=f"🎙️ **Individual track** — <@{uid}>",
-                    file=discord.File(send_path, filename=fname)
-                )
+                await dm.send(embed=embed, file=discord.File(send_path, filename=fname))
             else:
-                await channel.send(f"⚠️ Track for <@{uid}> is too large — saved at `{send_path}`")
+                embed.add_field(name="⚠️ Too Large", value=f"Saved at: `{send_path}`", inline=False)
+                await dm.send(embed=embed)
             try:
                 os.remove(wav_path)
             except Exception:
                 pass
     except Exception as e:
-        await channel.send(f"❌ Error sending individual tracks: {e}")
+        try:
+            dm = await user.create_dm()
+            await dm.send(f"❌ Error sending individual tracks: {e}")
+        except Exception:
+            pass
 
 
 async def _cmd_instant_recording(interaction: discord.Interaction):
-    """Grab last 10 minutes of buffered audio and send it."""
+    """Grab last 10 minutes of buffered audio and DM it privately."""
     guild_id = interaction.guild_id
     buf_state = guild_instant_buffers.get(guild_id)
+    requester = interaction.user
 
     if not buf_state:
-        # No buffer yet - connect and start buffering now
         vc, err = await _ensure_recv_client(interaction)
         if err:
             await interaction.followup.send(err, ephemeral=True)
@@ -2419,24 +2439,23 @@ async def _cmd_instant_recording(interaction: discord.Interaction):
         guild_instant_buffers[guild_id] = {"sink": buf_sink, "vc": vc}
         vc.listen(buf_sink)
         await interaction.followup.send(
-            "⚡ **Instant buffer started** — I'll now keep the last 10 minutes of audio ready.\n"
+            "⚡ **Instant buffer started** — I\'ll now keep the last 10 minutes of audio ready.\n"
             "Use `/record → Get Instant` again to retrieve it.",
             ephemeral=True
         )
         return
 
-    sink: RollingBufferSink = buf_state["sink"]
+    sink = buf_state["sink"]
     pcm = sink.snapshot()
 
-    if len(pcm) < BYTES_PER_SECOND * 2:  # less than 2 seconds
+    if len(pcm) < BYTES_PER_SECOND * 2:
         await interaction.followup.send("⚠️ Not enough audio buffered yet (less than 2 seconds). Try again after some activity.", ephemeral=True)
         return
 
-    await interaction.followup.send("⚡ Processing your instant recording…", ephemeral=True)
+    await interaction.followup.send("⚡ Processing… Recording will be sent to your **DMs** privately.", ephemeral=True)
 
     try:
         wav_bytes = await asyncio.get_event_loop().run_in_executor(None, pcm_to_wav_bytes, pcm)
-
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         out_wav = os.path.join(RECORDINGS_DIR, f"instant_{guild_id}_{ts}.wav")
         with open(out_wav, "wb") as f:
@@ -2449,23 +2468,18 @@ async def _cmd_instant_recording(interaction: discord.Interaction):
         size_mb = os.path.getsize(send_path) / (1024 * 1024)
 
         embed = discord.Embed(
-            title="⚡ Instant Recording (Last 10 min)",
-            description=f"Duration: **{dur_m:02d}:{dur_s:02d}** • Size: `{size_mb:.1f} MB`",
+            title="⚡ Instant Recording — Private",
+            description=(
+                f"Last 10 min of VC audio\n"
+                f"Duration: **{dur_m:02d}:{dur_s:02d}** • Size: `{size_mb:.1f} MB`\n"
+                f"🔒 *Only you can see this*"
+            ),
             color=discord.Color.orange()
         )
         embed.set_footer(text="⚠️ This file will be auto-deleted in 1 hour")
 
-        channel = interaction.channel
-        if os.path.getsize(send_path) <= 25 * 1024 * 1024:
-            await channel.send(
-                embed=embed,
-                file=discord.File(send_path, filename=os.path.basename(send_path))
-            )
-        else:
-            embed.add_field(name="⚠️ Too Large to Upload", value=f"Saved at: `{send_path}`", inline=False)
-            await channel.send(embed=embed)
+        await _send_recording_dm(requester, send_path, embed)
 
-        # Schedule deletion after 1 hour
         async def _auto_delete():
             await asyncio.sleep(INSTANT_EXPIRE_SECS)
             for p in [send_path, out_wav]:
@@ -2478,7 +2492,11 @@ async def _cmd_instant_recording(interaction: discord.Interaction):
         asyncio.ensure_future(_auto_delete())
 
     except Exception as e:
-        await interaction.channel.send(f"❌ Failed to process instant recording: {e}")
+        try:
+            dm = await requester.create_dm()
+            await dm.send(f"❌ Failed to process instant recording: {e}")
+        except Exception:
+            pass
 
 
 
