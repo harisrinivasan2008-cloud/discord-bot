@@ -1952,6 +1952,7 @@ async def unlock_vc(interaction: discord.Interaction, channel: discord.VoiceChan
 
 
 
+
 # ==============================================================================
 # 13. VOICE CHANNEL RECORDING SYSTEM (DM Delivery + Instant Recall)
 # ==============================================================================
@@ -1968,12 +1969,40 @@ CHANNELS             = 2
 SAMPLE_WIDTH         = 2
 BYTES_PER_SECOND     = SAMPLE_RATE * CHANNELS * SAMPLE_WIDTH
 
+
+# ── CompositeSink (Custom Multiplex Sink that never crashes) ─────────────────
+class CompositeSink(voice_recv.AudioSink):
+    """Custom reliable sink that duplicates audio data to multiple sinks."""
+    def __init__(self, *sinks):
+        super().__init__()
+        self.sinks = list(sinks)
+
+    def wants_opus(self) -> bool:
+        return False
+
+    def write(self, user, data: voice_recv.VoiceData):
+        for s in self.sinks:
+            try:
+                s.write(user, data)
+            except Exception as e:
+                print(f"[CompositeSink write error] {e}", flush=True)
+
+    def cleanup(self):
+        for s in self.sinks:
+            try:
+                s.cleanup()
+            except Exception:
+                pass
+
+
+# ── Mixed Audio Sink (All speakers in 1 track) ───────────────────────────────
 class MixedPCMSink(voice_recv.AudioSink):
     """Writes all received PCM frames into a single wave file."""
     def __init__(self, wav_file):
         super().__init__()
         self._wav = wav_file
         self._lock = threading.Lock()
+        self.frame_count = 0
 
     def wants_opus(self) -> bool:
         return False
@@ -1984,8 +2013,12 @@ class MixedPCMSink(voice_recv.AudioSink):
             with self._lock:
                 try:
                     self._wav.writeframes(pcm)
-                except Exception:
-                    pass
+                    self.frame_count += 1
+                    if self.frame_count == 1:
+                        speaker = getattr(user, "display_name", str(user))
+                        print(f"[Voice Recording] Received first audio frame from {speaker}!", flush=True)
+                except Exception as e:
+                    print(f"[MixedPCMSink write error] {e}", flush=True)
 
     def cleanup(self):
         try:
@@ -1994,6 +2027,7 @@ class MixedPCMSink(voice_recv.AudioSink):
             pass
 
 
+# ── Individual Audio Sink (Per-speaker tracks) ────────────────────────────────
 class IndividualPCMSink(voice_recv.AudioSink):
     """Saves each speaker's audio to a separate wav file."""
     def __init__(self, out_dir):
@@ -2014,7 +2048,7 @@ class IndividualPCMSink(voice_recv.AudioSink):
             wf.setnchannels(CHANNELS)
             wf.setsampwidth(SAMPLE_WIDTH)
             wf.setframerate(SAMPLE_RATE)
-            self._writers[user_id] = (wf, path)
+            self._writers[user_id] = (wf, path, 0)
         return self._writers[user_id]
 
     def write(self, user, data: voice_recv.VoiceData):
@@ -2023,14 +2057,17 @@ class IndividualPCMSink(voice_recv.AudioSink):
             return
         with self._lock:
             try:
-                wf, _ = self._get_writer(user.id, getattr(user, "display_name", str(user.id)))
+                wf, path, count = self._get_writer(user.id, getattr(user, "display_name", str(user.id)))
                 wf.writeframes(pcm)
-            except Exception:
-                pass
+                self._writers[user.id] = (wf, path, count + 1)
+                if count == 0:
+                    print(f"[Voice Recording] Tracking individual audio for {getattr(user, 'display_name', user)}", flush=True)
+            except Exception as e:
+                print(f"[IndividualPCMSink write error] {e}", flush=True)
 
     def cleanup(self):
         with self._lock:
-            for wf, _ in self._writers.values():
+            for wf, path, count in self._writers.values():
                 try:
                     wf.close()
                 except Exception:
@@ -2038,9 +2075,10 @@ class IndividualPCMSink(voice_recv.AudioSink):
 
     def get_track_paths(self) -> list:
         with self._lock:
-            return [(uid, path) for uid, (_, path) in self._writers.items()]
+            return [(uid, path) for uid, (_, path, count) in self._writers.items() if count > 0]
 
 
+# ── Rolling Ring Buffer (For Instant 10-Min Recall) ──────────────────────────
 class RollingBufferSink(voice_recv.AudioSink):
     """Keeps a rolling 10-minute ring buffer of mixed audio."""
     def __init__(self, max_seconds: int = INSTANT_BUFFER_SECS):
@@ -2136,22 +2174,33 @@ async def _ensure_recv_client(interaction: discord.Interaction, channel: discord
     if existing and existing.is_connected():
         if existing.channel.id == target.id:
             if isinstance(existing, voice_recv.VoiceRecvClient):
-                return existing, None
-            try:
-                await existing.disconnect(force=True)
-            except Exception:
-                pass
+                vc = existing
+            else:
+                try:
+                    await existing.disconnect(force=True)
+                    vc = await target.connect(cls=voice_recv.VoiceRecvClient)
+                except Exception as e:
+                    return None, f"❌ Reconnect error: {e}"
         else:
             try:
                 await existing.disconnect(force=True)
-            except Exception:
-                pass
+                vc = await target.connect(cls=voice_recv.VoiceRecvClient)
+            except Exception as e:
+                return None, f"❌ Connect error: {e}"
+    else:
+        try:
+            vc = await target.connect(cls=voice_recv.VoiceRecvClient)
+        except Exception as e:
+            return None, f"❌ Could not connect to {target.mention}: {e}"
 
+    # Wake up Discord UDP voice receiving by sending initial silence packets
     try:
-        vc = await target.connect(cls=voice_recv.VoiceRecvClient)
-        return vc, None
-    except Exception as e:
-        return None, f"❌ Could not connect to {target.mention}: {e}"
+        for _ in range(5):
+            vc.send_audio_packet(b'\xf8\xff\xfe', encode=False)
+    except Exception:
+        pass
+
+    return vc, None
 
 
 # ── Interactive Buttons View (Persistent, Never Times Out) ───────────────────
@@ -2176,7 +2225,7 @@ class RecordButtonsView(discord.ui.View):
         await _cmd_instant_recording(interaction)
 
 
-# ── Main /record Command with Direct Action Choice ────────────────────────────
+# ── Main /record Command ──────────────────────────────────────────────────────
 @bot.tree.command(name="record", description="Voice channel recording with instant 10-min recall & secret DM delivery")
 @app_commands.describe(
     action="Execute an action directly or open the control panel",
@@ -2310,13 +2359,23 @@ async def _cmd_start_recording(interaction: discord.Interaction, mode: str = "mi
             "notify_channel": interaction.channel
         }
 
-    # Also hook rolling buffer for instant recall (shared connection)
+    # Hook rolling buffer for instant recall via custom CompositeSink
     if guild_id not in guild_instant_buffers:
         buf_sink = RollingBufferSink(INSTANT_BUFFER_SECS)
         guild_instant_buffers[guild_id] = {"sink": buf_sink, "vc": vc}
-        vc.listen(voice_recv.MultiAudioSink(sink, buf_sink))
+        active_sink = CompositeSink(sink, buf_sink)
     else:
-        vc.listen(sink)
+        buf_sink = guild_instant_buffers[guild_id]["sink"]
+        active_sink = CompositeSink(sink, buf_sink)
+
+    try:
+        vc.listen(active_sink)
+        print(f"[Voice Recording] Started listening in {vc.channel.name} (mode: {mode})", flush=True)
+    except Exception as e:
+        print(f"[Voice Recording Start Error] {e}", flush=True)
+        guild_recording_states.pop(guild_id, None)
+        await interaction.followup.send(f"❌ Failed to start recording listener: {e}", ephemeral=True)
+        return
 
     mode_label = "🎚️ Mixed (all speakers in 1 track)" if mode == "mixed" else "👤 Individual (per-speaker tracks)"
     embed = discord.Embed(
@@ -2324,7 +2383,7 @@ async def _cmd_start_recording(interaction: discord.Interaction, mode: str = "mi
         description=f"Now recording in {vc.channel.mention}\n**Mode:** {mode_label}",
         color=discord.Color.red()
     )
-    embed.set_footer(text="Use /recordstop or click Stop to end and receive the file in your DM")
+    embed.set_footer(text="Speak in VC! Type /recordstop when finished to receive audio in your DM")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
@@ -2335,7 +2394,6 @@ async def _cmd_stop_recording(interaction: discord.Interaction):
     guild_id = interaction.guild_id
     state = guild_recording_states.pop(guild_id, None)
 
-    # If state not found, also check if VC is connected to disconnect it
     if not state:
         vc = interaction.guild.voice_client if interaction.guild else None
         if vc and vc.is_connected():
@@ -2369,7 +2427,6 @@ async def _cmd_stop_recording(interaction: discord.Interaction):
     except Exception:
         pass
 
-    # Disconnect from VC cleanly
     if vc and vc.is_connected():
         try:
             await vc.disconnect(force=True)
@@ -2387,18 +2444,21 @@ async def _cmd_stop_recording(interaction: discord.Interaction):
 
     if mode == "mixed":
         wav_path = state.get("wav_path")
-        if wav_path and os.path.exists(wav_path) and os.path.getsize(wav_path) > 44:
+        frames = getattr(sink, "frame_count", 0)
+        print(f"[Recording Finished] Mixed frames recorded: {frames}", flush=True)
+        if wav_path and os.path.exists(wav_path) and os.path.getsize(wav_path) > 1000 and frames > 0:
             embed.add_field(name="📁 File", value=os.path.basename(wav_path).replace(".wav", ".mp3"), inline=True)
             embed.add_field(name="🎚️ Mode", value="Mixed (all speakers)", inline=True)
             await interaction.followup.send("✅ Recording stopped! Converting and sending to your **DM** privately…", ephemeral=True)
             asyncio.ensure_future(_finalize_and_send_mixed(requester, wav_path, embed))
         else:
-            await interaction.followup.send("⚠️ Recording file is empty — no audio was spoken while recording.", ephemeral=True)
+            await interaction.followup.send(f"⚠️ Recording ended ({m:02d}:{s:02d}), but no voice audio was detected while recording.", ephemeral=True)
 
     else:
         tracks = sink.get_track_paths() if hasattr(sink, "get_track_paths") else []
+        print(f"[Recording Finished] Individual tracks with audio: {len(tracks)}", flush=True)
         if not tracks:
-            await interaction.followup.send("⚠️ No individual tracks recorded (no audio detected).", ephemeral=True)
+            await interaction.followup.send(f"⚠️ Recording ended ({m:02d}:{s:02d}), but no member was heard speaking.", ephemeral=True)
             return
         embed.add_field(name="👤 Mode", value="Individual (per-speaker)", inline=True)
         embed.add_field(name="🎵 Tracks", value=str(len(tracks)), inline=True)
@@ -2439,7 +2499,7 @@ async def _finalize_and_send_individual(user, tracks: list):
     try:
         dm = await user.create_dm()
         for uid, wav_path in tracks:
-            if not os.path.exists(wav_path) or os.path.getsize(wav_path) <= 44:
+            if not os.path.exists(wav_path) or os.path.getsize(wav_path) <= 1000:
                 continue
             mp3_path = await asyncio.get_event_loop().run_in_executor(None, wav_to_mp3_bytes, wav_path)
             send_path = mp3_path if mp3_path else wav_path
