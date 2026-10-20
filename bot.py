@@ -6,10 +6,16 @@ import asyncio
 import traceback
 import random
 import re
-from collections import defaultdict
+import wave
+import struct
+import io
+import datetime
+import threading
+from collections import defaultdict, deque
 import discord
 from discord.ext import commands
 from discord import app_commands
+from discord.ext import voice_recv
 from dotenv import load_dotenv
 from aiohttp import web
 
@@ -176,7 +182,7 @@ intents.message_content = True  # Required to read mentions in messages
 intents.members = True          # Required for roles inspection, join dates, and member management
 intents.voice_states = True     # Required for voice channel management (mute, deafen, move)
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents, voice_client_cls=voice_recv.VoiceRecvClient)
 
 # Optional Web server for cloud health checks
 async def start_web_server():
@@ -1943,6 +1949,537 @@ async def unlock_vc(interaction: discord.Interaction, channel: discord.VoiceChan
         await interaction.response.send_message("❌ Missing Permissions: Ensure the bot has 'Manage Channels' permission.", ephemeral=True)
     except Exception as e:
         await interaction.response.send_message(f"❌ Failed to unlock voice channel: {e}", ephemeral=True)
+
+
+# ==============================================================================
+# 13. VOICE CHANNEL RECORDING SYSTEM
+# ==============================================================================
+RECORDINGS_DIR = os.path.join(os.path.dirname(__file__), "recordings")
+os.makedirs(RECORDINGS_DIR, exist_ok=True)
+
+# Per-guild recording state
+guild_recording_states: dict = {}       # guild_id -> {"sink": sink, "wav_path": str, "channel": vc, "start_time": float, "mode": str, "notify_channel": TextChannel}
+guild_instant_buffers: dict = {}        # guild_id -> {"buffer": deque of (timestamp, user_id, pcm_bytes), "vc": VoiceRecvClient}
+guild_instant_tasks: dict = {}          # guild_id -> asyncio.Task (buffer watcher)
+
+INSTANT_BUFFER_SECS  = 600   # Keep rolling 10 min of audio in memory buffer
+INSTANT_EXPIRE_SECS  = 3600  # Auto-delete instant recordings after 1 hour
+SAMPLE_RATE          = 48000
+CHANNELS             = 2
+SAMPLE_WIDTH         = 2     # bytes (16-bit PCM)
+BYTES_PER_SECOND     = SAMPLE_RATE * CHANNELS * SAMPLE_WIDTH  # 192000
+
+# ── Custom Sink: mixes all speakers into one PCM byte stream ──────────────────
+class MixedPCMSink(voice_recv.AudioSink):
+    """Writes all received PCM frames into a single wave file (mixed)."""
+    def __init__(self, wav_file):
+        super().__init__()
+        self._wav = wav_file
+        self._lock = threading.Lock()
+
+    def wants_opus(self) -> bool:
+        return False  # We want decoded PCM
+
+    def write(self, user, data: voice_recv.VoiceData):
+        pcm = data.pcm
+        if pcm:
+            with self._lock:
+                self._wav.writeframes(pcm)
+
+    def cleanup(self):
+        try:
+            self._wav.close()
+        except Exception:
+            pass
+
+
+# ── Custom Sink: saves individual speaker tracks ──────────────────────────────
+class IndividualPCMSink(voice_recv.AudioSink):
+    """Saves each speaker's audio to a separate wav file."""
+    def __init__(self, out_dir):
+        super().__init__()
+        self._dir = out_dir
+        self._writers: dict = {}  # user_id -> wave.Wave_write
+        self._lock = threading.Lock()
+        os.makedirs(out_dir, exist_ok=True)
+
+    def wants_opus(self) -> bool:
+        return False
+
+    def _get_writer(self, user_id: int, display_name: str):
+        if user_id not in self._writers:
+            safe = re.sub(r'[\\/:*?"<>|]', "_", display_name)
+            path = os.path.join(self._dir, f"{safe}_{user_id}.wav")
+            wf = wave.open(path, "wb")
+            wf.setnchannels(CHANNELS)
+            wf.setsampwidth(SAMPLE_WIDTH)
+            wf.setframerate(SAMPLE_RATE)
+            self._writers[user_id] = (wf, path)
+        return self._writers[user_id]
+
+    def write(self, user, data: voice_recv.VoiceData):
+        pcm = data.pcm
+        if not pcm or user is None:
+            return
+        with self._lock:
+            wf, _ = self._get_writer(user.id, getattr(user, "display_name", str(user.id)))
+            wf.writeframes(pcm)
+
+    def cleanup(self):
+        with self._lock:
+            for wf, _ in self._writers.values():
+                try:
+                    wf.close()
+                except Exception:
+                    pass
+
+    def get_track_paths(self) -> list:
+        with self._lock:
+            return [(uid, path) for uid, (_, path) in self._writers.items()]
+
+
+# ── Custom Sink: Rolling buffer (for instant recall) ─────────────────────────
+class RollingBufferSink(voice_recv.AudioSink):
+    """Keeps a rolling 10-minute ring buffer of mixed audio."""
+    def __init__(self, max_seconds: int = INSTANT_BUFFER_SECS):
+        super().__init__()
+        self._max_bytes = max_seconds * BYTES_PER_SECOND
+        self._buf = bytearray()
+        self._lock = threading.Lock()
+
+    def wants_opus(self) -> bool:
+        return False
+
+    def write(self, user, data: voice_recv.VoiceData):
+        pcm = data.pcm
+        if not pcm:
+            return
+        with self._lock:
+            self._buf.extend(pcm)
+            if len(self._buf) > self._max_bytes:
+                # Keep only last max_bytes
+                self._buf = self._buf[-self._max_bytes:]
+
+    def snapshot(self) -> bytes:
+        """Return a copy of the current buffer."""
+        with self._lock:
+            return bytes(self._buf)
+
+    def cleanup(self):
+        with self._lock:
+            self._buf = bytearray()
+
+
+def pcm_to_wav_bytes(pcm: bytes) -> bytes:
+    """Wrap raw PCM bytes in a WAV container and return as bytes."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(CHANNELS)
+        wf.setsampwidth(SAMPLE_WIDTH)
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(pcm)
+    return buf.getvalue()
+
+
+def wav_to_mp3_bytes(wav_path: str) -> str | None:
+    """Convert wav file to mp3 using ffmpeg. Returns mp3 path or None."""
+    try:
+        import imageio_ffmpeg
+        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        ffmpeg = "ffmpeg"
+    mp3_path = wav_path.replace(".wav", ".mp3")
+    import subprocess
+    result = subprocess.run(
+        [ffmpeg, "-y", "-i", wav_path,
+         "-codec:a", "libmp3lame", "-qscale:a", "2",
+         mp3_path],
+        capture_output=True
+    )
+    if result.returncode == 0 and os.path.exists(mp3_path):
+        return mp3_path
+    return None
+
+
+async def _send_audio_file(channel, file_path: str, embed: discord.Embed, label: str = "recording"):
+    """Send audio file to channel. Converts to mp3 if wav is too large."""
+    size = os.path.getsize(file_path)
+    max_size = 25 * 1024 * 1024  # 25 MB Discord limit
+
+    send_path = file_path
+    if size > max_size and file_path.endswith(".wav"):
+        mp3 = await asyncio.get_event_loop().run_in_executor(None, wav_to_mp3_bytes, file_path)
+        if mp3:
+            send_path = mp3
+            size = os.path.getsize(mp3)
+
+    if os.path.getsize(send_path) > max_size:
+        embed.add_field(
+            name="⚠️ File Too Large",
+            value=f"Recording is **{size / (1024*1024):.1f} MB** — too large for Discord upload (25 MB limit).\n"
+                  f"File saved locally at:\n`{send_path}`",
+            inline=False
+        )
+        await channel.send(embed=embed)
+        return
+
+    await channel.send(
+        embed=embed,
+        file=discord.File(send_path, filename=os.path.basename(send_path))
+    )
+
+
+# ── Ensure VoiceRecvClient is used when connecting ───────────────────────────
+async def _ensure_recv_client(interaction: discord.Interaction, channel: discord.VoiceChannel = None):
+    """Connect or move bot to VC using VoiceRecvClient. Returns (vc, error_str)."""
+    guild = interaction.guild
+    target = channel
+    if not target:
+        if interaction.user.voice and interaction.user.voice.channel:
+            target = interaction.user.voice.channel
+        else:
+            return None, "❌ Please join a voice channel first or specify one."
+
+    existing = guild.voice_client
+    if existing and existing.is_connected():
+        if existing.channel.id == target.id:
+            if isinstance(existing, voice_recv.VoiceRecvClient):
+                return existing, None
+            # Wrong type — disconnect and reconnect with recv client
+            await existing.disconnect(force=True)
+        else:
+            await existing.disconnect(force=True)
+
+    try:
+        vc = await target.connect(cls=voice_recv.VoiceRecvClient)
+        return vc, None
+    except Exception as e:
+        return None, f"❌ Could not connect to {target.mention}: {e}"
+
+
+# ── /record slash command ─────────────────────────────────────────────────────
+class RecordActionSelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(label="⏺️  Start Recording (Mixed)",      value="start_mixed",   description="Record all speakers into one audio file"),
+            discord.SelectOption(label="👤  Start Recording (Individual)", value="start_individual", description="Record each speaker in a separate audio track"),
+            discord.SelectOption(label="⏹️  Stop Recording",               value="stop",          description="Stop and get the recording file"),
+            discord.SelectOption(label="⚡  Get Instant (last 10 min)",    value="instant",       description="Get the last 10 minutes of VC audio"),
+        ]
+        super().__init__(placeholder="Choose a recording action…", options=options, min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        choice = self.values[0]
+        guild_id = interaction.guild_id
+        await interaction.response.defer(ephemeral=True)
+
+        if choice in ("start_mixed", "start_individual"):
+            await _cmd_start_recording(interaction, mode=choice.replace("start_", ""))
+
+        elif choice == "stop":
+            await _cmd_stop_recording(interaction)
+
+        elif choice == "instant":
+            await _cmd_instant_recording(interaction)
+
+
+class RecordView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=120)
+        self.add_item(RecordActionSelect())
+
+
+@bot.tree.command(name="record", description="Record the voice channel — mixed or per-speaker. Includes instant 10-min recall.")
+@app_commands.describe(channel="Voice channel to record (defaults to your current VC)")
+async def cmd_record(interaction: discord.Interaction, channel: discord.VoiceChannel = None):
+    if not is_authorized_admin(interaction):
+        await interaction.response.send_message(
+            "🔒 **Access Denied**: Only bot administrators can use the recording system.",
+            ephemeral=True
+        )
+        return
+
+    guild_id = interaction.guild_id
+    recording = guild_recording_states.get(guild_id)
+    instant   = guild_id in guild_instant_buffers
+
+    status_lines = []
+    if recording:
+        elapsed = int(time.time() - recording["start_time"])
+        m, s = divmod(elapsed, 60)
+        status_lines.append(f"🔴 **Recording active** ({recording['mode']} mode) — `{m:02d}:{s:02d}` elapsed")
+    else:
+        status_lines.append("⚪ No active recording")
+
+    if instant:
+        status_lines.append("⚡ **Instant buffer** is running (rolling 10-min recall ready)")
+    else:
+        status_lines.append("💤 Instant buffer not started — start a recording to enable it")
+
+    embed = discord.Embed(
+        title="🎙️ Recording Control Panel",
+        description="\n".join(status_lines),
+        color=discord.Color.red() if recording else discord.Color.blurple()
+    )
+    embed.add_field(
+        name="📖 How it works",
+        value=(
+            "**Mixed** — all voices blended into one `.mp3` file\n"
+            "**Individual** — each speaker gets their own track\n"
+            "**Instant** — bot always keeps the last 10 min buffered; ask anytime\n"
+            "**Auto-delete** — instant files deleted after 1 hour"
+        ),
+        inline=False
+    )
+    embed.set_footer(text="Recordings are only accessible by bot admins • Use /record to manage")
+    await interaction.response.send_message(embed=embed, view=RecordView(), ephemeral=True)
+
+
+# ── Core recording helpers ────────────────────────────────────────────────────
+async def _cmd_start_recording(interaction: discord.Interaction, mode: str = "mixed"):
+    guild_id = interaction.guild_id
+
+    if guild_id in guild_recording_states:
+        await interaction.followup.send("⚠️ A recording is already active. Use **Stop Recording** first.", ephemeral=True)
+        return
+
+    vc, err = await _ensure_recv_client(interaction)
+    if err:
+        await interaction.followup.send(err, ephemeral=True)
+        return
+
+    ts   = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    name = f"rec_{guild_id}_{ts}"
+
+    if mode == "mixed":
+        wav_path = os.path.join(RECORDINGS_DIR, f"{name}.wav")
+        wf = wave.open(wav_path, "wb")
+        wf.setnchannels(CHANNELS)
+        wf.setsampwidth(SAMPLE_WIDTH)
+        wf.setframerate(SAMPLE_RATE)
+        sink = MixedPCMSink(wf)
+        guild_recording_states[guild_id] = {
+            "sink": sink, "wav_path": wav_path, "vc": vc,
+            "start_time": time.time(), "mode": "mixed",
+            "notify_channel": interaction.channel
+        }
+    else:
+        out_dir = os.path.join(RECORDINGS_DIR, name)
+        sink = IndividualPCMSink(out_dir)
+        guild_recording_states[guild_id] = {
+            "sink": sink, "out_dir": out_dir, "vc": vc,
+            "start_time": time.time(), "mode": "individual",
+            "notify_channel": interaction.channel
+        }
+
+    # Also hook rolling buffer for instant recall (shared connection)
+    if guild_id not in guild_instant_buffers:
+        buf_sink = RollingBufferSink(INSTANT_BUFFER_SECS)
+        guild_instant_buffers[guild_id] = {"sink": buf_sink, "vc": vc}
+        vc.listen(voice_recv.MultiAudioSink(sink, buf_sink))
+    else:
+        vc.listen(sink)
+
+    mode_label = "🎚️ Mixed (all speakers)" if mode == "mixed" else "👤 Individual (per-speaker)"
+    embed = discord.Embed(
+        title="🔴 Recording Started",
+        description=f"Now recording **{vc.channel.mention}**\n**Mode:** {mode_label}",
+        color=discord.Color.red()
+    )
+    embed.set_footer(text="Use /record → Stop Recording to end and receive the file")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+async def _cmd_stop_recording(interaction: discord.Interaction):
+    guild_id = interaction.guild_id
+    state = guild_recording_states.pop(guild_id, None)
+
+    if not state:
+        await interaction.followup.send("⚠️ No active recording to stop.", ephemeral=True)
+        return
+
+    vc: voice_recv.VoiceRecvClient = state["vc"]
+    sink = state["sink"]
+    mode = state["mode"]
+
+    if vc.is_listening():
+        vc.stop_listening()
+
+    # Cleanup sink (closes wav file writers)
+    try:
+        sink.cleanup()
+    except Exception:
+        pass
+
+    elapsed = int(time.time() - state["start_time"])
+    m, s = divmod(elapsed, 60)
+
+    embed = discord.Embed(
+        title="⏹️ Recording Stopped",
+        description=f"Duration: **{m:02d}:{s:02d}**",
+        color=discord.Color.green()
+    )
+
+    channel = interaction.channel
+
+    if mode == "mixed":
+        wav_path = state.get("wav_path")
+        if wav_path and os.path.exists(wav_path) and os.path.getsize(wav_path) > 44:
+            embed.add_field(name="📁 File", value=os.path.basename(wav_path).replace(".wav", ".mp3"), inline=True)
+            embed.add_field(name="🎚️ Mode", value="Mixed (all speakers)", inline=True)
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            # Convert and send in background
+            asyncio.ensure_future(_finalize_and_send_mixed(channel, wav_path, embed))
+        else:
+            await interaction.followup.send("⚠️ Recording file is empty — no audio was captured.", ephemeral=True)
+
+    else:  # individual
+        out_dir = state.get("out_dir")
+        tracks = sink.get_track_paths() if hasattr(sink, "get_track_paths") else []
+        if not tracks:
+            await interaction.followup.send("⚠️ No individual tracks recorded.", ephemeral=True)
+            return
+        embed.add_field(name="👤 Mode", value="Individual (per-speaker)", inline=True)
+        embed.add_field(name="🎵 Tracks", value=str(len(tracks)), inline=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        asyncio.ensure_future(_finalize_and_send_individual(channel, tracks, out_dir))
+
+
+async def _finalize_and_send_mixed(channel, wav_path: str, base_embed: discord.Embed):
+    """Convert wav → mp3 and send to channel."""
+    try:
+        mp3_path = await asyncio.get_event_loop().run_in_executor(None, wav_to_mp3_bytes, wav_path)
+        send_path = mp3_path if mp3_path else wav_path
+        size_mb = os.path.getsize(send_path) / (1024 * 1024)
+
+        send_embed = discord.Embed(
+            title="🎙️ Meeting Recording Ready",
+            description=f"**{os.path.basename(send_path)}** — `{size_mb:.1f} MB`",
+            color=discord.Color.green()
+        )
+        send_embed.set_footer(text="Download the file above ↑")
+
+        if os.path.getsize(send_path) > 25 * 1024 * 1024:
+            send_embed.add_field(
+                name="⚠️ File too large to upload",
+                value=f"Recording saved locally: `{send_path}`",
+                inline=False
+            )
+            await channel.send(embed=send_embed)
+        else:
+            await channel.send(
+                embed=send_embed,
+                file=discord.File(send_path, filename=os.path.basename(send_path))
+            )
+        # Clean up raw wav after sending
+        try:
+            os.remove(wav_path)
+        except Exception:
+            pass
+    except Exception as e:
+        await channel.send(f"❌ Failed to finalize recording: {e}")
+
+
+async def _finalize_and_send_individual(channel, tracks: list, out_dir: str):
+    """Convert each individual track and send."""
+    try:
+        for uid, wav_path in tracks:
+            if not os.path.exists(wav_path) or os.path.getsize(wav_path) <= 44:
+                continue
+            mp3_path = await asyncio.get_event_loop().run_in_executor(None, wav_to_mp3_bytes, wav_path)
+            send_path = mp3_path if mp3_path else wav_path
+            fname = os.path.basename(send_path)
+            if os.path.getsize(send_path) <= 25 * 1024 * 1024:
+                await channel.send(
+                    content=f"🎙️ **Individual track** — <@{uid}>",
+                    file=discord.File(send_path, filename=fname)
+                )
+            else:
+                await channel.send(f"⚠️ Track for <@{uid}> is too large — saved at `{send_path}`")
+            try:
+                os.remove(wav_path)
+            except Exception:
+                pass
+    except Exception as e:
+        await channel.send(f"❌ Error sending individual tracks: {e}")
+
+
+async def _cmd_instant_recording(interaction: discord.Interaction):
+    """Grab last 10 minutes of buffered audio and send it."""
+    guild_id = interaction.guild_id
+    buf_state = guild_instant_buffers.get(guild_id)
+
+    if not buf_state:
+        # No buffer yet - connect and start buffering now
+        vc, err = await _ensure_recv_client(interaction)
+        if err:
+            await interaction.followup.send(err, ephemeral=True)
+            return
+        buf_sink = RollingBufferSink(INSTANT_BUFFER_SECS)
+        guild_instant_buffers[guild_id] = {"sink": buf_sink, "vc": vc}
+        vc.listen(buf_sink)
+        await interaction.followup.send(
+            "⚡ **Instant buffer started** — I'll now keep the last 10 minutes of audio ready.\n"
+            "Use `/record → Get Instant` again to retrieve it.",
+            ephemeral=True
+        )
+        return
+
+    sink: RollingBufferSink = buf_state["sink"]
+    pcm = sink.snapshot()
+
+    if len(pcm) < BYTES_PER_SECOND * 2:  # less than 2 seconds
+        await interaction.followup.send("⚠️ Not enough audio buffered yet (less than 2 seconds). Try again after some activity.", ephemeral=True)
+        return
+
+    await interaction.followup.send("⚡ Processing your instant recording…", ephemeral=True)
+
+    try:
+        wav_bytes = await asyncio.get_event_loop().run_in_executor(None, pcm_to_wav_bytes, pcm)
+
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_wav = os.path.join(RECORDINGS_DIR, f"instant_{guild_id}_{ts}.wav")
+        with open(out_wav, "wb") as f:
+            f.write(wav_bytes)
+
+        mp3_path = await asyncio.get_event_loop().run_in_executor(None, wav_to_mp3_bytes, out_wav)
+        send_path = mp3_path if mp3_path else out_wav
+        duration_s = len(pcm) // BYTES_PER_SECOND
+        dur_m, dur_s = divmod(duration_s, 60)
+        size_mb = os.path.getsize(send_path) / (1024 * 1024)
+
+        embed = discord.Embed(
+            title="⚡ Instant Recording (Last 10 min)",
+            description=f"Duration: **{dur_m:02d}:{dur_s:02d}** • Size: `{size_mb:.1f} MB`",
+            color=discord.Color.orange()
+        )
+        embed.set_footer(text="⚠️ This file will be auto-deleted in 1 hour")
+
+        channel = interaction.channel
+        if os.path.getsize(send_path) <= 25 * 1024 * 1024:
+            await channel.send(
+                embed=embed,
+                file=discord.File(send_path, filename=os.path.basename(send_path))
+            )
+        else:
+            embed.add_field(name="⚠️ Too Large to Upload", value=f"Saved at: `{send_path}`", inline=False)
+            await channel.send(embed=embed)
+
+        # Schedule deletion after 1 hour
+        async def _auto_delete():
+            await asyncio.sleep(INSTANT_EXPIRE_SECS)
+            for p in [send_path, out_wav]:
+                try:
+                    if os.path.exists(p):
+                        os.remove(p)
+                except Exception:
+                    pass
+
+        asyncio.ensure_future(_auto_delete())
+
+    except Exception as e:
+        await interaction.channel.send(f"❌ Failed to process instant recording: {e}")
+
 
 
 
