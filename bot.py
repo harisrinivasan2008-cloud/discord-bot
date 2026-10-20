@@ -1953,6 +1953,36 @@ async def unlock_vc(interaction: discord.Interaction, channel: discord.VoiceChan
 
 
 
+
+import discord.ext.voice_recv.router as vr_router
+import davey
+
+# Monkey-patch PacketDecoder._decode_packet to support Discord DAVE E2EE decryption
+orig_decode_packet = vr_router.PacketDecoder._decode_packet
+
+def dave_aware_decode_packet(self, packet):
+    assert self._decoder is not None
+    if packet:
+        opus_payload = packet.decrypted_data
+        vc = getattr(self.sink, "voice_client", None)
+        if vc and hasattr(vc, "_connection") and getattr(vc._connection, "dave_session", None):
+            dave = vc._connection.dave_session
+            if dave and getattr(dave, "ready", False):
+                uid = self._cached_id or (vc._get_id_from_ssrc(self.ssrc) if hasattr(vc, "_get_id_from_ssrc") else None)
+                if uid:
+                    try:
+                        opus_payload = dave.decrypt(uid, davey.MediaType.audio, opus_payload)
+                    except Exception:
+                        pass
+        try:
+            pcm = self._decoder.decode(opus_payload, fec=False)
+            return packet, pcm
+        except Exception:
+            pass
+    return orig_decode_packet(self, packet)
+
+vr_router.PacketDecoder._decode_packet = dave_aware_decode_packet
+
 # ==============================================================================
 # 13. VOICE CHANNEL RECORDING SYSTEM (DM Delivery + Instant Recall)
 # ==============================================================================
@@ -2040,9 +2070,9 @@ class IndividualPCMSink(voice_recv.AudioSink):
     def wants_opus(self) -> bool:
         return False
 
-    def _get_writer(self, user_id: int, display_name: str):
+    def _get_writer(self, user_id, display_name: str):
         if user_id not in self._writers:
-            safe = re.sub(r'[\\/:*?"<>|]', "_", display_name)
+            safe = re.sub(r'[\\/:*?"<>|]', "_", str(display_name))
             path = os.path.join(self._dir, f"{safe}_{user_id}.wav")
             wf = wave.open(path, "wb")
             wf.setnchannels(CHANNELS)
@@ -2053,15 +2083,34 @@ class IndividualPCMSink(voice_recv.AudioSink):
 
     def write(self, user, data: voice_recv.VoiceData):
         pcm = data.pcm
-        if not pcm or user is None:
+        if not pcm:
             return
+
+        # Resolve speaker identifier (even if user is None)
+        speaker_id = getattr(user, "id", None)
+        speaker_name = getattr(user, "display_name", None)
+        if not speaker_id:
+            ssrc = getattr(data.packet, "ssrc", None) if hasattr(data, "packet") else None
+            # Check vc ssrc mapping if available
+            vc = getattr(self, "voice_client", None)
+            if vc and ssrc and hasattr(vc, "_get_id_from_ssrc"):
+                mapped_uid = vc._get_id_from_ssrc(ssrc)
+                if mapped_uid:
+                    member = vc.guild.get_member(mapped_uid) if hasattr(vc, "guild") else None
+                    if member:
+                        speaker_id = member.id
+                        speaker_name = member.display_name
+            if not speaker_id:
+                speaker_id = ssrc if ssrc else "Speaker"
+                speaker_name = f"Speaker_{speaker_id}"
+
         with self._lock:
             try:
-                wf, path, count = self._get_writer(user.id, getattr(user, "display_name", str(user.id)))
+                wf, path, count = self._get_writer(speaker_id, speaker_name)
                 wf.writeframes(pcm)
-                self._writers[user.id] = (wf, path, count + 1)
+                self._writers[speaker_id] = (wf, path, count + 1)
                 if count == 0:
-                    print(f"[Voice Recording] Tracking individual audio for {getattr(user, 'display_name', user)}", flush=True)
+                    print(f"[Voice Recording] Tracking individual audio for {speaker_name} (ID: {speaker_id})", flush=True)
             except Exception as e:
                 print(f"[IndividualPCMSink write error] {e}", flush=True)
 
@@ -2189,9 +2238,17 @@ async def _ensure_recv_client(interaction: discord.Interaction, channel: discord
                 return None, f"❌ Connect error: {e}"
     else:
         try:
-            vc = await target.connect(cls=voice_recv.VoiceRecvClient)
+            vc = await target.connect(cls=voice_recv.VoiceRecvClient, self_deaf=False, self_mute=False)
         except Exception as e:
             return None, f"❌ Could not connect to {target.mention}: {e}"
+
+    # Ensure bot is not server-deafened so Discord forwards audio
+    try:
+        bot_member = guild.me or guild.get_member(bot.user.id)
+        if bot_member and bot_member.voice and bot_member.voice.deaf:
+            await bot_member.edit(deafen=False)
+    except Exception:
+        pass
 
     # Wake up Discord UDP voice receiving by sending initial silence packets
     try:
