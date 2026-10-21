@@ -1987,12 +1987,14 @@ import discord.ext.voice_recv.opus as vr_opus
 # 1. Fix UDP keepalive: discord-ext-voice-recv erroneously set delay to 5000s instead of 5s
 vr_reader.UDPKeepAlive.delay = 5
 
-# 2. Robust DAVE-aware packet decoding with pre-cached UID resolution
+import audioop
+
+# 2. Robust DAVE-aware packet decoding with proper PLC concealment (no screeching ciphertext)
 def safe_decode_packet(self, packet):
     assert self._decoder is not None
     vc = getattr(self.sink, "voice_client", None) or getattr(self.sink, "_voice_client", None)
     
-    # Immediately resolve cached user id so DAVE decrypt always has the target user_id
+    # Resolve cached user id from SSRC
     if not self._cached_id and vc and hasattr(vc, "_get_id_from_ssrc"):
         uid = vc._get_id_from_ssrc(self.ssrc)
         if uid:
@@ -2000,37 +2002,49 @@ def safe_decode_packet(self, packet):
 
     if not packet:
         try:
-            next_packet = self._buffer.peek_next()
-            if next_packet is not None:
-                opus_data = next_packet.decrypted_data
-                if vc and hasattr(vc, "_connection") and getattr(vc._connection, "dave_session", None):
-                    dave = vc._connection.dave_session
-                    if dave and getattr(dave, "ready", False) and self._cached_id:
-                        try:
-                            opus_data = dave.decrypt(self._cached_id, davey.MediaType.audio, opus_data)
-                        except Exception:
-                            pass
-                pcm = self._decoder.decode(opus_data, fec=True)
-            else:
-                pcm = self._decoder.decode(None, fec=False)
+            pcm = self._decoder.decode(None, fec=False)
             return packet, pcm
         except Exception:
-            return packet, b''
+            return packet, b'\x00' * 3840
 
-    opus_payload = packet.decrypted_data
-    if vc and hasattr(vc, "_connection") and getattr(vc._connection, "dave_session", None):
-        dave = vc._connection.dave_session
-        if dave and getattr(dave, "ready", False) and self._cached_id:
+    raw = packet.decrypted_data
+    if not raw:
+        return packet, b'\x00' * 3840
+
+    # Discord silence frame (standard Opus, unencrypted)
+    if raw == b'\xf8\xff\xfe':
+        try:
+            pcm = self._decoder.decode(raw, fec=False)
+            return packet, pcm
+        except Exception:
+            return packet, b'\x00' * 3840
+
+    state = getattr(vc, "_connection", None) if vc else None
+    dave = getattr(state, "dave_session", None) if state else None
+    dave_ver = getattr(state, "dave_protocol_version", 0) if state else 0
+
+    if dave_ver > 0 and dave and getattr(dave, "ready", False) and self._cached_id:
+        try:
+            opus_payload = dave.decrypt(int(self._cached_id), davey.MediaType.audio, bytes(raw))
+            pcm = self._decoder.decode(opus_payload, fec=False)
+            return packet, pcm
+        except Exception:
+            # Undecrypted ciphertext - NEVER feed ciphertext into opus! Conceal with PLC
             try:
-                opus_payload = dave.decrypt(self._cached_id, davey.MediaType.audio, opus_payload)
+                pcm = self._decoder.decode(None, fec=False)
+                return packet, pcm
             except Exception:
-                pass
+                return packet, b'\x00' * 3840
 
     try:
-        pcm = self._decoder.decode(opus_payload, fec=False)
+        pcm = self._decoder.decode(raw, fec=False)
         return packet, pcm
     except Exception:
-        return packet, b''
+        try:
+            pcm = self._decoder.decode(None, fec=False)
+            return packet, pcm
+        except Exception:
+            return packet, b'\x00' * 3840
 
 vr_opus.PacketDecoder._decode_packet = safe_decode_packet
 
@@ -2049,12 +2063,13 @@ SAMPLE_RATE          = 48000
 CHANNELS             = 2
 SAMPLE_WIDTH         = 2
 BYTES_PER_SECOND     = SAMPLE_RATE * CHANNELS * SAMPLE_WIDTH
+FRAME_BYTES          = 3840  # 20ms of 48000Hz 16-bit stereo PCM
 
 
 # ── Guild Master Sink (Continuous 10-Min Rolling Recall + Multiplexer) ───────
 class GuildMasterSink(voice_recv.AudioSink):
     """Unified master audio sink for a guild voice channel.
-    Permanently keeps a rolling 10-minute ring buffer of mixed audio,
+    Permanently keeps a rolling 10-minute ring buffer of properly mixed audio,
     and dynamically multiplexes audio to manual recording sinks (mixed or individual).
     """
     def __init__(self, max_seconds: int = INSTANT_BUFFER_SECS):
@@ -2065,6 +2080,11 @@ class GuildMasterSink(voice_recv.AudioSink):
         self.manual_sink: voice_recv.AudioSink | None = None
         self._last_activity = time.time()
         self.total_frames_received = 0
+
+        # Real-time mixer state for concurrent speakers
+        self._pending_pcm = None
+        self._pending_time = 0.0
+        self._last_flushed_time = 0.0
 
     @property
     def voice_client(self):
@@ -2083,16 +2103,41 @@ class GuildMasterSink(voice_recv.AudioSink):
     def wants_opus(self) -> bool:
         return False
 
+    def _flush_pending_locked(self, now: float):
+        """Flushes the current mixed 20ms frame into the buffer, adding natural silence for gaps."""
+        if self._pending_pcm is None:
+            return
+
+        if self._last_flushed_time > 0:
+            gap_s = self._pending_time - self._last_flushed_time
+            if gap_s > 0.035:
+                silence_frames = min(int(gap_s / 0.02) - 1, 1500)
+                if silence_frames > 0:
+                    self._buf.extend(b'\x00' * (FRAME_BYTES * silence_frames))
+
+        self._buf.extend(self._pending_pcm)
+        if len(self._buf) > self._max_bytes:
+            self._buf = self._buf[-self._max_bytes:]
+
+        self._last_flushed_time = self._pending_time
+        self._pending_pcm = None
+
     def write(self, user, data: voice_recv.VoiceData):
         pcm = data.pcm
-        if not pcm:
+        if not pcm or len(pcm) != FRAME_BYTES:
             return
 
         now = time.time()
         with self._lock:
-            self._buf.extend(pcm)
-            if len(self._buf) > self._max_bytes:
-                self._buf = self._buf[-self._max_bytes:]
+            # If this frame arrived within the SAME 20ms tick (<= 12ms) as another frame:
+            if self._pending_pcm is not None and (now - self._pending_time) < 0.012:
+                # Mathematically mix concurrent speakers together (audioop.add clamps without clipping)
+                self._pending_pcm = audioop.add(self._pending_pcm, pcm, 2)
+            else:
+                self._flush_pending_locked(now)
+                self._pending_pcm = pcm
+                self._pending_time = now
+
             self._last_activity = now
             self.total_frames_received += 1
             if self.total_frames_received == 1 or self.total_frames_received % 500 == 0:
@@ -2107,6 +2152,8 @@ class GuildMasterSink(voice_recv.AudioSink):
 
     def snapshot(self) -> bytes:
         with self._lock:
+            if self._pending_pcm is not None:
+                self._flush_pending_locked(time.time())
             if time.time() - self._last_activity > INSTANT_EXPIRE_SECS:
                 self._buf = bytearray()
             return bytes(self._buf)
@@ -2114,10 +2161,13 @@ class GuildMasterSink(voice_recv.AudioSink):
     def clear(self):
         with self._lock:
             self._buf = bytearray()
+            self._pending_pcm = None
+            self._last_flushed_time = 0.0
 
     def cleanup(self):
-        # Do not wipe the buffer! The 10-min rolling recall must be preserved!
-        pass
+        with self._lock:
+            if self._pending_pcm is not None:
+                self._flush_pending_locked(time.time())
 
 
 def get_or_create_master_sink(guild_id: int) -> GuildMasterSink:
@@ -2128,43 +2178,87 @@ def get_or_create_master_sink(guild_id: int) -> GuildMasterSink:
 
 # ── Mixed Audio Sink (All speakers in 1 track) ───────────────────────────────
 class MixedPCMSink(voice_recv.AudioSink):
-    """Writes all received PCM frames into a single wave file."""
+    """Writes all received PCM frames into a single wave file with real-time mixing."""
     def __init__(self, wav_file):
         super().__init__()
         self._wav = wav_file
         self._lock = threading.Lock()
         self.frame_count = 0
 
+        # Real-time mixer state
+        self._pending_pcm = None
+        self._pending_time = 0.0
+        self._last_flushed_time = 0.0
+        self._start_time = time.time()
+
     def wants_opus(self) -> bool:
         return False
 
+    def _flush_pending_locked(self):
+        if self._pending_pcm is None:
+            return
+
+        if self._last_flushed_time > 0:
+            gap_s = self._pending_time - self._last_flushed_time
+            if gap_s > 0.035:
+                silence_frames = min(int(gap_s / 0.02) - 1, 1500)
+                if silence_frames > 0:
+                    self._wav.writeframes(b'\x00' * (FRAME_BYTES * silence_frames))
+                    self.frame_count += silence_frames
+        elif self._start_time > 0:
+            initial_gap = self._pending_time - self._start_time
+            if initial_gap > 0.05:
+                silence_frames = min(int(initial_gap / 0.02), 1500)
+                if silence_frames > 0:
+                    self._wav.writeframes(b'\x00' * (FRAME_BYTES * silence_frames))
+                    self.frame_count += silence_frames
+
+        self._wav.writeframes(self._pending_pcm)
+        self.frame_count += 1
+        self._last_flushed_time = self._pending_time
+        self._pending_pcm = None
+
     def write(self, user, data: voice_recv.VoiceData):
         pcm = data.pcm
-        if pcm:
-            with self._lock:
-                try:
-                    self._wav.writeframes(pcm)
-                    self.frame_count += 1
-                    if self.frame_count == 1 or self.frame_count % 100 == 0:
-                        speaker = getattr(user, "display_name", str(user))
-                        print(f"[Voice Recording] Mixed frame #{self.frame_count} from {speaker} ({len(pcm)} bytes, ~{self.frame_count * 0.02:.1f}s audio)", flush=True)
-                except Exception as e:
-                    print(f"[MixedPCMSink write error] {e}", flush=True)
+        if not pcm or len(pcm) != FRAME_BYTES:
+            return
+
+        now = time.time()
+        with self._lock:
+            try:
+                if self._pending_pcm is not None and (now - self._pending_time) < 0.012:
+                    self._pending_pcm = audioop.add(self._pending_pcm, pcm, 2)
+                else:
+                    self._flush_pending_locked()
+                    self._pending_pcm = pcm
+                    self._pending_time = now
+
+                if self.frame_count == 1 or self.frame_count % 100 == 0:
+                    speaker = getattr(user, "display_name", str(user))
+                    print(f"[Voice Recording] Mixed frame #{self.frame_count} from {speaker} (~{self.frame_count * 0.02:.1f}s audio)", flush=True)
+            except Exception as e:
+                print(f"[MixedPCMSink write error] {e}", flush=True)
 
     def cleanup(self):
-        try:
-            self._wav.close()
-        except Exception:
-            pass
+        with self._lock:
+            try:
+                self._flush_pending_locked()
+            except Exception:
+                pass
+            try:
+                self._wav.close()
+            except Exception:
+                pass
 
 
 # ── Individual Audio Sink (Per-speaker tracks) ────────────────────────────────
 class IndividualPCMSink(voice_recv.AudioSink):
-    """Saves each speaker's audio to a separate wav file."""
+    """Saves each speaker's audio to a separate wav file with time synchronization."""
     def __init__(self, out_dir):
         super().__init__()
         self._dir = out_dir
         self._writers: dict = {}
+        self._start_time = time.time()
         self._lock = threading.Lock()
         os.makedirs(out_dir, exist_ok=True)
 
@@ -2179,15 +2273,14 @@ class IndividualPCMSink(voice_recv.AudioSink):
             wf.setnchannels(CHANNELS)
             wf.setsampwidth(SAMPLE_WIDTH)
             wf.setframerate(SAMPLE_RATE)
-            self._writers[user_id] = [wf, path, 0]
+            self._writers[user_id] = [wf, path, 0, None]
         return self._writers[user_id]
 
     def write(self, user, data: voice_recv.VoiceData):
         pcm = data.pcm
-        if not pcm:
+        if not pcm or len(pcm) != FRAME_BYTES:
             return
 
-        # Resolve speaker identifier (even if user is None)
         speaker_id = getattr(user, "id", None)
         speaker_name = getattr(user, "display_name", None)
         if not speaker_id:
@@ -2204,14 +2297,33 @@ class IndividualPCMSink(voice_recv.AudioSink):
                 speaker_id = ssrc if ssrc else "Speaker"
                 speaker_name = f"Speaker_{speaker_id}"
 
+        now = time.time()
         with self._lock:
             try:
                 entry = self._get_writer(speaker_id, speaker_name)
-                if entry[0] is not None:
-                    entry[0].writeframes(pcm)
+                wf = entry[0]
+                if wf is not None:
+                    last_time = entry[3]
+                    if last_time is None:
+                        initial_gap = now - self._start_time
+                        if initial_gap > 0.035:
+                            silence_frames = min(int(initial_gap / 0.02) - 1, 1500)
+                            if silence_frames > 0:
+                                wf.writeframes(b'\x00' * (FRAME_BYTES * silence_frames))
+                                entry[2] += silence_frames
+                    else:
+                        gap_s = now - last_time
+                        if gap_s > 0.035:
+                            silence_frames = min(int(gap_s / 0.02) - 1, 1500)
+                            if silence_frames > 0:
+                                wf.writeframes(b'\x00' * (FRAME_BYTES * silence_frames))
+                                entry[2] += silence_frames
+
+                    wf.writeframes(pcm)
                     entry[2] += 1
+                    entry[3] = now
                     if entry[2] == 1 or entry[2] % 100 == 0:
-                        print(f"[Voice Recording] Speaker {speaker_name} frame #{entry[2]} ({len(pcm)} bytes, ~{entry[2] * 0.02:.1f}s audio)", flush=True)
+                        print(f"[Voice Recording] Speaker {speaker_name} frame #{entry[2]} (~{entry[2] * 0.02:.1f}s audio)", flush=True)
             except Exception as e:
                 print(f"[IndividualPCMSink write error] {e}", flush=True)
 
@@ -2228,7 +2340,7 @@ class IndividualPCMSink(voice_recv.AudioSink):
 
     def get_track_paths(self) -> list:
         with self._lock:
-            return [(uid, path) for uid, (wf, path, count) in self._writers.items() if count > 0]
+            return [(uid, entry[1]) for uid, entry in self._writers.items() if entry[2] > 0]
 
 
 def pcm_to_wav_bytes(pcm: bytes) -> bytes:
