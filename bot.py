@@ -2069,22 +2069,25 @@ FRAME_BYTES          = 3840  # 20ms of 48000Hz 16-bit stereo PCM
 # ── Guild Master Sink (Continuous 10-Min Rolling Recall + Multiplexer) ───────
 class GuildMasterSink(voice_recv.AudioSink):
     """Unified master audio sink for a guild voice channel.
-    Permanently keeps a rolling 10-minute ring buffer of properly mixed audio,
-    and dynamically multiplexes audio to manual recording sinks (mixed or individual).
+    Permanently keeps a rolling 10-minute ring buffer of mixed audio,
+    AND separate rolling buffers for every individual speaker.
+    Dynamically multiplexes audio to manual recording sinks (mixed or individual).
     """
     def __init__(self, max_seconds: int = INSTANT_BUFFER_SECS):
         super().__init__()
         self._max_bytes = max_seconds * BYTES_PER_SECOND
-        self._buf = bytearray()
+        self._mixed_buf = bytearray()
+        self._user_bufs: dict[int | str, bytearray] = {}
+        self._user_names: dict[int | str, str] = {}
+        self._last_user_time: dict[int | str, float] = {}
         self._lock = threading.Lock()
         self.manual_sink: voice_recv.AudioSink | None = None
         self._last_activity = time.time()
         self.total_frames_received = 0
 
-        # Real-time mixer state for concurrent speakers
-        self._pending_pcm = None
-        self._pending_time = 0.0
-        self._last_flushed_time = 0.0
+        # Mixing tracking
+        self._last_frame_time = 0.0
+        self._last_speaker = None
 
     @property
     def voice_client(self):
@@ -2103,45 +2106,61 @@ class GuildMasterSink(voice_recv.AudioSink):
     def wants_opus(self) -> bool:
         return False
 
-    def _flush_pending_locked(self, now: float):
-        """Flushes the current mixed 20ms frame into the buffer, adding natural silence for gaps."""
-        if self._pending_pcm is None:
-            return
-
-        if self._last_flushed_time > 0:
-            gap_s = self._pending_time - self._last_flushed_time
-            if gap_s > 0.035:
-                silence_frames = min(int(gap_s / 0.02) - 1, 1500)
-                if silence_frames > 0:
-                    self._buf.extend(b'\x00' * (FRAME_BYTES * silence_frames))
-
-        self._buf.extend(self._pending_pcm)
-        if len(self._buf) > self._max_bytes:
-            self._buf = self._buf[-self._max_bytes:]
-
-        self._last_flushed_time = self._pending_time
-        self._pending_pcm = None
-
     def write(self, user, data: voice_recv.VoiceData):
         pcm = data.pcm
         if not pcm or len(pcm) != FRAME_BYTES:
             return
 
         now = time.time()
-        with self._lock:
-            # If this frame arrived within the SAME 20ms tick (<= 12ms) as another frame:
-            if self._pending_pcm is not None and (now - self._pending_time) < 0.012:
-                # Mathematically mix concurrent speakers together (audioop.add clamps without clipping)
-                self._pending_pcm = audioop.add(self._pending_pcm, pcm, 2)
-            else:
-                self._flush_pending_locked(now)
-                self._pending_pcm = pcm
-                self._pending_time = now
+        vc = self.voice_client
 
+        # Resolve speaker
+        speaker_id = getattr(user, "id", None)
+        speaker_name = getattr(user, "display_name", None)
+        if not speaker_id:
+            ssrc = getattr(data.packet, "ssrc", None) if hasattr(data, "packet") else None
+            if vc and ssrc and hasattr(vc, "_get_id_from_ssrc"):
+                mapped_uid = vc._get_id_from_ssrc(ssrc)
+                if mapped_uid:
+                    member = vc.guild.get_member(mapped_uid) if hasattr(vc, "guild") else None
+                    if member:
+                        speaker_id = member.id
+                        speaker_name = member.display_name
+            if not speaker_id:
+                speaker_id = ssrc if ssrc else "Speaker"
+                speaker_name = f"Speaker_{speaker_id}"
+        elif not speaker_name:
+            speaker_name = str(user)
+
+        with self._lock:
+            # 1. Store in speaker's individual rolling buffer
+            if speaker_id not in self._user_bufs:
+                self._user_bufs[speaker_id] = bytearray()
+            self._user_names[speaker_id] = speaker_name
+            self._last_user_time[speaker_id] = now
+            ubuf = self._user_bufs[speaker_id]
+            ubuf.extend(pcm)
+            if len(ubuf) > self._max_bytes:
+                self._user_bufs[speaker_id] = ubuf[-self._max_bytes:]
+
+            # 2. Store in master mixed rolling buffer
+            # If a DIFFERENT speaker speaks within 8ms (same 20ms audio tick):
+            if (now - self._last_frame_time) < 0.008 and self._last_speaker != speaker_id and len(self._mixed_buf) >= FRAME_BYTES:
+                last_frame = bytes(self._mixed_buf[-FRAME_BYTES:])
+                mixed = audioop.add(last_frame, pcm, 2)
+                self._mixed_buf[-FRAME_BYTES:] = mixed
+            else:
+                self._mixed_buf.extend(pcm)
+
+            if len(self._mixed_buf) > self._max_bytes:
+                self._mixed_buf = self._mixed_buf[-self._max_bytes:]
+
+            self._last_frame_time = now
+            self._last_speaker = speaker_id
             self._last_activity = now
             self.total_frames_received += 1
             if self.total_frames_received == 1 or self.total_frames_received % 500 == 0:
-                print(f"[Instant Recall] Buffer: {len(self._buf)} bytes (~{len(self._buf) // BYTES_PER_SECOND}s rolling audio)", flush=True)
+                print(f"[Instant Recall] Buffer: {len(self._mixed_buf)} bytes (~{len(self._mixed_buf) // BYTES_PER_SECOND}s), Active Speakers: {len(self._user_bufs)}", flush=True)
 
         ms = self.manual_sink
         if ms:
@@ -2150,24 +2169,43 @@ class GuildMasterSink(voice_recv.AudioSink):
             except Exception as e:
                 print(f"[Manual Recording Sink Error] {e}", flush=True)
 
-    def snapshot(self) -> bytes:
+    def snapshot_mixed(self) -> bytes:
         with self._lock:
-            if self._pending_pcm is not None:
-                self._flush_pending_locked(time.time())
             if time.time() - self._last_activity > INSTANT_EXPIRE_SECS:
-                self._buf = bytearray()
-            return bytes(self._buf)
+                self._mixed_buf = bytearray()
+            return bytes(self._mixed_buf)
+
+    def snapshot_all(self) -> tuple[bytes, list[tuple[int | str, str, bytes]]]:
+        with self._lock:
+            now = time.time()
+            if now - self._last_activity > INSTANT_EXPIRE_SECS:
+                self._mixed_buf = bytearray()
+                self._user_bufs.clear()
+                self._user_names.clear()
+
+            mixed_data = bytes(self._mixed_buf)
+            individuals = []
+            for uid, ubuf in self._user_bufs.items():
+                # Only include speakers who spoke at least 1 second (~50 frames)
+                if len(ubuf) >= FRAME_BYTES * 50:
+                    name = self._user_names.get(uid, f"Speaker_{uid}")
+                    individuals.append((uid, name, bytes(ubuf)))
+
+            return mixed_data, individuals
+
+    def snapshot(self) -> bytes:
+        return self.snapshot_mixed()
 
     def clear(self):
         with self._lock:
-            self._buf = bytearray()
-            self._pending_pcm = None
-            self._last_flushed_time = 0.0
+            self._mixed_buf = bytearray()
+            self._user_bufs.clear()
+            self._user_names.clear()
+            self._last_frame_time = 0.0
+            self._last_speaker = None
 
     def cleanup(self):
-        with self._lock:
-            if self._pending_pcm is not None:
-                self._flush_pending_locked(time.time())
+        pass
 
 
 def get_or_create_master_sink(guild_id: int) -> GuildMasterSink:
@@ -2178,60 +2216,43 @@ def get_or_create_master_sink(guild_id: int) -> GuildMasterSink:
 
 # ── Mixed Audio Sink (All speakers in 1 track) ───────────────────────────────
 class MixedPCMSink(voice_recv.AudioSink):
-    """Writes all received PCM frames into a single wave file with real-time mixing."""
+    """Writes all received PCM frames into a single wave file."""
     def __init__(self, wav_file):
         super().__init__()
         self._wav = wav_file
         self._lock = threading.Lock()
         self.frame_count = 0
-
-        # Real-time mixer state
         self._pending_pcm = None
         self._pending_time = 0.0
-        self._last_flushed_time = 0.0
-        self._start_time = time.time()
+        self._pending_speaker = None
 
     def wants_opus(self) -> bool:
         return False
 
     def _flush_pending_locked(self):
-        if self._pending_pcm is None:
-            return
-
-        if self._last_flushed_time > 0:
-            gap_s = self._pending_time - self._last_flushed_time
-            if gap_s > 0.035:
-                silence_frames = min(int(gap_s / 0.02) - 1, 1500)
-                if silence_frames > 0:
-                    self._wav.writeframes(b'\x00' * (FRAME_BYTES * silence_frames))
-                    self.frame_count += silence_frames
-        elif self._start_time > 0:
-            initial_gap = self._pending_time - self._start_time
-            if initial_gap > 0.05:
-                silence_frames = min(int(initial_gap / 0.02), 1500)
-                if silence_frames > 0:
-                    self._wav.writeframes(b'\x00' * (FRAME_BYTES * silence_frames))
-                    self.frame_count += silence_frames
-
-        self._wav.writeframes(self._pending_pcm)
-        self.frame_count += 1
-        self._last_flushed_time = self._pending_time
-        self._pending_pcm = None
+        if self._pending_pcm is not None:
+            self._wav.writeframes(self._pending_pcm)
+            self.frame_count += 1
+            self._pending_pcm = None
 
     def write(self, user, data: voice_recv.VoiceData):
         pcm = data.pcm
         if not pcm or len(pcm) != FRAME_BYTES:
             return
 
+        speaker_id = getattr(user, "id", None) or (data.packet.ssrc if hasattr(data, "packet") else None)
         now = time.time()
+
         with self._lock:
             try:
-                if self._pending_pcm is not None and (now - self._pending_time) < 0.012:
+                # If a different speaker spoke in the same 20ms audio tick (<= 8ms):
+                if (now - self._pending_time) < 0.008 and self._pending_speaker != speaker_id and self._pending_pcm is not None:
                     self._pending_pcm = audioop.add(self._pending_pcm, pcm, 2)
                 else:
                     self._flush_pending_locked()
                     self._pending_pcm = pcm
                     self._pending_time = now
+                    self._pending_speaker = speaker_id
 
                 if self.frame_count == 1 or self.frame_count % 100 == 0:
                     speaker = getattr(user, "display_name", str(user))
@@ -2253,12 +2274,11 @@ class MixedPCMSink(voice_recv.AudioSink):
 
 # ── Individual Audio Sink (Per-speaker tracks) ────────────────────────────────
 class IndividualPCMSink(voice_recv.AudioSink):
-    """Saves each speaker's audio to a separate wav file with time synchronization."""
+    """Saves each speaker's audio cleanly to a separate wav file."""
     def __init__(self, out_dir):
         super().__init__()
         self._dir = out_dir
         self._writers: dict = {}
-        self._start_time = time.time()
         self._lock = threading.Lock()
         os.makedirs(out_dir, exist_ok=True)
 
@@ -2273,7 +2293,7 @@ class IndividualPCMSink(voice_recv.AudioSink):
             wf.setnchannels(CHANNELS)
             wf.setsampwidth(SAMPLE_WIDTH)
             wf.setframerate(SAMPLE_RATE)
-            self._writers[user_id] = [wf, path, 0, None]
+            self._writers[user_id] = [wf, path, 0]
         return self._writers[user_id]
 
     def write(self, user, data: voice_recv.VoiceData):
@@ -2296,32 +2316,16 @@ class IndividualPCMSink(voice_recv.AudioSink):
             if not speaker_id:
                 speaker_id = ssrc if ssrc else "Speaker"
                 speaker_name = f"Speaker_{speaker_id}"
+        elif not speaker_name:
+            speaker_name = str(user)
 
-        now = time.time()
         with self._lock:
             try:
                 entry = self._get_writer(speaker_id, speaker_name)
                 wf = entry[0]
                 if wf is not None:
-                    last_time = entry[3]
-                    if last_time is None:
-                        initial_gap = now - self._start_time
-                        if initial_gap > 0.035:
-                            silence_frames = min(int(initial_gap / 0.02) - 1, 1500)
-                            if silence_frames > 0:
-                                wf.writeframes(b'\x00' * (FRAME_BYTES * silence_frames))
-                                entry[2] += silence_frames
-                    else:
-                        gap_s = now - last_time
-                        if gap_s > 0.035:
-                            silence_frames = min(int(gap_s / 0.02) - 1, 1500)
-                            if silence_frames > 0:
-                                wf.writeframes(b'\x00' * (FRAME_BYTES * silence_frames))
-                                entry[2] += silence_frames
-
                     wf.writeframes(pcm)
                     entry[2] += 1
-                    entry[3] = now
                     if entry[2] == 1 or entry[2] % 100 == 0:
                         print(f"[Voice Recording] Speaker {speaker_name} frame #{entry[2]} (~{entry[2] * 0.02:.1f}s audio)", flush=True)
             except Exception as e:
@@ -2787,7 +2791,7 @@ async def _finalize_and_send_individual(user, tracks: list):
 
 
 async def _cmd_instant_recording(interaction: discord.Interaction):
-    """Grab last 10 minutes of buffered audio and DM it privately."""
+    """Grab last 10 minutes of buffered audio (Whole Mixed + All Individual Tracks) and DM privately."""
     if not interaction.response.is_done():
         await interaction.response.defer(ephemeral=True)
 
@@ -2795,9 +2799,9 @@ async def _cmd_instant_recording(interaction: discord.Interaction):
     requester = interaction.user
     master_sink = guild_master_sinks.get(guild_id)
 
-    pcm = master_sink.snapshot() if master_sink else b''
+    mixed_pcm, ind_tracks = master_sink.snapshot_all() if master_sink else (b'', [])
 
-    if len(pcm) < BYTES_PER_SECOND * 2:
+    if len(mixed_pcm) < BYTES_PER_SECOND * 2:
         vc = interaction.guild.voice_client if interaction.guild else None
         if not vc or not vc.is_connected():
             vc, err = await _ensure_recv_client(interaction)
@@ -2818,37 +2822,80 @@ async def _cmd_instant_recording(interaction: discord.Interaction):
             )
             return
 
-    duration_s = len(pcm) // BYTES_PER_SECOND
+    duration_s = len(mixed_pcm) // BYTES_PER_SECOND
     dur_m, dur_s = divmod(duration_s, 60)
-    await interaction.followup.send(f"⚡ Processing **{dur_m:02d}:{dur_s:02d}** of instant recall audio… Sending to your **DM** privately!", ephemeral=True)
+    num_speakers = len(ind_tracks)
+    speaker_info = f" with **{num_speakers} individual track(s)**" if num_speakers > 0 else ""
+    await interaction.followup.send(
+        f"⚡ Processing **{dur_m:02d}:{dur_s:02d}** of instant recall audio (Whole audio{speaker_info})… Sending to your **DM** privately!",
+        ephemeral=True
+    )
 
     try:
-        wav_bytes = await asyncio.get_event_loop().run_in_executor(None, pcm_to_wav_bytes, pcm)
+        files_to_cleanup = []
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_wav = os.path.join(RECORDINGS_DIR, f"instant_{guild_id}_{ts}.wav")
+
+        # 1. Process and send Whole Mixed Audio
+        wav_bytes = await asyncio.get_event_loop().run_in_executor(None, pcm_to_wav_bytes, mixed_pcm)
+        out_wav = os.path.join(RECORDINGS_DIR, f"instant_{guild_id}_{ts}_whole.wav")
         with open(out_wav, "wb") as f:
             f.write(wav_bytes)
+        files_to_cleanup.append(out_wav)
 
         mp3_path = await asyncio.get_event_loop().run_in_executor(None, wav_to_mp3_bytes, out_wav)
         send_path = mp3_path if mp3_path else out_wav
+        if mp3_path:
+            files_to_cleanup.append(mp3_path)
         size_mb = os.path.getsize(send_path) / (1024 * 1024)
 
         embed = discord.Embed(
-            title="⚡ Instant Recall Recording — Private",
+            title="⚡ Instant Recall — Whole Voice Channel",
             description=(
-                f"**Last {dur_m:02d}:{dur_s:02d} of Voice Channel Audio**\n"
+                f"**Last {dur_m:02d}:{dur_s:02d} of Voice Channel Audio (All Speakers)**\n"
                 f"File: `{os.path.basename(send_path)}` • Size: `{size_mb:.1f} MB`\n"
+                f"Recorded Speakers: **{num_speakers}**\n"
                 f"🔒 *Only you can see this*"
             ),
             color=discord.Color.gold()
         )
         embed.set_footer(text="⚡ HELLFIRE CLUB Bot • Auto-deletes from disk in 1 hour")
-
         await _send_recording_dm(requester, send_path, embed)
+
+        # 2. Process and send Each Individual Speaker Track
+        for uid, s_name, u_pcm in ind_tracks:
+            try:
+                u_dur_s = len(u_pcm) // BYTES_PER_SECOND
+                u_m, u_s = divmod(u_dur_s, 60)
+                safe_name = re.sub(r'[\\/:*?"<>|]', "_", str(s_name))
+                u_wav = os.path.join(RECORDINGS_DIR, f"instant_{guild_id}_{ts}_{safe_name}_{uid}.wav")
+                u_wav_bytes = await asyncio.get_event_loop().run_in_executor(None, pcm_to_wav_bytes, u_pcm)
+                with open(u_wav, "wb") as f:
+                    f.write(u_wav_bytes)
+                files_to_cleanup.append(u_wav)
+
+                u_mp3 = await asyncio.get_event_loop().run_in_executor(None, wav_to_mp3_bytes, u_wav)
+                u_send = u_mp3 if u_mp3 else u_wav
+                if u_mp3:
+                    files_to_cleanup.append(u_mp3)
+                u_size_mb = os.path.getsize(u_send) / (1024 * 1024)
+
+                u_embed = discord.Embed(
+                    title="👤 Instant Recall — Speaker Track",
+                    description=(
+                        f"Speaker: <@{uid}> (**{s_name}**)\n"
+                        f"File: `{os.path.basename(u_send)}` • Speech Duration: `{u_m:02d}:{u_s:02d}` • Size: `{u_size_mb:.1f} MB`\n"
+                        f"🔒 *Only you can see this*"
+                    ),
+                    color=discord.Color.blue()
+                )
+                u_embed.set_footer(text="⚡ HELLFIRE CLUB Bot • Auto-deletes from disk in 1 hour")
+                await _send_recording_dm(requester, u_send, u_embed)
+            except Exception as e_ind:
+                print(f"[Instant Recall Individual Send Error] {uid}: {e_ind}", flush=True)
 
         async def _auto_delete():
             await asyncio.sleep(INSTANT_EXPIRE_SECS)
-            for p in [send_path, out_wav]:
+            for p in files_to_cleanup:
                 try:
                     if os.path.exists(p):
                         os.remove(p)
@@ -2858,9 +2905,10 @@ async def _cmd_instant_recording(interaction: discord.Interaction):
         asyncio.ensure_future(_auto_delete())
 
     except Exception as e:
+        print(f"[Instant Recall Error] {e}", flush=True)
         try:
             dm = await requester.create_dm()
-            await dm.send(f"❌ Failed to process instant recording: {e}")
+            await dm.send(f"❌ Error processing instant recall audio: {e}")
         except Exception:
             pass
 
