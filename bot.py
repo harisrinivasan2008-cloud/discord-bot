@@ -97,6 +97,68 @@ def remove_default_prefix(guild_id: int) -> bool:
         return True
     return False
 
+def get_bye_channel(guild_id: int) -> int | None:
+    config = load_server_config()
+    return config.get(str(guild_id), {}).get("bye_channel_id")
+
+def set_bye_channel(guild_id: int, channel_id: int):
+    config = load_server_config()
+    guild_key = str(guild_id)
+    if guild_key not in config:
+        config[guild_key] = {}
+    config[guild_key]["bye_channel_id"] = channel_id
+    save_server_config(config)
+
+def remove_bye_channel(guild_id: int) -> bool:
+    config = load_server_config()
+    guild_key = str(guild_id)
+    if guild_key in config and "bye_channel_id" in config[guild_key]:
+        del config[guild_key]["bye_channel_id"]
+        save_server_config(config)
+        return True
+    return False
+
+def build_farewell_card(member: discord.Member | discord.User, guild: discord.Guild, custom_message: str = None) -> tuple[str, discord.Embed]:
+    server_nick = getattr(member, "nick", None) or getattr(member, "display_name", getattr(member, "name", "Member"))
+    username = f"@{member.name}"
+    
+    avatar = getattr(member, "display_avatar", None)
+    avatar_url = avatar.url if avatar else "https://cdn.discordapp.com/embed/avatars/0.png"
+    
+    joined_at = getattr(member, "joined_at", None)
+    if joined_at:
+        joined_timestamp = int(joined_at.timestamp())
+        joined_str = f"<t:{joined_timestamp}:D> (<t:{joined_timestamp}:R>)"
+    else:
+        joined_str = "*Unknown*"
+        
+    founder_role = discord.utils.find(lambda r: "founder" in r.name.lower(), guild.roles) if guild else None
+    if founder_role:
+        founder_tag = founder_role.mention
+    elif guild and guild.owner:
+        founder_tag = guild.owner.mention
+    else:
+        founder_tag = f"<@{BOT_OWNER_ID}>"
+
+    embed = discord.Embed(
+        title="👋 FAREWELL • GOODBYE 👋",
+        description=f"### A member has left **{guild.name if guild else 'the server'}**!",
+        color=discord.Color.dark_red()
+    )
+    embed.set_thumbnail(url=avatar_url)
+    embed.add_field(name="🏷️ Server Nickname", value=f"**{server_nick}**", inline=True)
+    embed.add_field(name="👤 Username", value=f"`{username}` ({member.mention})", inline=True)
+    embed.add_field(name="📅 Date Joined", value=joined_str, inline=False)
+    embed.add_field(name="👑 Founder", value=founder_tag, inline=True)
+
+    if custom_message and custom_message.strip():
+        msg_clean = custom_message.strip()
+        embed.add_field(name="💬 Message", value=f"> *\"{msg_clean}\"*", inline=False)
+
+    embed.set_footer(text=f"Farewell Card • {guild.name if guild else 'Server'}")
+    content = f"👋 **Farewell** {member.mention} | Paging Founder: {founder_tag}"
+    return content, embed
+
 def is_user_admin(user_id: int) -> bool:
     # 1. Supreme Bot Owner is ALWAYS permanently authorized across all servers
     if user_id == BOT_OWNER_ID:
@@ -266,6 +328,43 @@ async def on_member_join(member: discord.Member):
         print(f"[Auto-Prefix] Forbidden: Bot lacks permission to edit {member.name}'s nickname in {member.guild.name}.", flush=True)
     except Exception as e:
         print(f"[Auto-Prefix] Error editing nickname for {member.name}: {e}", flush=True)
+
+# ==============================================================================
+# AUTOMATIC FAREWELL ON MEMBER REMOVE / LEAVE
+# ==============================================================================
+@bot.event
+async def on_member_remove(member: discord.Member):
+    # Ignore bot accounts leaving
+    if getattr(member, "bot", False):
+        return
+
+    guild = member.guild
+    if not guild:
+        return
+
+    channel_id = get_bye_channel(guild.id)
+    if not channel_id:
+        return
+
+    channel = guild.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(channel_id)
+        except Exception:
+            channel = None
+
+    if not channel or not isinstance(channel, discord.TextChannel):
+        print(f"[Auto-Bye] Targeted channel {channel_id} not found in {guild.name}.", flush=True)
+        return
+
+    try:
+        content, embed = build_farewell_card(member, guild)
+        await channel.send(content=content, embed=embed)
+        print(f"[Auto-Bye] Successfully posted farewell card for {member.name} ({member.id}) in #{channel.name} ({guild.name}).", flush=True)
+    except discord.Forbidden:
+        print(f"[Auto-Bye] Forbidden: Missing send or embed permissions in #{channel.name} ({guild.name}).", flush=True)
+    except Exception as e:
+        print(f"[Auto-Bye] Error sending farewell card for {member.name}: {e}", flush=True)
 
 # ==============================================================================
 # ACTION & ROLEPLAY SYSTEM (kiss, hug, slap, chase, challenge)
@@ -1637,79 +1736,100 @@ async def clear_messages(
         await send_clear_reply(f"❌ Unexpected error while deleting messages: {e}")
 
 # ==============================================================================
-# BYE — Send an elegant farewell card for a member to a target channel
+# BYE — Automatic Farewell Card System (/bye, /byestatus, /byedisable)
 # ==============================================================================
-@bot.tree.command(name="bye", description="Send a farewell goodbye card for a member to a target channel")
+@bot.tree.command(name="bye", description="Set target channel for automatic farewell cards when members leave, or send preview")
 @app_commands.describe(
-    target_channel="The text channel where the farewell card will be posted",
-    member="The member who is leaving / farewell target (defaults to yourself)",
-    custom_message="Optional custom farewell message"
+    target_channel="The text channel where automatic farewell cards will be sent whenever a member leaves",
+    preview_member="Optional: Immediately post a farewell card for this member as a preview",
+    custom_message="Optional note to include on the preview card"
 )
 @check_bot_admin()
 async def bye(
     interaction: discord.Interaction,
     target_channel: discord.TextChannel,
-    member: discord.Member = None,
+    preview_member: discord.Member = None,
     custom_message: str = None
 ):
-    target = member or interaction.user
     guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("❌ This command can only be used inside a server.", ephemeral=True)
+        return
 
-    # 1. Server Nickname (or display name)
-    server_nick = target.nick if getattr(target, "nick", None) else target.display_name
+    perms = target_channel.permissions_for(guild.me)
+    if not perms.send_messages or not perms.embed_links:
+        await interaction.response.send_message(
+            f"❌ The bot lacks `Send Messages` and `Embed Links` permissions in {target_channel.mention}.",
+            ephemeral=True
+        )
+        return
 
-    # 2. Username
-    username = f"@{target.name}"
+    # Set as the automatic bye channel for this guild
+    set_bye_channel(guild.id, target_channel.id)
 
-    # 3. Profile picture on right corner (thumbnail)
-    avatar_url = target.display_avatar.url
-
-    # 4. Date of joined
-    if target.joined_at:
-        joined_timestamp = int(target.joined_at.timestamp())
-        joined_str = f"<t:{joined_timestamp}:D> (<t:{joined_timestamp}:R>)"
-    else:
-        joined_str = "*Unknown*"
-
-    # 5. It should tag Founder
-    founder_role = discord.utils.find(lambda r: "founder" in r.name.lower(), guild.roles) if guild else None
-    if founder_role:
-        founder_tag = founder_role.mention
-    elif guild and guild.owner:
-        founder_tag = guild.owner.mention
-    else:
-        founder_tag = f"<@{BOT_OWNER_ID}>"
-
-    # Construct the farewell Card Embed
-    embed = discord.Embed(
-        title="👋 FAREWELL • GOODBYE 👋",
-        description=f"### A member is bidding farewell to **{guild.name if guild else 'the server'}**!",
-        color=discord.Color.dark_red()
+    reply_msg = (
+        f"✅ **Automatic Farewell Channel Configured!**\n\n"
+        f"🎯 **Target Channel**: {target_channel.mention}\n"
+        f"Whenever any member leaves **{guild.name}**, the bot will **automatically** post their farewell card with:\n"
+        f"• 🏷️ Server Nickname\n"
+        f"• 👤 Username\n"
+        f"• 🖼️ Profile picture on the top-right corner\n"
+        f"• 📅 Date of joined\n"
+        f"• 👑 Founder ping\n\n"
+        f"*Use `/byestatus` to check status or `/byedisable` to turn it off.*"
     )
-    # Profile picture on the right corner
-    embed.set_thumbnail(url=avatar_url)
 
-    embed.add_field(name="🏷️ Server Nickname", value=f"**{server_nick}**", inline=True)
-    embed.add_field(name="👤 Username", value=f"`{username}` ({target.mention})", inline=True)
-    embed.add_field(name="📅 Date Joined", value=joined_str, inline=False)
-    embed.add_field(name="👑 Founder", value=founder_tag, inline=True)
+    if preview_member:
+        try:
+            content, embed = build_farewell_card(preview_member, guild, custom_message=custom_message)
+            await target_channel.send(content=content, embed=embed)
+            reply_msg += f"\n\n🚀 **Preview farewell card sent** to {target_channel.mention} for {preview_member.mention}!"
+        except Exception as e:
+            reply_msg += f"\n\n⚠️ Failed to send preview: {e}"
 
-    if custom_message and custom_message.strip():
-        msg_clean = custom_message.strip()
-        embed.add_field(name="💬 Message", value=f"> *\"{msg_clean}\"*", inline=False)
+    await interaction.response.send_message(reply_msg)
 
-    embed.set_footer(text=f"Farewell Card • Sent via {interaction.user.display_name}")
+@bot.tree.command(name="byestatus", description="Check the current automatic farewell channel configuration")
+@check_bot_admin()
+async def bye_status(interaction: discord.Interaction):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
+        return
 
-    # Content tags Founder so they receive the notification
-    content = f"👋 **Farewell** {target.mention} | Paging Founder: {founder_tag}"
+    channel_id = get_bye_channel(guild.id)
+    if channel_id:
+        channel = guild.get_channel(channel_id)
+        mention = channel.mention if channel else f"<#{channel_id}>"
+        await interaction.response.send_message(
+            f"👋 **Automatic Farewell Status for {guild.name}**\n"
+            f"• **Status**: Active ✅\n"
+            f"• **Target Channel**: {mention}\n"
+            f"Whenever a member leaves, their farewell card will be posted automatically in {mention}."
+        )
+    else:
+        await interaction.response.send_message(
+            f"ℹ️ Automatic farewell cards are currently **not configured** for **{guild.name}**.\n"
+            f"Use `/bye target_channel: #channel` to configure one."
+        )
 
-    try:
-        await target_channel.send(content=content, embed=embed)
-        await interaction.response.send_message(f"✅ Farewell card successfully posted in {target_channel.mention}!", ephemeral=True)
-    except discord.Forbidden:
-        await interaction.response.send_message(f"❌ Cannot send message to {target_channel.mention}: Missing send permissions.", ephemeral=True)
-    except Exception as e:
-        await interaction.response.send_message(f"❌ Failed to send farewell card: {e}", ephemeral=True)
+@bot.tree.command(name="byedisable", description="Disable automatic farewell cards when members leave")
+@check_bot_admin()
+async def bye_disable(interaction: discord.Interaction):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
+        return
+
+    if remove_bye_channel(guild.id):
+        await interaction.response.send_message(
+            f"✅ Automatic farewell cards have been **disabled** for **{guild.name}**."
+        )
+    else:
+        await interaction.response.send_message(
+            f"⚠️ Automatic farewell cards were not active in **{guild.name}**.",
+            ephemeral=True
+        )
 
 
 # ==============================================================================
