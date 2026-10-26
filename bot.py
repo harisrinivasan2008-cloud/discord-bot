@@ -435,12 +435,383 @@ def make_challenge_payload(source, target, custom_shout: str = None):
 
     return content, embed
 
-class ChallengeResponseView(discord.ui.View):
+def make_hp_bar(current: int, total: int = 100, length: int = 10) -> str:
+    current = max(0, min(current, total))
+    filled = int(round(length * (current / total)))
+    empty = length - filled
+    if current > 50:
+        bar = "🟩" * filled + "⬜" * empty
+    elif current > 20:
+        bar = "🟨" * filled + "⬜" * empty
+    else:
+        bar = "🟥" * filled + "⬜" * empty
+    return f"`[{bar}]` **{current}/{total} HP**"
+
+class CombatGameView(discord.ui.View):
+    def __init__(self, challenger_id: int, target_id: int):
+        super().__init__(timeout=180)
+        self.p1 = challenger_id
+        self.p2 = target_id
+        self.turn = challenger_id
+        self.hp = {challenger_id: 100, target_id: 100}
+        self.shielded = {challenger_id: False, target_id: False}
+        self.potions = {challenger_id: 1, target_id: 1}
+        self.round_num = 1
+        self.log = []
+
+    def opponent_id(self, user_id: int) -> int:
+        return self.p2 if user_id == self.p1 else self.p1
+
+    def make_embed(self, last_action: str = None) -> discord.Embed:
+        if last_action:
+            self.log.append(last_action)
+            if len(self.log) > 4:
+                self.log.pop(0)
+
+        p1_bar = make_hp_bar(self.hp[self.p1])
+        p2_bar = make_hp_bar(self.hp[self.p2])
+
+        is_game_over = self.hp[self.p1] <= 0 or self.hp[self.p2] <= 0
+        if is_game_over:
+            winner = self.p1 if self.hp[self.p1] > 0 else self.p2
+            loser = self.p2 if winner == self.p1 else self.p1
+            embed = discord.Embed(
+                title="🏆 DUEL DECIDED • VICTORY! 👑",
+                description=(
+                    f"### 👑 <@{winner}> HAS DEFEATED <@{loser}> IN COMBAT! 🥊\n\n"
+                    f"**Remaining HP:** `{max(0, self.hp[winner])}/100`\n"
+                    f"**Rounds Fought:** `{self.round_num}`\n\n"
+                    f"🎉 **HAIL THE ARENA CHAMPION!**"
+                ),
+                color=discord.Color.green()
+            )
+            embed.set_thumbnail(url="https://media.giphy.com/media/26u4cqiYI30juCOGY/giphy.gif")
+            embed.set_footer(text="Hellfire Combat Arena • Match Concluded")
+            return embed
+
+        turn_mention = f"<@{self.turn}>"
+        embed = discord.Embed(
+            title=f"⚔️ COMBAT ARENA • ROUND {self.round_num} 💥",
+            description=(
+                f"**<@{self.p1}>**\n{p1_bar}\n\n"
+                f"**<@{self.p2}>**\n{p2_bar}\n\n"
+                f"👉 **Current Turn:** {turn_mention}\n"
+                f"*Choose an action below before timeout!*"
+            ),
+            color=discord.Color.red() if self.round_num % 2 == 1 else discord.Color.blue()
+        )
+        if self.log:
+            embed.add_field(name="📜 Combat Log", value="\n".join(f"> {entry}" for entry in self.log), inline=False)
+        embed.set_footer(text="Hellfire Combat Arena • Turn-based battle")
+        return embed
+
+    async def _handle_action(self, interaction: discord.Interaction, action_type: str):
+        if interaction.user.id not in (self.p1, self.p2):
+            await interaction.response.send_message("❌ You are not part of this duel!", ephemeral=True)
+            return
+
+        if interaction.user.id != self.turn:
+            await interaction.response.send_message("⏳ It's not your turn yet! Wait for your opponent.", ephemeral=True)
+            return
+
+        attacker = self.turn
+        defender = self.opponent_id(attacker)
+        action_msg = ""
+
+        if action_type == "strike":
+            dmg = random.randint(18, 28)
+            if self.shielded[defender]:
+                dmg = max(1, dmg // 2)
+                reflect = random.randint(8, 14)
+                self.hp[attacker] = max(0, self.hp[attacker] - reflect)
+                action_msg = f"🛡️ <@{defender}> blocked! <@{attacker}> dealt **{dmg}** DMG, but took **{reflect}** reflected DMG!"
+                self.shielded[defender] = False
+            else:
+                action_msg = f"⚔️ <@{attacker}> struck <@{defender}> for **{dmg}** DMG!"
+            self.hp[defender] = max(0, self.hp[defender] - dmg)
+
+        elif action_type == "shield":
+            self.shielded[attacker] = True
+            action_msg = f"🛡️ <@{attacker}> braced with their Shield! Next attack will be halved & countered."
+
+        elif action_type == "heavy":
+            if random.random() < 0.65:
+                dmg = random.randint(35, 50)
+                if self.shielded[defender]:
+                    dmg = max(1, dmg // 2)
+                    self.shielded[defender] = False
+                    action_msg = f"⚡ <@{attacker}> CRUSHED through shield with Heavy Slam for **{dmg}** DMG!"
+                else:
+                    action_msg = f"💥 **CRITICAL SMASH!** <@{attacker}> dealt **{dmg}** massive DMG to <@{defender}>!"
+                self.hp[defender] = max(0, self.hp[defender] - dmg)
+            else:
+                action_msg = f"💨 <@{attacker}> swung wildly with Heavy Slam and **MISSED**!"
+
+        elif action_type == "potion":
+            if self.potions[attacker] <= 0:
+                await interaction.response.send_message("❌ You have already used your Health Potion!", ephemeral=True)
+                return
+            heal = random.randint(25, 35)
+            self.hp[attacker] = min(100, self.hp[attacker] + heal)
+            self.potions[attacker] -= 1
+            action_msg = f"🧪 <@{attacker}> drank a Health Potion and healed **+{heal} HP**!"
+
+        self.turn = defender
+        self.round_num += 1
+
+        is_game_over = self.hp[self.p1] <= 0 or self.hp[self.p2] <= 0
+        if is_game_over:
+            for child in self.children:
+                child.disabled = True
+            embed = self.make_embed(action_msg)
+            winner = self.p1 if self.hp[self.p1] > 0 else self.p2
+            await interaction.response.edit_message(content=f"### 🏆 ARENA VICTOR: <@{winner}>! 🥊", embed=embed, view=self)
+        else:
+            embed = self.make_embed(action_msg)
+            await interaction.response.edit_message(content=f"### ⚔️ ARENA DUEL: <@{self.p1}> VS <@{self.p2}>", embed=embed, view=self)
+
+    @discord.ui.button(label="Strike", style=discord.ButtonStyle.danger, emoji="⚔️", row=0)
+    async def btn_strike(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._handle_action(interaction, "strike")
+
+    @discord.ui.button(label="Shield / Counter", style=discord.ButtonStyle.secondary, emoji="🛡️", row=0)
+    async def btn_shield(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._handle_action(interaction, "shield")
+
+    @discord.ui.button(label="Heavy Slam", style=discord.ButtonStyle.primary, emoji="⚡", row=0)
+    async def btn_heavy(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._handle_action(interaction, "heavy")
+
+    @discord.ui.button(label="Potion", style=discord.ButtonStyle.success, emoji="🧪", row=0)
+    async def btn_potion(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._handle_action(interaction, "potion")
+
+    @discord.ui.button(label="Surrender", style=discord.ButtonStyle.secondary, emoji="🏳️", row=1)
+    async def btn_forfeit(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id not in (self.p1, self.p2):
+            await interaction.response.send_message("❌ You are not part of this duel!", ephemeral=True)
+            return
+        surrenderer = interaction.user.id
+        winner = self.opponent_id(surrenderer)
+        for child in self.children:
+            child.disabled = True
+        embed = discord.Embed(
+            title="🏳️ MATCH CONCLUDED • SURRENDER",
+            description=f"### 🏆 <@{winner}> WINS BY FORFEIT!\n<@{surrenderer}> surrendered the match! 🏳️",
+            color=discord.Color.light_grey()
+        )
+        embed.set_footer(text="Hellfire Combat Arena • Match Concluded")
+        await interaction.response.edit_message(content=f"### 🏆 WINNER: <@{winner}> (By Forfeit)", embed=embed, view=self)
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+
+
+class RPSGameView(discord.ui.View):
+    def __init__(self, challenger_id: int, target_id: int):
+        super().__init__(timeout=120)
+        self.p1 = challenger_id
+        self.p2 = target_id
+        self.choices = {}
+        self.round_num = 1
+
+    def make_embed(self, status: str = "") -> discord.Embed:
+        p1_status = "✅ Locked In" if self.p1 in self.choices else "⏳ Choosing..."
+        p2_status = "✅ Locked In" if self.p2 in self.choices else "⏳ Choosing..."
+
+        embed = discord.Embed(
+            title=f"✂️ ROCK-PAPER-SCISSORS DUEL • ROUND {self.round_num} 🪨",
+            description=(
+                f"### <@{self.p1}> ⚔️ **VS** ⚔️ <@{self.p2}>\n\n"
+                f"**<@{self.p1}>**: {p1_status}\n"
+                f"**<@{self.p2}>**: {p2_status}\n\n"
+                f"*{status}*"
+            ),
+            color=discord.Color.purple()
+        )
+        embed.set_footer(text="Click a button below to choose your move secretly")
+        return embed
+
+    async def _choose(self, interaction: discord.Interaction, choice: str):
+        if interaction.user.id not in (self.p1, self.p2):
+            await interaction.response.send_message("❌ You are not part of this duel!", ephemeral=True)
+            return
+
+        self.choices[interaction.user.id] = choice
+        emoji_map = {"rock": "🪨", "paper": "📄", "scissors": "✂️"}
+        await interaction.response.send_message(f"🔒 You picked **{emoji_map[choice]} {choice.upper()}**! Locked in secretly.", ephemeral=True)
+
+        if self.p1 in self.choices and self.p2 in self.choices:
+            c1 = self.choices[self.p1]
+            c2 = self.choices[self.p2]
+            e1 = emoji_map[c1]
+            e2 = emoji_map[c2]
+
+            if c1 == c2:
+                self.choices.clear()
+                self.round_num += 1
+                embed = self.make_embed(f"🤝 **TIE!** Both picked {e1} {c1.upper()}!\nResetting for **Sudden Death Round {self.round_num}**! Choose again below!")
+                await interaction.message.edit(embed=embed, view=self)
+            else:
+                wins = {"rock": "scissors", "scissors": "paper", "paper": "rock"}
+                winner = self.p1 if wins[c1] == c2 else self.p2
+                w_choice = c1 if winner == self.p1 else c2
+                l_choice = c2 if winner == self.p1 else c1
+
+                for child in self.children:
+                    child.disabled = True
+
+                embed = discord.Embed(
+                    title="🏆 DUEL DECIDED • VICTORY! 👑",
+                    description=(
+                        f"### 👑 <@{winner}> IS THE WINNER! 🎉\n\n"
+                        f"• <@{self.p1}> chose **{e1} {c1.upper()}**\n"
+                        f"• <@{self.p2}> chose **{e2} {c2.upper()}**\n\n"
+                        f"> 💥 **{emoji_map[w_choice]} {w_choice.upper()} BEATS {emoji_map[l_choice]} {l_choice.upper()}!**\n\n"
+                        f"🏆 Hail <@{winner}>!"
+                    ),
+                    color=discord.Color.green()
+                )
+                embed.set_footer(text="Hellfire RPS Duel • Match Concluded")
+                await interaction.message.edit(content=f"### 🏆 WINNER: <@{winner}>! 🪨📄✂️", embed=embed, view=self)
+        else:
+            embed = self.make_embed("One fighter has locked in! Waiting for opponent...")
+            await interaction.message.edit(embed=embed, view=self)
+
+    @discord.ui.button(label="Rock", style=discord.ButtonStyle.secondary, emoji="🪨")
+    async def btn_rock(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._choose(interaction, "rock")
+
+    @discord.ui.button(label="Paper", style=discord.ButtonStyle.secondary, emoji="📄")
+    async def btn_paper(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._choose(interaction, "paper")
+
+    @discord.ui.button(label="Scissors", style=discord.ButtonStyle.secondary, emoji="✂️")
+    async def btn_scissors(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._choose(interaction, "scissors")
+
+
+class DiceGameView(discord.ui.View):
+    def __init__(self, challenger_id: int, target_id: int):
+        super().__init__(timeout=120)
+        self.p1 = challenger_id
+        self.p2 = target_id
+        self.rolls = {}
+        self.round_num = 1
+
+    def make_embed(self, status: str = "") -> discord.Embed:
+        p1_status = f"🎲 Rolled **{self.rolls[self.p1][2]}** ({self.rolls[self.p1][0]} + {self.rolls[self.p1][1]})" if self.p1 in self.rolls else "⏳ Waiting to roll..."
+        p2_status = f"🎲 Rolled **{self.rolls[self.p2][2]}** ({self.rolls[self.p2][0]} + {self.rolls[self.p2][1]})" if self.p2 in self.rolls else "⏳ Waiting to roll..."
+
+        embed = discord.Embed(
+            title=f"🎲 HIGH-ROLLER DICE DUEL • ROUND {self.round_num} 🎲",
+            description=(
+                f"### <@{self.p1}> ⚔️ **VS** ⚔️ <@{self.p2}>\n\n"
+                f"**<@{self.p1}>**: {p1_status}\n"
+                f"**<@{self.p2}>**: {p2_status}\n\n"
+                f"*{status}*"
+            ),
+            color=discord.Color.gold()
+        )
+        embed.set_footer(text="Click 'Roll Dice' to roll your 2d20 dice pair!")
+        return embed
+
+    @discord.ui.button(label="🎲 Roll 2d20 Dice", style=discord.ButtonStyle.success)
+    async def btn_roll(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id not in (self.p1, self.p2):
+            await interaction.response.send_message("❌ You are not part of this duel!", ephemeral=True)
+            return
+
+        if interaction.user.id in self.rolls:
+            await interaction.response.send_message(f"⚠️ You already rolled **{self.rolls[interaction.user.id][2]}**! Waiting for opponent.", ephemeral=True)
+            return
+
+        d1 = random.randint(1, 20)
+        d2 = random.randint(1, 20)
+        tot = d1 + d2
+        self.rolls[interaction.user.id] = (d1, d2, tot)
+
+        if self.p1 in self.rolls and self.p2 in self.rolls:
+            r1 = self.rolls[self.p1][2]
+            r2 = self.rolls[self.p2][2]
+
+            if r1 == r2:
+                self.rolls.clear()
+                self.round_num += 1
+                embed = self.make_embed(f"🤝 **TIE!** Both rolled **{r1}**!\nRolling again for **Sudden Death Round {self.round_num}**!")
+                await interaction.response.edit_message(embed=embed, view=self)
+            else:
+                winner = self.p1 if r1 > r2 else self.p2
+                w_tot = max(r1, r2)
+                l_tot = min(r1, r2)
+
+                for child in self.children:
+                    child.disabled = True
+
+                embed = discord.Embed(
+                    title="🏆 DUEL DECIDED • VICTORY! 👑",
+                    description=(
+                        f"### 👑 <@{winner}> HAS WON THE DICE DUEL! 🎲\n\n"
+                        f"• <@{self.p1}>: 🎲 **{r1}** ({self.rolls[self.p1][0]} + {self.rolls[self.p1][1]})\n"
+                        f"• <@{self.p2}>: 🎲 **{r2}** ({self.rolls[self.p2][0]} + {self.rolls[self.p2][1]})\n\n"
+                        f"> 💥 **Winning Roll: {w_tot} vs {l_tot}!**\n\n"
+                        f"🏆 Congratulations <@{winner}>!"
+                    ),
+                    color=discord.Color.green()
+                )
+                embed.set_footer(text="Hellfire Dice Duel • Match Concluded")
+                await interaction.response.edit_message(content=f"### 🏆 WINNER: <@{winner}> with a roll of {w_tot}! 🎲", embed=embed, view=self)
+        else:
+            embed = self.make_embed(f"<@{interaction.user.id}> rolled **{tot}**! Waiting for opponent...")
+            await interaction.response.edit_message(embed=embed, view=self)
+
+
+class ChallengeSelectGameView(discord.ui.View):
     def __init__(self, challenger_id: int, target_id: int, shout: str = "COME LETS FIGHT"):
         super().__init__(timeout=120)
         self.challenger_id = challenger_id
         self.target_id = target_id
         self.shout = shout
+
+    def check_player(self, user_id: int) -> bool:
+        return user_id in (self.challenger_id, self.target_id)
+
+    @discord.ui.button(label="⚔️ HP Combat Duel", style=discord.ButtonStyle.danger, emoji="🥊")
+    async def btn_combat(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.check_player(interaction.user.id):
+            await interaction.response.send_message("❌ You are not part of this duel!", ephemeral=True)
+            return
+        view = CombatGameView(self.challenger_id, self.target_id)
+        embed = view.make_embed("🔥 Combat Arena started! Challenger strikes first.")
+        await interaction.response.edit_message(content=f"### ⚔️ ARENA DUEL: <@{self.challenger_id}> VS <@{self.target_id}>", embed=embed, view=view)
+
+    @discord.ui.button(label="✂️ Rock-Paper-Scissors", style=discord.ButtonStyle.primary, emoji="🪨")
+    async def btn_rps(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.check_player(interaction.user.id):
+            await interaction.response.send_message("❌ You are not part of this duel!", ephemeral=True)
+            return
+        view = RPSGameView(self.challenger_id, self.target_id)
+        embed = view.make_embed("Lock in your move secretly using the buttons below!")
+        await interaction.response.edit_message(content=f"### 🪨 ROCK-PAPER-SCISSORS DUEL: <@{self.challenger_id}> VS <@{self.target_id}>", embed=embed, view=view)
+
+    @discord.ui.button(label="🎲 High-Roller Dice", style=discord.ButtonStyle.success, emoji="🎲")
+    async def btn_dice(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.check_player(interaction.user.id):
+            await interaction.response.send_message("❌ You are not part of this duel!", ephemeral=True)
+            return
+        view = DiceGameView(self.challenger_id, self.target_id)
+        embed = view.make_embed("Roll your 20-sided dice! Highest roll takes the crown.")
+        await interaction.response.edit_message(content=f"### 🎲 HIGH-ROLLER DICE DUEL: <@{self.challenger_id}> VS <@{self.target_id}>", embed=embed, view=view)
+
+
+class ChallengeResponseView(discord.ui.View):
+    def __init__(self, challenger_id: int, target_id: int, shout: str = "COME LETS FIGHT", game: str = "select"):
+        super().__init__(timeout=120)
+        self.challenger_id = challenger_id
+        self.target_id = target_id
+        self.shout = shout
+        self.game = game
 
     @discord.ui.button(label="⚔️ Accept Battle", style=discord.ButtonStyle.danger, custom_id="challenge_accept")
     async def accept_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -451,17 +822,37 @@ class ChallengeResponseView(discord.ui.View):
         for child in self.children:
             child.disabled = True
 
-        embed = interaction.message.embeds[0] if interaction.message.embeds else discord.Embed()
-        embed.color = discord.Color.dark_gold()
-        embed.title = "⚔️ BATTLE ACCEPTED • FIGHT IN PROGRESS! 💥"
-        embed.set_footer(text="Hellfire Combat Arena • Challenge Accepted")
-
-        result_content = (
-            f"### 🔥 CHALLENGE ACCEPTED! 🥊\n"
-            f"{interaction.user.mention} stepped into the ring to fight <@{self.challenger_id}>!\n"
-            f"> 💥 **LET THE BATTLE COMMENCE!** ⚔️"
-        )
-        await interaction.response.edit_message(content=result_content, embed=embed, view=self)
+        if self.game == "combat":
+            view = CombatGameView(self.challenger_id, self.target_id)
+            embed = view.make_embed("🔥 Combat Arena started! Challenger strikes first.")
+            await interaction.response.edit_message(content=f"### ⚔️ ARENA DUEL: <@{self.challenger_id}> VS <@{self.target_id}>", embed=embed, view=view)
+        elif self.game == "rps":
+            view = RPSGameView(self.challenger_id, self.target_id)
+            embed = view.make_embed("Lock in your move secretly using the buttons below!")
+            await interaction.response.edit_message(content=f"### 🪨 ROCK-PAPER-SCISSORS DUEL: <@{self.challenger_id}> VS <@{self.target_id}>", embed=embed, view=view)
+        elif self.game == "dice":
+            view = DiceGameView(self.challenger_id, self.target_id)
+            embed = view.make_embed("Roll your 20-sided dice! Highest roll takes the crown.")
+            await interaction.response.edit_message(content=f"### 🎲 HIGH-ROLLER DICE DUEL: <@{self.challenger_id}> VS <@{self.target_id}>", embed=embed, view=view)
+        else:
+            select_view = ChallengeSelectGameView(self.challenger_id, self.target_id, self.shout)
+            embed = discord.Embed(
+                title="⚔️ BATTLE ACCEPTED • CHOOSE A GAME MODE! 🎮",
+                description=(
+                    f"### 🥊 <@{self.challenger_id}> ⚔️ **VS** ⚔️ {interaction.user.mention}\n\n"
+                    f"Both warriors are in the ring! Select a mini-game below to fight:\n\n"
+                    f"• 🥊 **⚔️ HP Combat Duel**: 100 HP Turn-based RPG fight with Strikes, Shields & Potions\n"
+                    f"• 🪨 **✂️ Rock-Paper-Scissors**: Secret move duel with instant reveal & sudden death\n"
+                    f"• 🎲 **High-Roller Dice**: Roll 2d20 dice showdown — highest roll wins\n"
+                ),
+                color=discord.Color.gold()
+            )
+            embed.set_footer(text="Hellfire Combat Arena • Either fighter can select a game mode")
+            await interaction.response.edit_message(
+                content=f"### 🔥 CHALLENGE ACCEPTED! 🥊 <@{self.challenger_id}> ⚔️ {interaction.user.mention}",
+                embed=embed,
+                view=select_view
+            )
 
     @discord.ui.button(label="🏳️ Decline / Flee", style=discord.ButtonStyle.secondary, custom_id="challenge_decline")
     async def decline_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -487,6 +878,7 @@ class ChallengeResponseView(discord.ui.View):
     async def on_timeout(self):
         for child in self.children:
             child.disabled = True
+
 
 # ==============================================================================
 # 1. AUTO-REACT ON MENTION & AUTOMATED ANTI-SPAM DETECTION
@@ -1245,6 +1637,82 @@ async def clear_messages(
         await send_clear_reply(f"❌ Unexpected error while deleting messages: {e}")
 
 # ==============================================================================
+# BYE — Send an elegant farewell card for a member to a target channel
+# ==============================================================================
+@bot.tree.command(name="bye", description="Send a farewell goodbye card for a member to a target channel")
+@app_commands.describe(
+    target_channel="The text channel where the farewell card will be posted",
+    member="The member who is leaving / farewell target (defaults to yourself)",
+    custom_message="Optional custom farewell message"
+)
+@check_bot_admin()
+async def bye(
+    interaction: discord.Interaction,
+    target_channel: discord.TextChannel,
+    member: discord.Member = None,
+    custom_message: str = None
+):
+    target = member or interaction.user
+    guild = interaction.guild
+
+    # 1. Server Nickname (or display name)
+    server_nick = target.nick if getattr(target, "nick", None) else target.display_name
+
+    # 2. Username
+    username = f"@{target.name}"
+
+    # 3. Profile picture on right corner (thumbnail)
+    avatar_url = target.display_avatar.url
+
+    # 4. Date of joined
+    if target.joined_at:
+        joined_timestamp = int(target.joined_at.timestamp())
+        joined_str = f"<t:{joined_timestamp}:D> (<t:{joined_timestamp}:R>)"
+    else:
+        joined_str = "*Unknown*"
+
+    # 5. It should tag Founder
+    founder_role = discord.utils.find(lambda r: "founder" in r.name.lower(), guild.roles) if guild else None
+    if founder_role:
+        founder_tag = founder_role.mention
+    elif guild and guild.owner:
+        founder_tag = guild.owner.mention
+    else:
+        founder_tag = f"<@{BOT_OWNER_ID}>"
+
+    # Construct the farewell Card Embed
+    embed = discord.Embed(
+        title="👋 FAREWELL • GOODBYE 👋",
+        description=f"### A member is bidding farewell to **{guild.name if guild else 'the server'}**!",
+        color=discord.Color.dark_red()
+    )
+    # Profile picture on the right corner
+    embed.set_thumbnail(url=avatar_url)
+
+    embed.add_field(name="🏷️ Server Nickname", value=f"**{server_nick}**", inline=True)
+    embed.add_field(name="👤 Username", value=f"`{username}` ({target.mention})", inline=True)
+    embed.add_field(name="📅 Date Joined", value=joined_str, inline=False)
+    embed.add_field(name="👑 Founder", value=founder_tag, inline=True)
+
+    if custom_message and custom_message.strip():
+        msg_clean = custom_message.strip()
+        embed.add_field(name="💬 Message", value=f"> *\"{msg_clean}\"*", inline=False)
+
+    embed.set_footer(text=f"Farewell Card • Sent via {interaction.user.display_name}")
+
+    # Content tags Founder so they receive the notification
+    content = f"👋 **Farewell** {target.mention} | Paging Founder: {founder_tag}"
+
+    try:
+        await target_channel.send(content=content, embed=embed)
+        await interaction.response.send_message(f"✅ Farewell card successfully posted in {target_channel.mention}!", ephemeral=True)
+    except discord.Forbidden:
+        await interaction.response.send_message(f"❌ Cannot send message to {target_channel.mention}: Missing send permissions.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Failed to send farewell card: {e}", ephemeral=True)
+
+
+# ==============================================================================
 # SERVER INFO — Full server dashboard with all statistics
 # ==============================================================================
 @bot.tree.command(name="serverinfo", description="Display comprehensive server statistics and information")
@@ -1402,6 +1870,98 @@ async def serverinfo(interaction: discord.Interaction):
 
     embed.set_footer(text=f"Server ID: {guild.id} • Requested by {interaction.user.display_name}")
 
+    await interaction.followup.send(embed=embed)
+
+
+# ==============================================================================
+# AUDIT — View recent server audit log entries
+# ==============================================================================
+@bot.tree.command(name="audit", description="Fetch and display the most recent server audit log messages")
+@app_commands.describe(
+    count="Number of audit log entries to retrieve (1 to 50, default: 10)"
+)
+@check_bot_admin()
+async def audit(interaction: discord.Interaction, count: int = 10):
+    await interaction.response.defer()
+    guild = interaction.guild
+    if not guild:
+        await interaction.followup.send("❌ This command can only be used inside a server.")
+        return
+
+    bot_member = guild.me or guild.get_member(bot.user.id)
+    if bot_member and not bot_member.guild_permissions.view_audit_log:
+        await interaction.followup.send("❌ **Missing Permissions**: The bot needs the **View Audit Log** permission to read audit entries.")
+        return
+
+    count = max(1, min(count, 50))
+
+    ACTION_ICONS = {
+        "kick": "👢",
+        "ban": "🔨",
+        "unban": "🔓",
+        "member_update": "👤",
+        "member_role_update": "🏷️",
+        "member_move": "🚚",
+        "member_disconnect": "🔌",
+        "bot_add": "🤖",
+        "role_create": "➕",
+        "role_delete": "➖",
+        "role_update": "✏️",
+        "channel_create": "📁",
+        "channel_delete": "🗑️",
+        "channel_update": "⚙️",
+        "message_delete": "🗑️",
+        "message_bulk_delete": "🧹",
+        "message_pin": "📌",
+        "message_unpin": "📍",
+        "invite_create": "🔗",
+        "invite_delete": "❌",
+        "webhook_create": "🪝",
+        "webhook_delete": "🪝",
+    }
+
+    entries = []
+    try:
+        async for entry in guild.audit_logs(limit=count):
+            entries.append(entry)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Failed to fetch audit logs: {e}")
+        return
+
+    if not entries:
+        await interaction.followup.send("📋 No audit log entries found.")
+        return
+
+    embed = discord.Embed(
+        title="🛡️ Server Audit Logs",
+        description=f"Showing the last **{len(entries)}** action(s) recorded in **{guild.name}**:",
+        color=discord.Color.blue()
+    )
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+
+    for i, entry in enumerate(entries, 1):
+        act_key = entry.action.name.lower()
+        icon = ACTION_ICONS.get(act_key, "📝")
+        act_name = str(entry.action.name).replace("_", " ").title()
+        
+        user_str = entry.user.mention if entry.user else "Unknown Moderator"
+        target_str = ""
+        if entry.target:
+            if hasattr(entry.target, "mention"):
+                target_str = f" ➔ {entry.target.mention}"
+            elif hasattr(entry.target, "name"):
+                target_str = f" ➔ **{entry.target.name}**"
+            else:
+                target_str = f" ➔ `{entry.target}`"
+
+        time_str = f"<t:{int(entry.created_at.timestamp())}:R>"
+        reason_str = f"\n> *Reason: {entry.reason}*" if entry.reason else ""
+
+        val = f"**Mod:** {user_str}{target_str}\n**When:** {time_str}{reason_str}"
+        embed.add_field(name=f"{icon} #{i} • {act_name}", value=val, inline=False)
+
+    embed.set_footer(text=f"Requested by {interaction.user.display_name} • Audit Log Inspector")
     await interaction.followup.send(embed=embed)
 
 
@@ -1574,13 +2134,26 @@ async def cmd_chase(interaction: discord.Interaction, target: discord.Member, so
             except Exception:
                 pass
 
-@bot.tree.command(name="challenge", description="Challenge another server member to an animated battle duel with a fighting shout card")
+@bot.tree.command(name="challenge", description="Challenge another server member to an interactive duel mini-game with combat shouting")
 @app_commands.describe(
     target="The member you want to challenge to a fight",
     source="The challenger (defaults to you)",
-    shout="Custom battle shout (defaults to: 'COME LETS FIGHT')"
+    shout="Custom battle shout (defaults to: 'COME LETS FIGHT')",
+    game="Duel mini-game mode (defaults to letting opponent choose in chat)"
 )
-async def cmd_challenge(interaction: discord.Interaction, target: discord.Member, source: discord.Member = None, shout: str = "COME LETS FIGHT"):
+@app_commands.choices(game=[
+    app_commands.Choice(name="🥊 Choose in Chat (Player's Choice)", value="select"),
+    app_commands.Choice(name="⚔️ HP Combat Duel (100 HP RPG Battle)", value="combat"),
+    app_commands.Choice(name="✂️ Rock-Paper-Scissors Duel", value="rps"),
+    app_commands.Choice(name="🎲 High-Roller Dice Duel (2d20)", value="dice")
+])
+async def cmd_challenge(
+    interaction: discord.Interaction,
+    target: discord.Member,
+    source: discord.Member = None,
+    shout: str = "COME LETS FIGHT",
+    game: str = "select"
+):
     actor = source if source is not None else interaction.user
     if is_duplicate_action(interaction.channel_id, "challenge", actor.id, target.id):
         if not interaction.response.is_done():
@@ -1588,7 +2161,7 @@ async def cmd_challenge(interaction: discord.Interaction, target: discord.Member
         return
 
     content, embed = make_challenge_payload(actor, target, shout)
-    view = ChallengeResponseView(actor.id, target.id, shout)
+    view = ChallengeResponseView(actor.id, target.id, shout, game=game)
     try:
         await interaction.response.send_message(content=content, embed=embed, view=view)
     except Exception:
@@ -1733,6 +2306,55 @@ async def moveall(
     if skipped_count > 0:
         msg += f"\n*(Skipped {skipped_count} member(s) due to higher role hierarchy/ownership)*"
     await interaction.followup.send(msg)
+
+# ==============================================================================
+# KICKALL — Kick/disconnect all members from a targeted voice channel
+# ==============================================================================
+@bot.tree.command(name="kickall", description="Kick/disconnect all members from a targeted voice channel")
+@app_commands.describe(
+    target_channel="The voice channel to kick everyone from (defaults to your current voice channel)"
+)
+@check_bot_admin()
+async def kickall(interaction: discord.Interaction, target_channel: discord.VoiceChannel = None):
+    await interaction.response.defer()
+
+    vc = target_channel
+    if not vc:
+        if interaction.user.voice and interaction.user.voice.channel:
+            vc = interaction.user.voice.channel
+        else:
+            await interaction.followup.send("❌ Please specify a target voice channel or join one first.")
+            return
+
+    members = list(vc.members)
+    if not members:
+        await interaction.followup.send(f"⚠️ No members currently in {vc.mention}.")
+        return
+
+    kicked_count = 0
+    skipped_count = 0
+
+    for member in members:
+        # Don't kick the bot itself
+        if member.id == bot.user.id:
+            continue
+        # Protect Supreme Bot Owner
+        if member.id == BOT_OWNER_ID:
+            skipped_count += 1
+            continue
+
+        try:
+            await member.move_to(None)
+            kicked_count += 1
+            await asyncio.sleep(0.15)
+        except Exception:
+            skipped_count += 1
+
+    msg = f"👢 Successfully kicked/disconnected **{kicked_count}** member(s) from **{vc.name}**."
+    if skipped_count > 0:
+        msg += f"\n*(Skipped {skipped_count} member(s) due to hierarchy or owner protection)*"
+    await interaction.followup.send(msg)
+
 
 @bot.tree.command(name="muteall", description="Mute or unmute ALL members in a voice channel")
 @app_commands.describe(
