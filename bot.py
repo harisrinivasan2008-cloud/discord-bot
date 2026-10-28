@@ -161,6 +161,28 @@ def remove_bye_channel(guild_id: int) -> bool:
         return True
     return False
 
+def get_stay_vc_config(guild_id: int) -> dict:
+    config = load_server_config()
+    return config.get(str(guild_id), {}).get("stay_vc", {})
+
+def set_stay_vc_config(guild_id: int, channel_id: int, enabled: bool = True):
+    config = load_server_config()
+    g_key = str(guild_id)
+    if g_key not in config:
+        config[g_key] = {}
+    config[g_key]["stay_vc"] = {
+        "enabled": enabled,
+        "channel_id": channel_id
+    }
+    save_server_config(config)
+
+def disable_stay_vc(guild_id: int):
+    config = load_server_config()
+    g_key = str(guild_id)
+    if g_key in config and "stay_vc" in config[g_key]:
+        config[g_key]["stay_vc"]["enabled"] = False
+        save_server_config(config)
+
 def get_bump_config(guild_id: int) -> dict:
     config = load_server_config()
     return config.get(str(guild_id), {}).get("bump", {})
@@ -381,6 +403,8 @@ async def on_ready():
     print("=" * 45, flush=True)
     if not auto_bump_loop.is_running():
         auto_bump_loop.start()
+    if not stay_vc_watchdog_loop.is_running():
+        stay_vc_watchdog_loop.start()
 
     # Sync slash commands once per process lifecycle to prevent hitting Discord rate limits (429)
     if not _commands_synced:
@@ -1148,6 +1172,56 @@ async def auto_bump_loop():
 
 @auto_bump_loop.before_loop
 async def before_auto_bump_loop():
+    await bot.wait_until_ready()
+
+# ==============================================================================
+# 24/7 STAY-IN-VOICE RECONNECT WATCHDOG LOOP
+# ==============================================================================
+@tasks.loop(seconds=20)
+async def stay_vc_watchdog_loop():
+    """Keeps the bot connected in 24/7 voice channels automatically."""
+    config = load_server_config()
+    for guild_id_str, g_data in list(config.items()):
+        stay_cfg = g_data.get("stay_vc")
+        if not stay_cfg or not stay_cfg.get("enabled"):
+            continue
+
+        try:
+            guild_id = int(guild_id_str)
+        except ValueError:
+            continue
+
+        guild = bot.get_guild(guild_id)
+        if not guild:
+            continue
+
+        channel_id = stay_cfg.get("channel_id")
+        channel = guild.get_channel(channel_id)
+        if not channel or not isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
+            continue
+
+        vc = guild.voice_client
+        if vc is None or not vc.is_connected():
+            try:
+                if vc:
+                    try:
+                        await vc.disconnect(force=True)
+                    except Exception:
+                        pass
+                print(f"[24/7 Voice Watchdog] Auto-reconnecting to #{channel.name} in {guild.name}...", flush=True)
+                await channel.connect(timeout=30.0, reconnect=True, self_deaf=True)
+                print(f"[24/7 Voice Watchdog] Successfully connected to #{channel.name} in {guild.name}.", flush=True)
+            except Exception as e:
+                print(f"[24/7 Voice Watchdog Error] Failed to connect to #{channel.name}: {e}", flush=True)
+        elif vc.channel and vc.channel.id != channel.id:
+            try:
+                print(f"[24/7 Voice Watchdog] Returning to 24/7 channel #{channel.name} in {guild.name}...", flush=True)
+                await vc.move_to(channel)
+            except Exception as e:
+                print(f"[24/7 Voice Watchdog Error] Failed to move back: {e}", flush=True)
+
+@stay_vc_watchdog_loop.before_loop
+async def before_stay_vc_watchdog_loop():
     await bot.wait_until_ready()
 
 
@@ -3250,7 +3324,7 @@ def get_ffmpeg_path():
     except Exception:
         return "ffmpeg"
 
-@bot.tree.command(name="join", description="Connect the bot to your current voice channel")
+@bot.tree.command(name="join", description="Connect the bot to your voice channel and keep it in VC 24/7")
 @app_commands.describe(channel="Voice channel to join (optional, defaults to your current VC)")
 @check_bot_admin()
 async def join_voice(interaction: discord.Interaction, channel: discord.VoiceChannel = None):
@@ -3284,14 +3358,16 @@ async def join_voice(interaction: discord.Interaction, channel: discord.VoiceCha
 
     # Case 1: Already in the target channel
     if vc and vc.is_connected() and vc.channel and vc.channel.id == target.id:
-        await interaction.followup.send(f"⚠️ Already connected to {target.mention}.", ephemeral=True)
+        set_stay_vc_config(guild.id, target.id, enabled=True)
+        await interaction.followup.send(f"🔊 Already connected to {target.mention}!\n🛡️ **24/7 Stay-in-VC Mode** is active and guarding this channel.")
         return
 
     # Case 2: Connected in another channel -> move cleanly
     if vc and vc.is_connected():
         try:
             await vc.move_to(target)
-            await interaction.followup.send(f"🔊 Successfully moved to {target.mention}!")
+            set_stay_vc_config(guild.id, target.id, enabled=True)
+            await interaction.followup.send(f"🔊 Successfully moved to {target.mention}!\n🛡️ **24/7 Stay-in-VC Mode** is active: The bot will stay connected 24 hours.")
             return
         except Exception as e:
             print(f"[Voice Move Error] {e}", flush=True)
@@ -3307,35 +3383,47 @@ async def join_voice(interaction: discord.Interaction, channel: discord.VoiceCha
         except Exception:
             pass
 
-    # Case 4: Connect fresh
+    # Case 4: Connect fresh with DAVE protocol & self_deaf=True
     try:
-        await target.connect(timeout=15.0, reconnect=True)
-        await interaction.followup.send(f"🔊 Successfully connected to {target.mention}!")
+        await target.connect(timeout=30.0, reconnect=True, self_deaf=True)
+        set_stay_vc_config(guild.id, target.id, enabled=True)
+        await interaction.followup.send(
+            f"🔊 Successfully connected to {target.mention}!\n"
+            f"🛡️ **24/7 Stay-in-VC Mode** is active: The bot will stay connected 24/7 with auto-reconnection."
+        )
     except asyncio.TimeoutError:
         try:
             if guild.voice_client:
                 await guild.voice_client.disconnect(force=True)
-            await asyncio.sleep(1)
-            await target.connect(timeout=15.0, reconnect=True)
-            await interaction.followup.send(f"🔊 Successfully connected to {target.mention}!")
+            await asyncio.sleep(1.5)
+            await target.connect(timeout=30.0, reconnect=True, self_deaf=True)
+            set_stay_vc_config(guild.id, target.id, enabled=True)
+            await interaction.followup.send(
+                f"🔊 Successfully connected to {target.mention}!\n"
+                f"🛡️ **24/7 Stay-in-VC Mode** is active: The bot will stay connected 24/7."
+            )
         except Exception as err:
-            await interaction.followup.send(f"❌ Connection timed out connecting to {target.mention}. Discord voice gateway did not respond: {err}", ephemeral=True)
+            await interaction.followup.send(f"❌ Connection error: Could not complete voice handshake with {target.mention}: {err}", ephemeral=True)
     except discord.ClientException as e:
         if "Already connected" in str(e) and guild.voice_client:
-            await interaction.followup.send(f"🔊 Connected to {guild.voice_client.channel.mention if guild.voice_client.channel else target.mention}!")
+            set_stay_vc_config(guild.id, target.id, enabled=True)
+            await interaction.followup.send(f"🔊 Connected to {guild.voice_client.channel.mention if guild.voice_client.channel else target.mention}!\n🛡️ **24/7 Mode** active.")
         else:
             await interaction.followup.send(f"❌ Voice error: {e}", ephemeral=True)
     except Exception as e:
         await interaction.followup.send(f"❌ Failed to connect to {target.mention}: {e}", ephemeral=True)
 
 
-@bot.tree.command(name="leave", description="Disconnect the bot from the voice channel")
+@bot.tree.command(name="leave", description="Disconnect the bot from voice and turn off 24/7 mode")
 @check_bot_admin()
 async def leave_voice(interaction: discord.Interaction):
     guild = interaction.guild
     if not guild:
         await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
         return
+
+    # Disable 24/7 mode so watchdog doesn't immediately reconnect
+    disable_stay_vc(guild.id)
 
     vc = guild.voice_client
     if not vc or not vc.is_connected():
@@ -3350,9 +3438,125 @@ async def leave_voice(interaction: discord.Interaction):
     channel_name = vc.channel.name if vc.channel else "the voice channel"
     try:
         await vc.disconnect(force=True)
-        await interaction.response.send_message(f"👋 Disconnected from **{channel_name}**.")
+        await interaction.response.send_message(f"👋 Disconnected from **{channel_name}** and disabled 24/7 voice mode.")
     except Exception as e:
         await interaction.response.send_message(f"❌ Error disconnecting: {e}", ephemeral=True)
+
+
+# ── Slash Command: /247 ───────────────────────────────────────────────────────
+@bot.tree.command(name="247", description="Configure or toggle 24/7 voice channel stay & auto-reconnect mode")
+@app_commands.describe(
+    mode="Turn 24/7 voice mode ON, OFF, or view status",
+    channel="Voice channel to stay in 24/7 (optional, defaults to your current voice channel)"
+)
+@app_commands.choices(mode=[
+    app_commands.Choice(name="🟢 Enable 24/7 Voice", value="on"),
+    app_commands.Choice(name="🔴 Disable 24/7 Voice", value="off"),
+    app_commands.Choice(name="📊 View 24/7 Status", value="status"),
+])
+@check_bot_admin()
+async def cmd_247(
+    interaction: discord.Interaction,
+    mode: app_commands.Choice[str] = None,
+    channel: discord.VoiceChannel = None
+):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
+        return
+
+    selected_mode = mode.value if mode else "status"
+    stay_cfg = get_stay_vc_config(guild.id)
+
+    if selected_mode == "off":
+        disable_stay_vc(guild.id)
+        embed = discord.Embed(
+            title="🔴 24/7 Voice Mode Disabled",
+            description="The bot will no longer auto-reconnect or force itself to stay in voice channels.\n*(Use `/leave` to disconnect the bot if it is currently in a VC)*",
+            color=discord.Color.red()
+        )
+        await interaction.response.send_message(embed=embed)
+        return
+
+    if selected_mode == "on":
+        target = channel
+        if not target:
+            user_voice = interaction.user.voice if isinstance(interaction.user, discord.Member) else None
+            if user_voice and user_voice.channel:
+                target = user_voice.channel
+            elif stay_cfg.get("channel_id"):
+                target = guild.get_channel(stay_cfg["channel_id"])
+
+        if not target:
+            await interaction.response.send_message(
+                "❌ Please join a voice channel first or select one in the `channel` parameter to set as your 24/7 room.",
+                ephemeral=True
+            )
+            return
+
+        set_stay_vc_config(guild.id, target.id, enabled=True)
+
+        # Defer and connect
+        await interaction.response.defer()
+        vc = guild.voice_client
+        status_note = ""
+        try:
+            if vc and vc.is_connected():
+                if vc.channel.id != target.id:
+                    await vc.move_to(target)
+                    status_note = f"\nMoved bot to {target.mention}."
+            else:
+                if vc:
+                    try:
+                        await vc.disconnect(force=True)
+                    except Exception:
+                        pass
+                await target.connect(timeout=30.0, reconnect=True, self_deaf=True)
+                status_note = f"\nConnected bot to {target.mention}."
+        except Exception as e:
+            status_note = f"\n⚠️ Auto-connect attempt: {e} *(Watchdog will continue auto-reconnecting)*"
+
+        embed = discord.Embed(
+            title="🟢 24/7 Voice Channel Mode Enabled",
+            description=(
+                f"🛡️ The bot is now locked into {target.mention} 24/7!{status_note}\n\n"
+                f"• **Auto-Reconnect Watchdog**: Active (Checks every 20s)\n"
+                f"• **DAVE E2EE Support**: Enabled (discord.py v2.7.1)\n"
+                f"• **Self-Deafen**: Active (Optimized for 24/7 stability)\n"
+                f"• **Rejoin on Kick/Move**: Enabled"
+            ),
+            color=discord.Color.green()
+        )
+        await interaction.followup.send(embed=embed)
+        return
+
+    # View Status
+    is_active = stay_cfg.get("enabled", False)
+    target_channel_id = stay_cfg.get("channel_id")
+    target_channel = guild.get_channel(target_channel_id) if target_channel_id else None
+    vc = guild.voice_client
+
+    embed = discord.Embed(
+        title="📊 24/7 Voice Mode Status",
+        color=discord.Color.blue() if is_active else discord.Color.greyple()
+    )
+    embed.add_field(
+        name="Status",
+        value="🟢 **Enabled (24/7 Guard Active)**" if is_active else "🔴 **Disabled**",
+        inline=True
+    )
+    embed.add_field(
+        name="Target 24/7 Channel",
+        value=target_channel.mention if target_channel else "None configured",
+        inline=True
+    )
+    embed.add_field(
+        name="Current VC Connection",
+        value=f"🔊 Connected to {vc.channel.mention}" if (vc and vc.is_connected() and vc.channel) else "❌ Not connected",
+        inline=False
+    )
+    embed.set_footer(text="Use /247 mode: Enable to lock the bot in a voice channel 24/7.")
+    await interaction.response.send_message(embed=embed)
 
 # ==============================================================================
 # VOICE CHANNEL LOCK & UNLOCK (/lock, /unlock)
@@ -3534,9 +3738,31 @@ def save_follow_config(config: dict):
 
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
-    """Listen to voice channel movements and follow the Supreme Bot Owner everywhere."""
-    # Ignore bot self
+    """Listen to voice channel movements and follow the Supreme Bot Owner, or guard 24/7 channels."""
+    # Check if update is for the bot itself (24/7 Reconnect Guard)
     if member.id == bot.user.id:
+        stay_cfg = get_stay_vc_config(member.guild.id)
+        if stay_cfg.get("enabled"):
+            target_cid = stay_cfg.get("channel_id")
+            if target_cid and (after.channel is None or after.channel.id != target_cid):
+                target_channel = member.guild.get_channel(target_cid)
+                if target_channel and isinstance(target_channel, (discord.VoiceChannel, discord.StageChannel)):
+                    print(f"[24/7 Voice] Bot disconnected or moved from #{target_channel.name} in {member.guild.name}. Auto-restoring in 2s...", flush=True)
+                    await asyncio.sleep(2.0)
+                    try:
+                        vc = member.guild.voice_client
+                        if vc and vc.is_connected():
+                            await vc.move_to(target_channel)
+                        else:
+                            if vc:
+                                try:
+                                    await vc.disconnect(force=True)
+                                except Exception:
+                                    pass
+                            await target_channel.connect(timeout=30.0, reconnect=True, self_deaf=True)
+                        print(f"[24/7 Voice] Auto-restored connection to #{target_channel.name}.", flush=True)
+                    except Exception as e:
+                        print(f"[24/7 Auto-Rejoin Error] {e}", flush=True)
         return
 
     cfg = load_follow_config()
