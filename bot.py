@@ -703,7 +703,11 @@ async def get_audit_log_entry(guild: discord.Guild, action: discord.AuditLogActi
                 if age > max_age_seconds:
                     continue
                 if target_id is not None:
-                    entry_target_id = getattr(entry.target, "id", None)
+                    entry_target_id = None
+                    try:
+                        entry_target_id = getattr(entry.target, "id", None)
+                    except Exception:
+                        entry_target_id = getattr(entry, "_target_id", None)
                     if entry_target_id != target_id:
                         continue
                 return entry
@@ -3569,25 +3573,46 @@ async def audit(interaction: discord.Interaction, count: int = 10):
         embed.set_thumbnail(url=guild.icon.url)
 
     for i, entry in enumerate(entries, 1):
-        act_key = entry.action.name.lower()
-        icon = ACTION_ICONS.get(act_key, "📝")
-        act_name = str(entry.action.name).replace("_", " ").title()
-        
-        user_str = entry.user.mention if entry.user else "Unknown Moderator"
-        target_str = ""
-        if entry.target:
-            if hasattr(entry.target, "mention"):
-                target_str = f" ➔ {entry.target.mention}"
-            elif hasattr(entry.target, "name"):
-                target_str = f" ➔ **{entry.target.name}**"
-            else:
-                target_str = f" ➔ `{entry.target}`"
+        try:
+            act_key = entry.action.name.lower()
+            icon = ACTION_ICONS.get(act_key, "📝")
+            act_name = str(entry.action.name).replace("_", " ").title()
+            
+            user_str = "Unknown Moderator"
+            try:
+                if entry.user:
+                    user_str = entry.user.mention
+            except Exception:
+                user_str = "Unknown Moderator"
 
-        time_str = f"<t:{int(entry.created_at.timestamp())}:R>"
-        reason_str = f"\n> *Reason: {entry.reason}*" if entry.reason else ""
+            target_str = ""
+            try:
+                target = entry.target
+                if target:
+                    if hasattr(target, "mention"):
+                        target_str = f" ➔ {target.mention}"
+                    elif hasattr(target, "name"):
+                        target_str = f" ➔ **{target.name}**"
+                    else:
+                        target_str = f" ➔ `{target}`"
+            except Exception:
+                raw_target_id = getattr(entry, "_target_id", None)
+                if raw_target_id:
+                    target_str = f" ➔ ID `{raw_target_id}`"
+                else:
+                    target_str = ""
 
-        val = f"**Mod:** {user_str}{target_str}\n**When:** {time_str}{reason_str}"
-        embed.add_field(name=f"{icon} #{i} • {act_name}", value=val, inline=False)
+            try:
+                time_str = f"<t:{int(entry.created_at.timestamp())}:R>"
+            except Exception:
+                time_str = "Recently"
+
+            reason_str = f"\n> *Reason: {entry.reason}*" if getattr(entry, "reason", None) else ""
+
+            val = f"**Mod:** {user_str}{target_str}\n**When:** {time_str}{reason_str}"
+            embed.add_field(name=f"{icon} #{i} • {act_name}", value=val, inline=False)
+        except Exception as item_err:
+            embed.add_field(name=f"📝 #{i} • Action", value=f"Audit item details unavailable: `{item_err}`", inline=False)
 
     embed.set_footer(text=f"Requested by {interaction.user.display_name} • Audit Log Inspector")
     await interaction.followup.send(embed=embed)
