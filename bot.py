@@ -13,7 +13,7 @@ import datetime
 import threading
 from collections import defaultdict, deque
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
 from discord.ext import voice_recv
 from dotenv import load_dotenv
@@ -114,6 +114,27 @@ def remove_bye_channel(guild_id: int) -> bool:
     guild_key = str(guild_id)
     if guild_key in config and "bye_channel_id" in config[guild_key]:
         del config[guild_key]["bye_channel_id"]
+        save_server_config(config)
+        return True
+    return False
+
+def get_bump_config(guild_id: int) -> dict:
+    config = load_server_config()
+    return config.get(str(guild_id), {}).get("bump", {})
+
+def save_bump_config(guild_id: int, bump_cfg: dict):
+    config = load_server_config()
+    guild_key = str(guild_id)
+    if guild_key not in config:
+        config[guild_key] = {}
+    config[guild_key]["bump"] = bump_cfg
+    save_server_config(config)
+
+def disable_bump_config(guild_id: int) -> bool:
+    config = load_server_config()
+    guild_key = str(guild_id)
+    if guild_key in config and "bump" in config[guild_key]:
+        config[guild_key]["bump"]["enabled"] = False
         save_server_config(config)
         return True
     return False
@@ -274,6 +295,8 @@ async def on_ready():
     admin_ids = load_admin_ids()
     print(f"Loaded {len(admin_ids)} custom bot admin(s) from admins.json", flush=True)
     print("=" * 45, flush=True)
+    if not auto_bump_loop.is_running():
+        auto_bump_loop.start()
 
     # Sync slash commands globally across Discord
     try:
@@ -982,8 +1005,100 @@ class ChallengeResponseView(discord.ui.View):
 # ==============================================================================
 # 1. AUTO-REACT ON MENTION & AUTOMATED ANTI-SPAM DETECTION
 # ==============================================================================
+# ==============================================================================
+# AUTOMATIC SERVER BUMP BACKGROUND TASK
+# ==============================================================================
+@tasks.loop(seconds=30)
+async def auto_bump_loop():
+    now = time.time()
+    config = load_server_config()
+    for guild_id_str, g_data in list(config.items()):
+        bump_cfg = g_data.get("bump")
+        if not bump_cfg or not bump_cfg.get("enabled"):
+            continue
+
+        next_bump = bump_cfg.get("next_bump_timestamp", 0)
+        if now >= next_bump:
+            try:
+                guild_id = int(guild_id_str)
+            except ValueError:
+                continue
+
+            guild = bot.get_guild(guild_id)
+            if not guild:
+                continue
+
+            channel_id = bump_cfg.get("channel_id")
+            channel = guild.get_channel(channel_id)
+            if not channel or not isinstance(channel, discord.TextChannel):
+                continue
+
+            interval_mins = bump_cfg.get("interval_minutes", 120)
+            bump_text = bump_cfg.get("bump_text", "/bump")
+            ping_role_id = bump_cfg.get("ping_role_id")
+
+            # Advance next bump timestamp
+            bump_cfg["next_bump_timestamp"] = now + (interval_mins * 60)
+            config[guild_id_str]["bump"] = bump_cfg
+            save_server_config(config)
+
+            # 1. Send the bump command string to the channel
+            try:
+                await channel.send(bump_text)
+            except Exception as e:
+                print(f"[Auto-Bump] Failed to send bump text in {guild.name}: {e}", flush=True)
+
+            # 2. Post the rich bump reminder card with ping
+            ping_str = f"<@&{ping_role_id}> " if ping_role_id else ""
+            embed = discord.Embed(
+                title="🚀 BUMP TIME! Automatic Server Bump Triggered",
+                description=(
+                    f"The **{interval_mins}-minute** cooldown has ended!\n\n"
+                    f"• **Sent Bump**: `{bump_text}`\n"
+                    f"• **Next Bump**: <t:{int(now + (interval_mins * 60))}:R> (<t:{int(now + (interval_mins * 60))}:t>)\n\n"
+                    f"💡 *If your bump bot (like Disboard) requires a manual slash interaction, click or type `/bump` in this channel now!*"
+                ),
+                color=discord.Color.from_rgb(255, 115, 250)
+            )
+            embed.set_footer(text=f"Auto-Bump System • Interval: {interval_mins} mins")
+            try:
+                await channel.send(content=ping_str if ping_str else None, embed=embed)
+                print(f"[Auto-Bump] Triggered auto-bump in #{channel.name} ({guild.name})", flush=True)
+            except Exception as e:
+                print(f"[Auto-Bump] Error sending reminder card: {e}", flush=True)
+
+
 @bot.event
 async def on_message(message: discord.Message):
+    # Detect bump confirmation or cooldown messages from Bump Bots (Disboard, Olympus, etc.)
+    if message.guild and message.author.bot:
+        bump_cfg = get_bump_config(message.guild.id)
+        if bump_cfg and bump_cfg.get("enabled"):
+            full_text = (message.content or "").lower()
+            for emb in message.embeds:
+                if emb.title:
+                    full_text += " " + emb.title.lower()
+                if emb.description:
+                    full_text += " " + emb.description.lower()
+                for field in emb.fields:
+                    full_text += f" {field.name.lower()} {field.value.lower()}"
+
+            # Check if bump was successful
+            if any(k in full_text for k in ["bump done", "bumped", "check it on disboard", "disboard.org"]):
+                interval_mins = bump_cfg.get("interval_minutes", 120)
+                bump_cfg["next_bump_timestamp"] = time.time() + (interval_mins * 60)
+                save_bump_config(message.guild.id, bump_cfg)
+                print(f"[Auto-Bump] Bump success detected in {message.guild.name}. Next bump in {interval_mins}m.", flush=True)
+
+            # Check if cooldown wait message was returned (e.g. 'wait another 45 minutes')
+            wait_match = re.search(r"wait(?: another)? (\d+)\s*minute", full_text)
+            if wait_match:
+                wait_mins = int(wait_match.group(1))
+                bump_cfg["next_bump_timestamp"] = time.time() + (wait_mins * 60)
+                save_bump_config(message.guild.id, bump_cfg)
+                print(f"[Auto-Bump] Bump cooldown detected in {message.guild.name}: {wait_mins}m remaining.", flush=True)
+        return
+
     # Ignore messages sent by bots
     if message.author.bot:
         return
@@ -1200,6 +1315,174 @@ async def on_message(message: discord.Message):
 # ==============================================================================
 # 2. ADMIN ACCESS MANAGEMENT COMMANDS (/admin add, /admin remove, /admin list)
 # ==============================================================================
+# ==============================================================================
+# BUMP — Automated Server Bumper & Cooldown Reminder (/bump)
+# ==============================================================================
+bump_group = app_commands.Group(name="bump", description="Automated server bump & reminder system")
+
+@bump_group.command(name="setup", description="Configure automatic server bumping on a scheduled interval")
+@app_commands.describe(
+    channel="The text channel where bump commands and reminders will be sent",
+    interval_minutes="Cooldown between bumps in minutes (default: 120 for Disboard)",
+    bump_text="The bump text command to send (default: /bump)",
+    ping_role="Optional role to ping when the server is bumped / ready"
+)
+@check_bot_admin()
+async def bump_setup(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+    interval_minutes: int = 120,
+    bump_text: str = "/bump",
+    ping_role: discord.Role = None
+):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
+        return
+
+    if interval_minutes < 5:
+        await interaction.response.send_message("❌ Interval must be at least 5 minutes.", ephemeral=True)
+        return
+
+    now = time.time()
+    next_bump = now + (interval_minutes * 60)
+
+    bump_cfg = {
+        "enabled": True,
+        "channel_id": channel.id,
+        "interval_minutes": interval_minutes,
+        "bump_text": bump_text.strip(),
+        "ping_role_id": ping_role.id if ping_role else None,
+        "next_bump_timestamp": next_bump
+    }
+    save_bump_config(guild.id, bump_cfg)
+
+    embed = discord.Embed(
+        title="✅ Automatic Bumper Configured!",
+        description=f"The bot will automatically bump **{guild.name}** and monitor cooldowns.",
+        color=discord.Color.green()
+    )
+    embed.add_field(name="📌 Channel", value=channel.mention, inline=True)
+    embed.add_field(name="⏱️ Interval", value=f"Every **{interval_minutes}** minutes ({(interval_minutes/60):.1f} hrs)", inline=True)
+    embed.add_field(name="💬 Sent Text", value=f"`{bump_text}`", inline=True)
+    embed.add_field(name="🔔 Ping Role", value=ping_role.mention if ping_role else "*None*", inline=True)
+    embed.add_field(name="⏳ First Scheduled Bump", value=f"<t:{int(next_bump)}:R> (<t:{int(next_bump)}:t>)", inline=False)
+    embed.set_footer(text="Use /bump now to trigger immediately, or /bump status to inspect.")
+
+    await interaction.response.send_message(embed=embed)
+
+
+@bump_group.command(name="now", description="Trigger an immediate bump in the configured channel")
+@check_bot_admin()
+async def bump_now(interaction: discord.Interaction):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
+        return
+
+    bump_cfg = get_bump_config(guild.id)
+    channel_id = bump_cfg.get("channel_id") if bump_cfg else None
+    channel = guild.get_channel(channel_id) if channel_id else interaction.channel
+
+    if not channel or not isinstance(channel, discord.TextChannel):
+        await interaction.response.send_message("❌ No valid bump channel configured. Use `/bump setup` first.", ephemeral=True)
+        return
+
+    bump_text = bump_cfg.get("bump_text", "/bump") if bump_cfg else "/bump"
+    interval_mins = bump_cfg.get("interval_minutes", 120) if bump_cfg else 120
+    ping_role_id = bump_cfg.get("ping_role_id") if bump_cfg else None
+
+    now = time.time()
+    next_bump = now + (interval_mins * 60)
+
+    if bump_cfg:
+        bump_cfg["next_bump_timestamp"] = next_bump
+        bump_cfg["enabled"] = True
+        save_bump_config(guild.id, bump_cfg)
+
+    # 1. Send the bump text in the target channel
+    try:
+        await channel.send(bump_text)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Failed to send bump text in {channel.mention}: {e}", ephemeral=True)
+        return
+
+    # 2. Send reminder embed
+    ping_str = f"<@&{ping_role_id}> " if ping_role_id else ""
+    embed = discord.Embed(
+        title="🚀 Manual Bump Triggered!",
+        description=(
+            f"Successfully posted `{bump_text}` in {channel.mention}!\n\n"
+            f"• **Next Scheduled Bump**: <t:{int(next_bump)}:R>\n"
+            f"• **Interval**: {interval_mins} minutes\n\n"
+            f"*If using Disboard slash commands, run `/bump` in {channel.mention} now!*"
+        ),
+        color=discord.Color.nitro_pink()
+    )
+    embed.set_footer(text=f"Triggered by {interaction.user.display_name}")
+    await channel.send(content=ping_str if ping_str else None, embed=embed)
+    await interaction.response.send_message(f"✅ Bump triggered in {channel.mention}!", ephemeral=True)
+
+
+@bump_group.command(name="status", description="Check current bump timer, channel, and settings")
+@check_bot_admin()
+async def bump_status(interaction: discord.Interaction):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
+        return
+
+    bump_cfg = get_bump_config(guild.id)
+    if not bump_cfg or not bump_cfg.get("channel_id"):
+        await interaction.response.send_message(
+            f"ℹ️ Automatic bump is currently **not configured** for **{guild.name}**.\n"
+            f"Use `/bump setup channel: #channel` to activate it.",
+            ephemeral=True
+        )
+        return
+
+    channel = guild.get_channel(bump_cfg.get("channel_id"))
+    interval_mins = bump_cfg.get("interval_minutes", 120)
+    next_bump = bump_cfg.get("next_bump_timestamp", 0)
+    ping_role = guild.get_role(bump_cfg.get("ping_role_id")) if bump_cfg.get("ping_role_id") else None
+    is_active = bump_cfg.get("enabled", False)
+
+    now = time.time()
+    if now >= next_bump:
+        countdown_str = "🟢 **Ready to bump now!**"
+    else:
+        countdown_str = f"⏳ <t:{int(next_bump)}:R> (<t:{int(next_bump)}:t>)"
+
+    embed = discord.Embed(
+        title="📊 Server Auto-Bump Status",
+        description=f"Auto-bump status and cooldown timer for **{guild.name}**.",
+        color=discord.Color.green() if is_active else discord.Color.greyple()
+    )
+    embed.add_field(name="⚙️ Status", value="🟢 **Active**" if is_active else "🔴 **Disabled**", inline=True)
+    embed.add_field(name="📌 Bump Channel", value=channel.mention if channel else "*Not found*", inline=True)
+    embed.add_field(name="⏱️ Interval", value=f"Every **{interval_mins}** mins ({(interval_mins/60):.1f} hrs)", inline=True)
+    embed.add_field(name="💬 Sent Text", value=f"`{bump_cfg.get('bump_text', '/bump')}`", inline=True)
+    embed.add_field(name="🔔 Ping Role", value=ping_role.mention if ping_role else "*None*", inline=True)
+    embed.add_field(name="⏰ Next Bump", value=countdown_str, inline=False)
+
+    await interaction.response.send_message(embed=embed)
+
+
+@bump_group.command(name="disable", description="Disable automatic server bumping")
+@check_bot_admin()
+async def bump_disable(interaction: discord.Interaction):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
+        return
+
+    if disable_bump_config(guild.id):
+        await interaction.response.send_message(f"✅ Automatic server bumping has been **disabled** for **{guild.name}**.")
+    else:
+        await interaction.response.send_message("⚠️ Automatic bumping was not active.", ephemeral=True)
+
+bot.tree.add_command(bump_group)
+
 admin_group = app_commands.Group(name="admin", description="Manage authorized bot administrators")
 
 @admin_group.command(name="add", description="Grant a user full access to use this bot")
