@@ -204,6 +204,216 @@ def disable_bump_config(guild_id: int) -> bool:
         return True
     return False
 
+# ==============================================================================
+# EXTRA OWNERS & WHITELIST HELPERS
+# ==============================================================================
+def get_extraowner_ids(guild_id: int) -> set:
+    config = load_server_config()
+    return set(config.get(str(guild_id), {}).get("extraowner_ids", []))
+
+def add_extraowner(guild_id: int, user_id: int):
+    config = load_server_config()
+    g_key = str(guild_id)
+    if g_key not in config:
+        config[g_key] = {}
+    extraowners = set(config[g_key].get("extraowner_ids", []))
+    extraowners.add(user_id)
+    config[g_key]["extraowner_ids"] = sorted(list(extraowners))
+    save_server_config(config)
+
+def remove_extraowner(guild_id: int, user_id: int) -> bool:
+    config = load_server_config()
+    g_key = str(guild_id)
+    if g_key in config and "extraowner_ids" in config[g_key]:
+        extraowners = set(config[g_key]["extraowner_ids"])
+        if user_id in extraowners:
+            extraowners.remove(user_id)
+            config[g_key]["extraowner_ids"] = sorted(list(extraowners))
+            save_server_config(config)
+            return True
+    return False
+
+def is_server_owner_or_extraowner(guild: discord.Guild, user_id: int) -> bool:
+    if user_id == BOT_OWNER_ID:
+        return True
+    if not guild:
+        return False
+    if guild.owner_id and user_id == guild.owner_id:
+        return True
+    return user_id in get_extraowner_ids(guild.id)
+
+def get_whitelist_ids(guild_id: int) -> set:
+    config = load_server_config()
+    return set(config.get(str(guild_id), {}).get("whitelist_ids", []))
+
+def add_whitelist_user(guild_id: int, user_id: int):
+    config = load_server_config()
+    g_key = str(guild_id)
+    if g_key not in config:
+        config[g_key] = {}
+    wl = set(config[g_key].get("whitelist_ids", []))
+    wl.add(user_id)
+    config[g_key]["whitelist_ids"] = sorted(list(wl))
+    save_server_config(config)
+
+def remove_whitelist_user(guild_id: int, user_id: int) -> bool:
+    config = load_server_config()
+    g_key = str(guild_id)
+    if g_key in config and "whitelist_ids" in config[g_key]:
+        wl = set(config[g_key]["whitelist_ids"])
+        if user_id in wl:
+            wl.remove(user_id)
+            config[g_key]["whitelist_ids"] = sorted(list(wl))
+            save_server_config(config)
+            return True
+    return False
+
+def is_whitelisted(guild: discord.Guild, user_id: int) -> bool:
+    if user_id == BOT_OWNER_ID:
+        return True
+    if not guild:
+        return False
+    if guild.owner_id and user_id == guild.owner_id:
+        return True
+    if user_id in get_extraowner_ids(guild.id):
+        return True
+    return user_id in get_whitelist_ids(guild.id)
+
+# ==============================================================================
+# AUTOMOD, ANTINUKE, AUTOROLE & GREET CONFIG HELPERS
+# ==============================================================================
+def get_automod_config(guild_id: int) -> dict:
+    config = load_server_config()
+    return config.get(str(guild_id), {}).get("automod", {"enabled": False, "channels": []})
+
+def set_automod_config(guild_id: int, automod_cfg: dict):
+    config = load_server_config()
+    g_key = str(guild_id)
+    if g_key not in config:
+        config[g_key] = {}
+    config[g_key]["automod"] = automod_cfg
+    save_server_config(config)
+
+def get_antinuke_config(guild_id: int) -> dict:
+    config = load_server_config()
+    return config.get(str(guild_id), {}).get("antinuke", {"enabled": False})
+
+def set_antinuke_config(guild_id: int, enabled: bool):
+    config = load_server_config()
+    g_key = str(guild_id)
+    if g_key not in config:
+        config[g_key] = {}
+    config[g_key]["antinuke"] = {"enabled": enabled}
+    save_server_config(config)
+
+def get_autorole_config(guild_id: int) -> dict:
+    config = load_server_config()
+    return config.get(str(guild_id), {}).get("autorole", {"human_role_id": None, "bot_role_id": None})
+
+def set_autorole_config(guild_id: int, autorole_cfg: dict):
+    config = load_server_config()
+    g_key = str(guild_id)
+    if g_key not in config:
+        config[g_key] = {}
+    config[g_key]["autorole"] = autorole_cfg
+    save_server_config(config)
+
+def get_greet_config(guild_id: int) -> dict:
+    config = load_server_config()
+    return config.get(str(guild_id), {}).get("greet", {
+        "enabled": False,
+        "channel_ids": [],
+        "banner_url": None,
+        "message": None,
+        "template": 1
+    })
+
+def set_greet_config(guild_id: int, greet_cfg: dict):
+    config = load_server_config()
+    g_key = str(guild_id)
+    if g_key not in config:
+        config[g_key] = {}
+    config[g_key]["greet"] = greet_cfg
+    save_server_config(config)
+
+def build_welcome_card(member: discord.Member | discord.User, template_id: int = 1, custom_msg: str = None, banner_url: str = None) -> tuple[str, discord.Embed]:
+    guild = getattr(member, "guild", None)
+    avatar = getattr(member, "display_avatar", None)
+    avatar_url = avatar.url if avatar else "https://cdn.discordapp.com/embed/avatars/0.png"
+
+    created_at = getattr(member, "created_at", None)
+    created_ts = int(created_at.timestamp()) if created_at else int(time.time())
+    member_count = guild.member_count if guild else 1
+
+    if guild and guild.owner:
+        founder_tag = guild.owner.mention
+    else:
+        exact_founder = discord.utils.find(lambda r: r.name.lower().strip() == "founder", guild.roles) if guild else None
+        founder_tag = exact_founder.mention if exact_founder else f"<@{BOT_OWNER_ID}>"
+
+    final_banner = banner_url or (guild.banner.url if guild and guild.banner else None)
+    msg_clean = custom_msg.strip() if custom_msg and custom_msg.strip() else None
+
+    if template_id == 2:
+        # Template 2: Monarch Royal Deluxe
+        embed = discord.Embed(
+            title=f"👑 IMPERIAL COURT • WELCOME TO {guild.name.upper() if guild else 'THE SERVER'} 👑",
+            description=f"### Royal Greetings, {member.mention}!\nBy imperial decree, your arrival marks member **#{member_count}** in the kingdom.",
+            color=discord.Color.gold()
+        )
+        embed.set_thumbnail(url=avatar_url)
+        embed.add_field(name="🛡️ Distinguished Guest", value=f"{member.mention} (`{member.name}`)", inline=True)
+        embed.add_field(name="🏰 Crown Founder", value=founder_tag, inline=True)
+        embed.add_field(name="📅 Account Age", value=f"<t:{created_ts}:D> (<t:{created_ts}:R>)", inline=True)
+        embed.add_field(name="📜 Kingdom Guidelines", value="Please read the server rules and treat all members with honor.", inline=False)
+        if msg_clean:
+            embed.add_field(name="💬 Royal Decree", value=f"> *\"{msg_clean}\"*", inline=False)
+        if final_banner:
+            embed.set_image(url=final_banner)
+        embed.set_footer(text=f"Royal Welcome • Member #{member_count} • {guild.name if guild else 'Server'}")
+        content = f"👑 **All hail and welcome** {member.mention} to **{guild.name if guild else 'the server'}**! | Paging Founder: {founder_tag}"
+
+    elif template_id == 3:
+        # Template 3: Modern Aesthetic Luxe
+        embed = discord.Embed(
+            title=f"✨ New Arrival • Welcome to {guild.name if guild else 'the server'} ✨",
+            description=f"Welcome to the community, {member.mention}! We are thrilled to have you here.",
+            color=discord.Color.from_rgb(88, 101, 242)
+        )
+        embed.set_thumbnail(url=avatar_url)
+        embed.add_field(name="👤 Member", value=f"`{member.name}` ({member.mention})", inline=True)
+        embed.add_field(name="📊 Member Count", value=f"**#{member_count}**", inline=True)
+        embed.add_field(name="👑 Founder", value=founder_tag, inline=True)
+        embed.add_field(name="⏰ Joined At", value=f"<t:{int(time.time())}:f>", inline=False)
+        if msg_clean:
+            embed.add_field(name="💭 Note", value=f"> *\"{msg_clean}\"*", inline=False)
+        if final_banner:
+            embed.set_image(url=final_banner)
+        embed.set_footer(text=f"Aesthetic Luxe • {guild.name if guild else 'Server'}")
+        content = f"✨ Welcome {member.mention} to **{guild.name if guild else 'the server'}**!"
+
+    else:
+        # Template 1: Cyberpunk Neon
+        embed = discord.Embed(
+            title=f"⚡ WELCOME TO {guild.name.upper() if guild else 'THE SERVER'} ⚡",
+            description=f"### Access Granted, {member.mention}!\nYou are connection **#{member_count}** in the mainframe.",
+            color=discord.Color.from_rgb(0, 240, 255)
+        )
+        embed.set_thumbnail(url=avatar_url)
+        embed.add_field(name="🏷️ Identity", value=f"**{member.name}** (`{member.id}`)", inline=True)
+        embed.add_field(name="👑 Founder", value=founder_tag, inline=True)
+        embed.add_field(name="📅 Account Created", value=f"<t:{created_ts}:D> (<t:{created_ts}:R>)", inline=True)
+        if msg_clean:
+            embed.add_field(name="💬 Transmission", value=f"> *\"{msg_clean}\"*", inline=False)
+        else:
+            embed.add_field(name="💬 Transmission", value="> *\"Suit up, check the server rules, and enjoy your time!\"*", inline=False)
+        if final_banner:
+            embed.set_image(url=final_banner)
+        embed.set_footer(text=f"Cyberpunk Neon • Member #{member_count} • {guild.name if guild else 'Server'}")
+        content = f"⚡ **Transmission incoming** for {member.mention}! Welcome to **{guild.name if guild else 'the server'}**!"
+
+    return content, embed
+
 def build_farewell_card(member: discord.Member | discord.User, guild: discord.Guild, custom_message: str = None) -> tuple[str, discord.Embed]:
     server_nick = getattr(member, "nick", None) or getattr(member, "display_name", getattr(member, "name", "Member"))
     username = f"@{member.name}"
@@ -218,13 +428,16 @@ def build_farewell_card(member: discord.Member | discord.User, guild: discord.Gu
     else:
         joined_str = "*Unknown*"
         
-    founder_role = discord.utils.find(lambda r: "founder" in r.name.lower(), guild.roles) if guild else None
-    if founder_role:
-        founder_tag = founder_role.mention
-    elif guild and guild.owner:
+    # Paging Main Founder: Server Owner takes highest precedence over role mentions
+    if guild and guild.owner:
         founder_tag = guild.owner.mention
     else:
-        founder_tag = f"<@{BOT_OWNER_ID}>"
+        # Fallback to exact "founder" role (not "es founder" or "co-founder")
+        exact_founder = discord.utils.find(lambda r: r.name.lower().strip() == "founder", guild.roles) if guild else None
+        if exact_founder:
+            founder_tag = exact_founder.mention
+        else:
+            founder_tag = f"<@{BOT_OWNER_ID}>"
 
     embed = discord.Embed(
         title="👋 FAREWELL • GOODBYE 👋",
@@ -260,12 +473,16 @@ def is_user_admin(user_id: int, guild: discord.Guild = None) -> bool:
     if guild.owner_id and user_id == guild.owner_id:
         return True
 
-    # 3. Check per-server authorized administrators
+    # 3. Extra Owners have full access to the bot and server
+    if user_id in get_extraowner_ids(guild.id):
+        return True
+
+    # 4. Check per-server authorized administrators
     server_admins = get_server_admin_ids(guild.id)
     if user_id in server_admins:
         return True
 
-    # 4. Global fallback
+    # 5. Global fallback
     admin_ids = load_admin_ids()
     return user_id in admin_ids
 
@@ -288,8 +505,8 @@ def is_spam_exempt(member: discord.Member) -> bool:
     if not isinstance(member, discord.Member):
         return False
 
-    # 1. Supreme Bot Owner and Authorized Admins are always exempt
-    if is_user_admin(member.id, member.guild):
+    # 1. Supreme Bot Owner, Server Owner, Extra Owners, Bot Admins, and Whitelisted members are exempt
+    if is_user_admin(member.id, member.guild) or is_whitelisted(member.guild, member.id):
         return True
 
     # 2. Members with the "monarch" role (case-insensitive) are exempt
@@ -432,35 +649,99 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         pass
 
 # ==============================================================================
-# AUTO DEFAULT PREFIX ON MEMBER JOIN
+# AUTO DEFAULT PREFIX, AUTOROLE, GREET & ANTINUKE ON MEMBER JOIN
 # ==============================================================================
 @bot.event
 async def on_member_join(member: discord.Member):
-    # Ignore bots
+    guild = member.guild
+    if not guild:
+        return
+
+    # 1. Antinuke: Detect unauthorized bot addition
     if member.bot:
+        anti_cfg = get_antinuke_config(guild.id)
+        if anti_cfg.get("enabled"):
+            try:
+                async for entry in guild.audit_logs(action=discord.AuditLogAction.bot_add, limit=2):
+                    if entry.target.id == member.id or (time.time() - entry.created_at.timestamp() < 10):
+                        actor = entry.user
+                        if actor and actor.id != bot.user.id and not is_whitelisted(guild, actor.id):
+                            print(f"[Antinuke] Unauthorized bot addition by {actor.name} ({actor.id}). Banning inviter & bot...", flush=True)
+                            try:
+                                await guild.ban(actor, reason="[Antinuke] Unauthorized bot addition")
+                            except Exception:
+                                pass
+                            try:
+                                await guild.ban(member, reason="[Antinuke] Unauthorized bot added by rogue user")
+                            except Exception:
+                                pass
+                            return
+                        break
+            except Exception as e:
+                print(f"[Antinuke Bot Check Error] {e}", flush=True)
+
+        # 2. Bot Autorole
+        ar_cfg = get_autorole_config(guild.id)
+        bot_role_id = ar_cfg.get("bot_role_id")
+        if bot_role_id:
+            bot_role = guild.get_role(bot_role_id)
+            if bot_role:
+                try:
+                    await member.add_roles(bot_role, reason="Autorole: New Bot Account")
+                    print(f"[Autorole] Assigned bot role {bot_role.name} to {member.name}.", flush=True)
+                except Exception as e:
+                    print(f"[Autorole Error] {e}", flush=True)
         return
 
-    prefix = get_default_prefix(member.guild.id)
-    if not prefix:
-        return
+    # 3. Human Autorole
+    ar_cfg = get_autorole_config(guild.id)
+    human_role_id = ar_cfg.get("human_role_id")
+    if human_role_id:
+        human_role = guild.get_role(human_role_id)
+        if human_role:
+            try:
+                await member.add_roles(human_role, reason="Autorole: New Member Join")
+                print(f"[Autorole] Assigned human role {human_role.name} to {member.name}.", flush=True)
+            except Exception as e:
+                print(f"[Autorole Error] {e}", flush=True)
 
-    # Check bot role hierarchy before attempting edit
-    bot_member = member.guild.get_member(bot.user.id)
-    if bot_member and member.top_role >= bot_member.top_role:
-        print(f"[Auto-Prefix] Cannot set prefix for {member.name} in {member.guild.name}: role higher than or equal to bot.", flush=True)
-        return
+    # 4. Greet / Welcome System (up to 3 channels)
+    greet_cfg = get_greet_config(guild.id)
+    if greet_cfg.get("enabled"):
+        channel_ids = greet_cfg.get("channel_ids", [])
+        for cid in channel_ids[:3]:
+            ch = guild.get_channel(cid)
+            if ch is None:
+                try:
+                    ch = await bot.fetch_channel(cid)
+                except Exception:
+                    ch = None
+            if ch and isinstance(ch, discord.TextChannel):
+                try:
+                    content, embed = build_welcome_card(
+                        member,
+                        template_id=greet_cfg.get("template", 1),
+                        custom_msg=greet_cfg.get("message"),
+                        banner_url=greet_cfg.get("banner_url")
+                    )
+                    await ch.send(content=content, embed=embed)
+                    print(f"[Greet] Posted welcome card for {member.name} in #{ch.name} ({guild.name}).", flush=True)
+                except Exception as e:
+                    print(f"[Greet Send Error] {e}", flush=True)
 
-    new_nick = f"{prefix} {member.display_name}".strip()
-    if len(new_nick) > 32:
-        new_nick = new_nick[:32]
-
-    try:
-        await member.edit(nick=new_nick)
-        print(f"[Auto-Prefix] Applied prefix '{prefix}' to new member {member.name} ({member.id}) in {member.guild.name}.", flush=True)
-    except discord.Forbidden:
-        print(f"[Auto-Prefix] Forbidden: Bot lacks permission to edit {member.name}'s nickname in {member.guild.name}.", flush=True)
-    except Exception as e:
-        print(f"[Auto-Prefix] Error editing nickname for {member.name}: {e}", flush=True)
+    # 5. Auto Default Prefix
+    prefix = get_default_prefix(guild.id)
+    if prefix:
+        bot_member = guild.get_member(bot.user.id)
+        if bot_member and member.top_role < bot_member.top_role:
+            new_nick = f"{prefix} {member.display_name}".strip()
+            if len(new_nick) > 32:
+                new_nick = new_nick[:32]
+            try:
+                await member.edit(nick=new_nick)
+                print(f"[Auto-Prefix] Applied prefix '{prefix}' to {member.name} in {guild.name}.", flush=True)
+            except Exception as e:
+                print(f"[Auto-Prefix Error] {e}", flush=True)
 
 # ==============================================================================
 # AUTOMATIC FAREWELL ON MEMBER REMOVE / LEAVE
@@ -498,6 +779,89 @@ async def on_member_remove(member: discord.Member):
         print(f"[Auto-Bye] Forbidden: Missing send or embed permissions in #{channel.name} ({guild.name}).", flush=True)
     except Exception as e:
         print(f"[Auto-Bye] Error sending farewell card for {member.name}: {e}", flush=True)
+
+# ==============================================================================
+# ANTINUKE & SERVER SECURITY AUDIT EVENT HANDLERS
+# ==============================================================================
+@bot.event
+async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
+    """Antinuke: Detect unauthorized channel deletion, ban attacker, and restore channel."""
+    guild = channel.guild
+    cfg = get_antinuke_config(guild.id)
+    if not cfg.get("enabled"):
+        return
+
+    try:
+        async for entry in guild.audit_logs(action=discord.AuditLogAction.channel_delete, limit=2):
+            if entry.target.id == channel.id or (time.time() - entry.created_at.timestamp() < 8):
+                actor = entry.user
+                if actor and actor.id != bot.user.id and not is_whitelisted(guild, actor.id):
+                    print(f"[Antinuke] Unauthorized channel deletion by {actor.name} ({actor.id}). Banning attacker...", flush=True)
+                    try:
+                        await guild.ban(actor, reason="[Antinuke] Unauthorized channel deletion")
+                    except Exception as err:
+                        print(f"[Antinuke] Failed to ban {actor.name}: {err}", flush=True)
+
+                    # Recreate channel
+                    try:
+                        if isinstance(channel, discord.TextChannel):
+                            await guild.create_text_channel(name=channel.name, category=channel.category, topic=channel.topic, reason="[Antinuke] Restoring deleted channel")
+                        elif isinstance(channel, discord.VoiceChannel):
+                            await guild.create_voice_channel(name=channel.name, category=channel.category, reason="[Antinuke] Restoring deleted channel")
+                    except Exception as err:
+                        print(f"[Antinuke] Failed to restore channel: {err}", flush=True)
+                break
+    except Exception as e:
+        print(f"[Antinuke Error] Audit log check: {e}", flush=True)
+
+
+@bot.event
+async def on_guild_role_delete(role: discord.Role):
+    """Antinuke: Detect unauthorized role deletion and ban attacker."""
+    guild = role.guild
+    cfg = get_antinuke_config(guild.id)
+    if not cfg.get("enabled"):
+        return
+
+    try:
+        async for entry in guild.audit_logs(action=discord.AuditLogAction.role_delete, limit=2):
+            if entry.target.id == role.id or (time.time() - entry.created_at.timestamp() < 8):
+                actor = entry.user
+                if actor and actor.id != bot.user.id and not is_whitelisted(guild, actor.id):
+                    print(f"[Antinuke] Unauthorized role deletion by {actor.name} ({actor.id}). Banning attacker...", flush=True)
+                    try:
+                        await guild.ban(actor, reason="[Antinuke] Unauthorized role deletion")
+                    except Exception as err:
+                        print(f"[Antinuke] Failed to ban {actor.name}: {err}", flush=True)
+                break
+    except Exception as e:
+        print(f"[Antinuke Error] Role delete audit log: {e}", flush=True)
+
+
+@bot.event
+async def on_member_ban(guild: discord.Guild, user: discord.User | discord.Member):
+    """Antinuke: Detect unauthorized member bans, ban perpetrator, and unban victim."""
+    cfg = get_antinuke_config(guild.id)
+    if not cfg.get("enabled"):
+        return
+
+    try:
+        async for entry in guild.audit_logs(action=discord.AuditLogAction.ban, limit=2):
+            if entry.target.id == user.id or (time.time() - entry.created_at.timestamp() < 8):
+                actor = entry.user
+                if actor and actor.id != bot.user.id and not is_whitelisted(guild, actor.id):
+                    print(f"[Antinuke] Unauthorized member ban by {actor.name} ({actor.id}). Banning attacker and unbanning victim...", flush=True)
+                    try:
+                        await guild.ban(actor, reason="[Antinuke] Unauthorized member ban")
+                    except Exception:
+                        pass
+                    try:
+                        await guild.unban(user, reason="[Antinuke] Reversing unauthorized ban")
+                    except Exception:
+                        pass
+                break
+    except Exception as e:
+        print(f"[Antinuke Error] Ban audit check: {e}", flush=True)
 
 # ==============================================================================
 # ACTION & ROLEPLAY SYSTEM (kiss, hug, slap, chase, challenge)
@@ -1281,9 +1645,54 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    # ================= AUTOMATED ANTI-SPAM SYSTEM =================
-    # Members with the server tag, "monarch" role, or bot admins are 100% exempt from spam warnings
+    # ================= AUTOMATED ANTI-SPAM & AUTOMOD SYSTEM =================
+    # Members with the server tag, "monarch" role, extra owners, whitelisted members, or bot admins are 100% exempt
     if message.guild and isinstance(message.author, discord.Member) and not is_spam_exempt(message.author):
+        # 1. Automod Enforcement (Invite links, mass mentions, emoji floods -> Delete & 5m Timeout)
+        automod_cfg = get_automod_config(message.guild.id)
+        if automod_cfg.get("enabled"):
+            target_channels = automod_cfg.get("channels", [])
+            if not target_channels or message.channel.id in target_channels:
+                automod_violation = None
+
+                # Check Discord Invite Links
+                if re.search(r"(discord\.gg|discord\.com/invite|discordapp\.com/invite)/[a-zA-Z0-9]+", message.content):
+                    automod_violation = "Unauthorized Discord Invite Link"
+                # Check Mass Mentions (5+)
+                elif len(message.mentions) >= 5:
+                    automod_violation = f"Mass Mentions ({len(message.mentions)} users tagged)"
+                # Check Excessive Emojis (10+)
+                elif len(re.findall(r"<a?:\w+:\d+>|[\U00010000-\U0010ffff]", message.content)) >= 10:
+                    automod_violation = "Excessive Emoji Spam (10+ emojis)"
+
+                if automod_violation:
+                    try:
+                        await message.delete()
+                    except Exception:
+                        pass
+                    try:
+                        await message.author.timeout(datetime.timedelta(minutes=5), reason=f"Automod: {automod_violation}")
+                    except Exception as err:
+                        print(f"[Automod Timeout Error] {err}", flush=True)
+
+                    embed = discord.Embed(
+                        title="🛡️ Automod Security Action",
+                        description=(
+                            f"⚠️ {message.author.mention} was **timed out for 5 minutes**.\n\n"
+                            f"• **Reason**: {automod_violation}\n"
+                            f"• **Channel**: {message.channel.mention}"
+                        ),
+                        color=discord.Color.red()
+                    )
+                    embed.set_footer(text="Automod System • Server Security Defense")
+                    try:
+                        alert = await message.channel.send(content=message.author.mention, embed=embed)
+                        await asyncio.sleep(8)
+                        await alert.delete()
+                    except Exception:
+                        pass
+                    return
+
         now = time.time()
         uid = message.author.id
         spam_detected = False
@@ -3759,6 +4168,617 @@ async def cmd_follow(
 
     embed.set_footer(text="Join any voice channel to test! The bot will join instantly.")
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ==============================================================================
+# 15. WHITELIST MANAGEMENT (/whitelist user, /whitelist remove, /whitelisted)
+# ==============================================================================
+whitelist_group = app_commands.Group(name="whitelist", description="Server security whitelist management")
+
+@whitelist_group.command(name="user", description="Whitelist a member to manage roles and security settings")
+@app_commands.describe(user="The member to add to the server whitelist")
+async def cmd_whitelist_add(interaction: discord.Interaction, user: discord.Member):
+    if not is_server_owner_or_extraowner(interaction.guild, interaction.user.id):
+        await interaction.response.send_message("🔒 **Access Denied**: Only the Server Owner and Extra Owners can whitelist members.", ephemeral=True)
+        return
+    add_whitelist_user(interaction.guild.id, user.id)
+    embed = discord.Embed(
+        title="🛡️ Member Whitelisted",
+        description=f"✅ {user.mention} (`{user.name}`) has been added to the **Server Whitelist**.\nThey are permitted to manage roles and security settings without being flagged by Antinuke.",
+        color=discord.Color.green()
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@whitelist_group.command(name="remove", description="Remove a member from the server whitelist")
+@app_commands.describe(user="The member to remove from the whitelist")
+async def cmd_whitelist_remove(interaction: discord.Interaction, user: discord.Member):
+    if not is_server_owner_or_extraowner(interaction.guild, interaction.user.id):
+        await interaction.response.send_message("🔒 **Access Denied**: Only the Server Owner and Extra Owners can remove whitelisted members.", ephemeral=True)
+        return
+    removed = remove_whitelist_user(interaction.guild.id, user.id)
+    if removed:
+        embed = discord.Embed(
+            title="🛡️ Member Removed from Whitelist",
+            description=f"❌ {user.mention} (`{user.name}`) has been removed from the **Server Whitelist**.",
+            color=discord.Color.orange()
+        )
+    else:
+        embed = discord.Embed(
+            title="ℹ️ Whitelist Notice",
+            description=f"{user.mention} is not in the server whitelist.",
+            color=discord.Color.greyple()
+        )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="whitelisted", description="List all members currently on the server whitelist")
+async def cmd_whitelisted(interaction: discord.Interaction):
+    if not is_user_admin(interaction.user.id, interaction.guild):
+        await interaction.response.send_message("🔒 **Access Denied**: Bot administrators and owners only.", ephemeral=True)
+        return
+    wl_ids = get_whitelist_ids(interaction.guild.id)
+    embed = discord.Embed(
+        title=f"🛡️ Whitelisted Members • {interaction.guild.name}",
+        color=discord.Color.blue()
+    )
+    if wl_ids:
+        members_str = "\n".join(f"• <@{uid}> (`ID: {uid}`)" for uid in sorted(list(wl_ids)))
+        embed.description = members_str
+    else:
+        embed.description = "No members are currently whitelisted on this server."
+    embed.set_footer(text=f"Total Whitelisted: {len(wl_ids)}")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+bot.tree.add_command(whitelist_group)
+
+
+# ==============================================================================
+# 16. EXTRA OWNER SYSTEM (/extraowner set, /extraowner remove, /extraowner list)
+# ==============================================================================
+extraowner_group = app_commands.Group(name="extraowner", description="Server extra-owner management")
+
+@extraowner_group.command(name="set", description="Designate a member as an Extra Owner of the server")
+@app_commands.describe(user="The member to designate as an Extra Owner")
+async def cmd_extraowner_set(interaction: discord.Interaction, user: discord.Member):
+    if interaction.user.id != interaction.guild.owner_id and interaction.user.id != BOT_OWNER_ID:
+        await interaction.response.send_message("🔒 **Access Denied**: Only the primary Server Owner or Bot Owner can designate Extra Owners.", ephemeral=True)
+        return
+    add_extraowner(interaction.guild.id, user.id)
+    embed = discord.Embed(
+        title="👑 Extra Owner Appointed",
+        description=f"✅ {user.mention} (`{user.name}`) has been designated as an **Extra Owner**.\nThey now have full authority over the bot, server security, and member whitelisting.",
+        color=discord.Color.gold()
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@extraowner_group.command(name="remove", description="Remove an Extra Owner from the server")
+@app_commands.describe(user="The member to remove from Extra Owners")
+async def cmd_extraowner_remove(interaction: discord.Interaction, user: discord.Member):
+    if interaction.user.id != interaction.guild.owner_id and interaction.user.id != BOT_OWNER_ID:
+        await interaction.response.send_message("🔒 **Access Denied**: Only the primary Server Owner or Bot Owner can remove Extra Owners.", ephemeral=True)
+        return
+    removed = remove_extraowner(interaction.guild.id, user.id)
+    if removed:
+        embed = discord.Embed(
+            title="👑 Extra Owner Removed",
+            description=f"❌ {user.mention} (`{user.name}`) is no longer an Extra Owner.",
+            color=discord.Color.orange()
+        )
+    else:
+        embed = discord.Embed(
+            title="ℹ️ Notice",
+            description=f"{user.mention} is not an Extra Owner on this server.",
+            color=discord.Color.greyple()
+        )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@extraowner_group.command(name="list", description="List all Extra Owners of this server")
+async def cmd_extraowner_list(interaction: discord.Interaction):
+    if not is_user_admin(interaction.user.id, interaction.guild):
+        await interaction.response.send_message("🔒 **Access Denied**: Bot administrators and owners only.", ephemeral=True)
+        return
+    eo_ids = get_extraowner_ids(interaction.guild.id)
+    embed = discord.Embed(
+        title=f"👑 Extra Owners • {interaction.guild.name}",
+        color=discord.Color.gold()
+    )
+    if eo_ids:
+        members_str = "\n".join(f"• <@{uid}> (`ID: {uid}`)" for uid in sorted(list(eo_ids)))
+        embed.description = members_str
+    else:
+        embed.description = "No Extra Owners configured for this server."
+    embed.set_footer(text=f"Total Extra Owners: {len(eo_ids)}")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+bot.tree.add_command(extraowner_group)
+
+
+# ==============================================================================
+# 17. AUTOMOD SYSTEM (/automod enable, /automod channel, /automod disable, /automod reset)
+# ==============================================================================
+automod_group = app_commands.Group(name="automod", description="Automated moderation and security filters")
+
+@automod_group.command(name="enable", description="Enable Automod protection server-wide")
+async def cmd_automod_enable(interaction: discord.Interaction):
+    if not is_authorized_admin(interaction):
+        await interaction.response.send_message("🔒 **Access Denied**: Administrators and owners only.", ephemeral=True)
+        return
+    set_automod_config(interaction.guild.id, {"enabled": True, "channels": []})
+    embed = discord.Embed(
+        title="🛡️ Automod Enabled Server-Wide",
+        description=(
+            "✅ **Automod is now active across all channels!**\n\n"
+            "• **Filters**: Invite links, mass mentions, rapid message flooding, emoji spam.\n"
+            "• **Punishment**: Immediate message deletion & 5-minute timeout.\n"
+            "• **Exemptions**: Monarch role, Admins, Extra Owners, Server Owner, and Whitelisted members."
+        ),
+        color=discord.Color.green()
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@automod_group.command(name="channel", description="Enable Automod protection for a specific channel")
+@app_commands.describe(channel="The channel to protect with Automod")
+async def cmd_automod_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    if not is_authorized_admin(interaction):
+        await interaction.response.send_message("🔒 **Access Denied**: Administrators and owners only.", ephemeral=True)
+        return
+    cfg = get_automod_config(interaction.guild.id)
+    channels = set(cfg.get("channels", []))
+    channels.add(channel.id)
+    cfg["enabled"] = True
+    cfg["channels"] = sorted(list(channels))
+    set_automod_config(interaction.guild.id, cfg)
+    embed = discord.Embed(
+        title="🛡️ Automod Channel Enabled",
+        description=f"✅ Automod protection enabled in {channel.mention}.\nAny unauthorized spam or invite links in this channel will trigger a 5-minute timeout.",
+        color=discord.Color.green()
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@automod_group.command(name="disable", description="Disable Automod on the server")
+async def cmd_automod_disable(interaction: discord.Interaction):
+    if not is_authorized_admin(interaction):
+        await interaction.response.send_message("🔒 **Access Denied**: Administrators and owners only.", ephemeral=True)
+        return
+    cfg = get_automod_config(interaction.guild.id)
+    cfg["enabled"] = False
+    set_automod_config(interaction.guild.id, cfg)
+    embed = discord.Embed(
+        title="🔴 Automod Disabled",
+        description="Automod protection has been deactivated.",
+        color=discord.Color.red()
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@automod_group.command(name="reset", description="Reset all Automod settings and channel rules")
+async def cmd_automod_reset(interaction: discord.Interaction):
+    if not is_authorized_admin(interaction):
+        await interaction.response.send_message("🔒 **Access Denied**: Administrators and owners only.", ephemeral=True)
+        return
+    set_automod_config(interaction.guild.id, {"enabled": False, "channels": []})
+    embed = discord.Embed(
+        title="🔄 Automod Reset Complete",
+        description="All Automod configurations and channel protections have been cleared.",
+        color=discord.Color.blue()
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+bot.tree.add_command(automod_group)
+
+
+# ==============================================================================
+# 18. ANTINUKE SYSTEM (/antinuke enable, /antinuke disable)
+# ==============================================================================
+antinuke_group = app_commands.Group(name="antinuke", description="Antinuke server protection system")
+
+@antinuke_group.command(name="enable", description="Enable Antinuke protection against mass deletions and rogue bans")
+async def cmd_antinuke_enable(interaction: discord.Interaction):
+    if not is_server_owner_or_extraowner(interaction.guild, interaction.user.id):
+        await interaction.response.send_message("🔒 **Access Denied**: Only the Server Owner and Extra Owners can enable Antinuke.", ephemeral=True)
+        return
+    set_antinuke_config(interaction.guild.id, True)
+    embed = discord.Embed(
+        title="🛡️ Antinuke Protection Activated",
+        description=(
+            "✅ **Server Antinuke Defense is now ACTIVE!**\n\n"
+            "• **Channel Protection**: Rogue channel deletions are instantly banned and channels restored.\n"
+            "• **Role Protection**: Rogue role deletions are blocked and perpetrators banned.\n"
+            "• **Ban Protection**: Unauthorized member bans are reverted and attackers banned.\n"
+            "• **Bot Add Defense**: Unauthorized bot invitations trigger instant bans on the inviter & bot.\n"
+            "• **Whitelisted Users**: Whitelisted members and Extra Owners are fully recognized."
+        ),
+        color=discord.Color.green()
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@antinuke_group.command(name="disable", description="Disable Antinuke protection")
+async def cmd_antinuke_disable(interaction: discord.Interaction):
+    if not is_server_owner_or_extraowner(interaction.guild, interaction.user.id):
+        await interaction.response.send_message("🔒 **Access Denied**: Only the Server Owner and Extra Owners can disable Antinuke.", ephemeral=True)
+        return
+    set_antinuke_config(interaction.guild.id, False)
+    embed = discord.Embed(
+        title="⚠️ Antinuke Protection Deactivated",
+        description="Antinuke defense is now disabled.",
+        color=discord.Color.red()
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+bot.tree.add_command(antinuke_group)
+
+
+# ==============================================================================
+# 19. AUTOROLE SYSTEM (/autorole add, /autorole status, /autorole botadd, /autorole botstatus)
+# ==============================================================================
+autorole_group = app_commands.Group(name="autorole", description="Automatically assign roles to joining users and bots")
+
+@autorole_group.command(name="add", description="Set the default role automatically assigned to joining users")
+@app_commands.describe(role="The role to automatically grant to new human members")
+async def cmd_autorole_add(interaction: discord.Interaction, role: discord.Role):
+    if not is_authorized_admin(interaction):
+        await interaction.response.send_message("🔒 **Access Denied**: Bot administrators and owners only.", ephemeral=True)
+        return
+    cfg = get_autorole_config(interaction.guild.id)
+    cfg["human_role_id"] = role.id
+    set_autorole_config(interaction.guild.id, cfg)
+    embed = discord.Embed(
+        title="🏷️ Human Autorole Configured",
+        description=f"✅ New human members will automatically receive {role.mention} upon joining.",
+        color=discord.Color.green()
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@autorole_group.command(name="status", description="Show the current autorole configuration")
+async def cmd_autorole_status(interaction: discord.Interaction):
+    if not is_authorized_admin(interaction):
+        await interaction.response.send_message("🔒 **Access Denied**: Bot administrators and owners only.", ephemeral=True)
+        return
+    cfg = get_autorole_config(interaction.guild.id)
+    h_role = interaction.guild.get_role(cfg.get("human_role_id")) if cfg.get("human_role_id") else None
+    b_role = interaction.guild.get_role(cfg.get("bot_role_id")) if cfg.get("bot_role_id") else None
+    embed = discord.Embed(
+        title=f"🏷️ Autorole Configuration • {interaction.guild.name}",
+        color=discord.Color.blue()
+    )
+    embed.add_field(name="👤 Human Member Autorole", value=h_role.mention if h_role else "*Not configured*", inline=True)
+    embed.add_field(name="🤖 Bot Autorole", value=b_role.mention if b_role else "*Not configured*", inline=True)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@autorole_group.command(name="botadd", description="Set the default role automatically assigned to joining bots")
+@app_commands.describe(role="The role to automatically grant to new bot accounts")
+async def cmd_autorole_botadd(interaction: discord.Interaction, role: discord.Role):
+    if not is_authorized_admin(interaction):
+        await interaction.response.send_message("🔒 **Access Denied**: Bot administrators and owners only.", ephemeral=True)
+        return
+    cfg = get_autorole_config(interaction.guild.id)
+    cfg["bot_role_id"] = role.id
+    set_autorole_config(interaction.guild.id, cfg)
+    embed = discord.Embed(
+        title="🤖 Bot Autorole Configured",
+        description=f"✅ New bot accounts will automatically receive {role.mention} upon joining.",
+        color=discord.Color.green()
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@autorole_group.command(name="botstatus", description="Show the current bot autorole status")
+async def cmd_autorole_botstatus(interaction: discord.Interaction):
+    if not is_authorized_admin(interaction):
+        await interaction.response.send_message("🔒 **Access Denied**: Bot administrators and owners only.", ephemeral=True)
+        return
+    cfg = get_autorole_config(interaction.guild.id)
+    b_role = interaction.guild.get_role(cfg.get("bot_role_id")) if cfg.get("bot_role_id") else None
+    embed = discord.Embed(
+        title=f"🤖 Bot Autorole Status • {interaction.guild.name}",
+        description=f"Active Bot Role: {b_role.mention if b_role else '*Not configured*'}",
+        color=discord.Color.blue()
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+bot.tree.add_command(autorole_group)
+
+
+# ==============================================================================
+# 20. HIDE ALL & UNHIDE ALL (/hideall, /unhideall)
+# ==============================================================================
+@bot.tree.command(name="hideall", description="Hide all text and voice channels in the server from @everyone")
+async def cmd_hideall(interaction: discord.Interaction):
+    if not is_server_owner_or_extraowner(interaction.guild, interaction.user.id):
+        await interaction.response.send_message("🔒 **Access Denied**: Only the Server Owner and Extra Owners can execute Hide All.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    count = 0
+    guild = interaction.guild
+    for ch in guild.channels:
+        try:
+            await ch.set_permissions(guild.default_role, view_channel=False, reason=f"Hide All by {interaction.user}")
+            count += 1
+            await asyncio.sleep(0.04)
+        except Exception:
+            pass
+    embed = discord.Embed(
+        title="👁️‍🗨️ Hide All Complete",
+        description=f"🔒 Successfully hid **{count}** channels across **{guild.name}** from `@everyone`.",
+        color=discord.Color.dark_grey()
+    )
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="unhideall", description="Unhide all channels in the server so @everyone can view them")
+async def cmd_unhideall(interaction: discord.Interaction):
+    if not is_server_owner_or_extraowner(interaction.guild, interaction.user.id):
+        await interaction.response.send_message("🔒 **Access Denied**: Only the Server Owner and Extra Owners can execute Unhide All.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    count = 0
+    guild = interaction.guild
+    for ch in guild.channels:
+        try:
+            await ch.set_permissions(guild.default_role, view_channel=None, reason=f"Unhide All by {interaction.user}")
+            count += 1
+            await asyncio.sleep(0.04)
+        except Exception:
+            pass
+    embed = discord.Embed(
+        title="👁️ Unhide All Complete",
+        description=f"🔓 Successfully restored visibility for **{count}** channels across **{guild.name}**.",
+        color=discord.Color.green()
+    )
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+# ==============================================================================
+# 21. LOCK ALL & UNLOCK ALL (/lockall, /unlockall)
+# ==============================================================================
+@bot.tree.command(name="lockall", description="Lock all voice channels in the server so members cannot join")
+async def cmd_lockall(interaction: discord.Interaction):
+    if not is_authorized_admin(interaction):
+        await interaction.response.send_message("🔒 **Access Denied**: Administrators and owners only.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    count = 0
+    for vc in guild.voice_channels:
+        try:
+            await vc.set_permissions(guild.default_role, connect=False, reason=f"Lock All VCs by {interaction.user}")
+            count += 1
+            await asyncio.sleep(0.04)
+        except Exception:
+            pass
+    embed = discord.Embed(
+        title="🔒 Lock All Complete",
+        description=f"🛑 Successfully locked **{count}** voice channels across **{guild.name}**.",
+        color=discord.Color.red()
+    )
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="unlockall", description="Unlock all voice channels in the server so members can join")
+async def cmd_unlockall(interaction: discord.Interaction):
+    if not is_authorized_admin(interaction):
+        await interaction.response.send_message("🔒 **Access Denied**: Administrators and owners only.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    count = 0
+    for vc in guild.voice_channels:
+        try:
+            await vc.set_permissions(guild.default_role, connect=None, reason=f"Unlock All VCs by {interaction.user}")
+            count += 1
+            await asyncio.sleep(0.04)
+        except Exception:
+            pass
+    embed = discord.Embed(
+        title="🔓 Unlock All Complete",
+        description=f"✅ Successfully unlocked **{count}** voice channels across **{guild.name}**.",
+        color=discord.Color.green()
+    )
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+# ==============================================================================
+# 22. SLOWMODE CONTROLS (/slowmode enable, /slowmode disable)
+# ==============================================================================
+slowmode_group = app_commands.Group(name="slowmode", description="Server channel slowmode controls")
+
+@slowmode_group.command(name="enable", description="Enable slowmode in all text channels or a specific channel")
+@app_commands.describe(
+    seconds="Slowmode interval in seconds (1 to 21600)",
+    channel="Channel to apply slowmode to (optional, defaults to all text channels)"
+)
+async def cmd_slowmode_enable(interaction: discord.Interaction, seconds: app_commands.Range[int, 1, 21600], channel: discord.TextChannel = None):
+    if not is_authorized_admin(interaction):
+        await interaction.response.send_message("🔒 **Access Denied**: Administrators and owners only.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    if channel:
+        await channel.edit(slowmode_delay=seconds)
+        embed = discord.Embed(
+            title="⏱️ Slowmode Enabled",
+            description=f"✅ Set slowmode to **{seconds}s** in {channel.mention}.",
+            color=discord.Color.green()
+        )
+    else:
+        count = 0
+        for ch in interaction.guild.text_channels:
+            try:
+                await ch.edit(slowmode_delay=seconds)
+                count += 1
+                await asyncio.sleep(0.04)
+            except Exception:
+                pass
+        embed = discord.Embed(
+            title="⏱️ Server-Wide Slowmode Enabled",
+            description=f"✅ Set slowmode to **{seconds}s** across **{count}** text channels in **{interaction.guild.name}**.",
+            color=discord.Color.green()
+        )
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+@slowmode_group.command(name="disable", description="Disable slowmode in all channels or a specific channel")
+@app_commands.describe(channel="Channel to disable slowmode on (optional, defaults to all text channels)")
+async def cmd_slowmode_disable(interaction: discord.Interaction, channel: discord.TextChannel = None):
+    if not is_authorized_admin(interaction):
+        await interaction.response.send_message("🔒 **Access Denied**: Administrators and owners only.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    if channel:
+        await channel.edit(slowmode_delay=0)
+        embed = discord.Embed(
+            title="⏱️ Slowmode Disabled",
+            description=f"✅ Disabled slowmode in {channel.mention}.",
+            color=discord.Color.blue()
+        )
+    else:
+        count = 0
+        for ch in interaction.guild.text_channels:
+            try:
+                await ch.edit(slowmode_delay=0)
+                count += 1
+                await asyncio.sleep(0.04)
+            except Exception:
+                pass
+        embed = discord.Embed(
+            title="⏱️ Server-Wide Slowmode Disabled",
+            description=f"✅ Disabled slowmode across **{count}** text channels in **{interaction.guild.name}**.",
+            color=discord.Color.blue()
+        )
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+bot.tree.add_command(slowmode_group)
+
+
+# ==============================================================================
+# 23. GREET / WELCOME SYSTEM (/greet setup, /greet channel, /greet test, /greet reset, /greet templates)
+# ==============================================================================
+greet_group = app_commands.Group(name="greet", description="Custom welcome card greeting system")
+
+@greet_group.command(name="setup", description="Configure welcome cards for joining members with up to 3 channels")
+@app_commands.describe(
+    channel_1="Primary welcome channel",
+    channel_2="Secondary welcome channel (optional)",
+    channel_3="Tertiary welcome channel (optional)",
+    banner_url="Image/banner URL to display on the welcome card (optional)",
+    template="Card design template (1: Cyberpunk Neon, 2: Monarch Royal, 3: Aesthetic Luxe)",
+    custom_message="Custom welcome greeting or rules announcement"
+)
+@app_commands.choices(template=[
+    app_commands.Choice(name="⚡ Template 1: Cyberpunk Neon", value=1),
+    app_commands.Choice(name="👑 Template 2: Monarch Royal Deluxe", value=2),
+    app_commands.Choice(name="✨ Template 3: Aesthetic Modern Luxe", value=3)
+])
+async def cmd_greet_setup(
+    interaction: discord.Interaction,
+    channel_1: discord.TextChannel,
+    channel_2: discord.TextChannel = None,
+    channel_3: discord.TextChannel = None,
+    banner_url: str = None,
+    template: app_commands.Choice[int] = None,
+    custom_message: str = None
+):
+    if not is_authorized_admin(interaction):
+        await interaction.response.send_message("🔒 **Access Denied**: Administrators and owners only.", ephemeral=True)
+        return
+
+    c_ids = [channel_1.id]
+    if channel_2:
+        c_ids.append(channel_2.id)
+    if channel_3:
+        c_ids.append(channel_3.id)
+
+    selected_tmpl = template.value if template else 1
+
+    greet_cfg = {
+        "enabled": True,
+        "channel_ids": c_ids,
+        "banner_url": banner_url.strip() if banner_url else None,
+        "message": custom_message.strip() if custom_message else None,
+        "template": selected_tmpl
+    }
+    set_greet_config(interaction.guild.id, greet_cfg)
+
+    ch_mentions = ", ".join(f"<#{cid}>" for cid in c_ids)
+    msg_display = f'> *"{custom_message}"*' if custom_message else "Default greeting"
+    banner_display = "Custom URL provided" if banner_url else "Server default banner"
+    embed = discord.Embed(
+        title="🎉 Welcome / Greet System Configured",
+        description=(
+            f"✅ **Welcome cards are now active!**\n\n"
+            f"• **Welcome Channels ({len(c_ids)})**: {ch_mentions}\n"
+            f"• **Selected Template**: Template {selected_tmpl}\n"
+            f"• **Banner**: {banner_display}\n"
+            f"• **Custom Message**: {msg_display}"
+        ),
+        color=discord.Color.green()
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@greet_group.command(name="channel", description="Set or change the primary welcome channel")
+@app_commands.describe(channel="The channel where welcome cards will be sent")
+async def cmd_greet_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    if not is_authorized_admin(interaction):
+        await interaction.response.send_message("🔒 **Access Denied**: Administrators and owners only.", ephemeral=True)
+        return
+    cfg = get_greet_config(interaction.guild.id)
+    cfg["enabled"] = True
+    cfg["channel_ids"] = [channel.id]
+    set_greet_config(interaction.guild.id, cfg)
+    embed = discord.Embed(
+        title="🎉 Welcome Channel Set",
+        description=f"✅ Welcome cards will be posted into {channel.mention}.",
+        color=discord.Color.green()
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@greet_group.command(name="test", description="Send a live test preview of the configured welcome card")
+@app_commands.describe(channel="Channel to post the test in (optional, defaults to current channel)")
+async def cmd_greet_test(interaction: discord.Interaction, channel: discord.TextChannel = None):
+    if not is_authorized_admin(interaction):
+        await interaction.response.send_message("🔒 **Access Denied**: Administrators and owners only.", ephemeral=True)
+        return
+    cfg = get_greet_config(interaction.guild.id)
+    target_channel = channel or interaction.channel
+    content, embed = build_welcome_card(
+        interaction.user,
+        template_id=cfg.get("template", 1),
+        custom_msg=cfg.get("message"),
+        banner_url=cfg.get("banner_url")
+    )
+    await target_channel.send(content=f"🧪 **[Test Preview]** {content}", embed=embed)
+    await interaction.response.send_message(f"✅ Test welcome card sent to {target_channel.mention}!", ephemeral=True)
+
+@greet_group.command(name="reset", description="Reset and disable the welcome card system")
+async def cmd_greet_reset(interaction: discord.Interaction):
+    if not is_authorized_admin(interaction):
+        await interaction.response.send_message("🔒 **Access Denied**: Administrators and owners only.", ephemeral=True)
+        return
+    set_greet_config(interaction.guild.id, {"enabled": False, "channel_ids": [], "banner_url": None, "message": None, "template": 1})
+    embed = discord.Embed(
+        title="🔄 Welcome System Reset",
+        description="Welcome greetings have been disabled and configuration cleared.",
+        color=discord.Color.blue()
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@greet_group.command(name="templates", description="View previews of all 3 available welcome card templates")
+async def cmd_greet_templates(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    t1_content, t1_embed = build_welcome_card(interaction.user, template_id=1, custom_msg="Suit up and enjoy your stay!")
+    t2_content, t2_embed = build_welcome_card(interaction.user, template_id=2, custom_msg="Honored to welcome you to the imperial court.")
+    t3_content, t3_embed = build_welcome_card(interaction.user, template_id=3, custom_msg="Make yourself comfortable and have fun.")
+
+    overview_embed = discord.Embed(
+        title="🎨 Available Welcome Card Templates",
+        description=(
+            "Here are the **3 Extraordinary Welcome Templates** available for `/greet setup`:\n\n"
+            "• **Template 1: ⚡ Cyberpunk Neon** — High-tech electric cyan aesthetic, account age & ID badge.\n"
+            "• **Template 2: 👑 Monarch Royal Deluxe** — Imperial gold styling, Founder spotlight & kingdom decree.\n"
+            "• **Template 3: ✨ Aesthetic Modern Luxe** — Minimalist Blurple/Velvet elegance & join stats.\n\n"
+            "👇 *See the samples below:*"
+        ),
+        color=discord.Color.gold()
+    )
+    await interaction.followup.send(embed=overview_embed, ephemeral=True)
+    await interaction.followup.send(content="**Template 1: Cyberpunk Neon**", embed=t1_embed, ephemeral=True)
+    await interaction.followup.send(content="**Template 2: Monarch Royal Deluxe**", embed=t2_embed, ephemeral=True)
+    await interaction.followup.send(content="**Template 3: Aesthetic Modern Luxe**", embed=t3_embed, ephemeral=True)
+
+bot.tree.add_command(greet_group)
 
 
 _web_server_initialized = False
