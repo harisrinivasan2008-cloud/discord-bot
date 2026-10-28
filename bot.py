@@ -18,6 +18,13 @@ from discord import app_commands
 from dotenv import load_dotenv
 from aiohttp import web
 
+# Initialize Opus for Discord voice connections
+if not discord.opus.is_loaded():
+    try:
+        discord.opus._load_default()
+    except Exception:
+        pass
+
 # Force unbuffered stdout/stderr so logs appear immediately (and handle pythonw where stdout is None)
 try:
     if sys.stdout is None:
@@ -3203,37 +3210,105 @@ def get_ffmpeg_path():
 @app_commands.describe(channel="Voice channel to join (optional, defaults to your current VC)")
 @check_bot_admin()
 async def join_voice(interaction: discord.Interaction, channel: discord.VoiceChannel = None):
+    # Defer immediately to prevent Discord 3-second 404 Unknown Interaction timeouts
+    await interaction.response.defer()
+
+    guild = interaction.guild
+    if not guild:
+        await interaction.followup.send("❌ This command can only be used in a server.", ephemeral=True)
+        return
+
+    # Determine target voice channel
     target = channel
     if not target:
-        if interaction.user.voice and interaction.user.voice.channel:
-            target = interaction.user.voice.channel
+        user_voice = interaction.user.voice if isinstance(interaction.user, discord.Member) else None
+        if user_voice and user_voice.channel:
+            target = user_voice.channel
         else:
-            await interaction.response.send_message("❌ Please join a voice channel first or select one.", ephemeral=True)
+            await interaction.followup.send("❌ Please join a voice channel first or specify a channel to join.", ephemeral=True)
             return
 
-    vc = interaction.guild.voice_client
-    if vc and vc.is_connected():
-        if vc.channel.id == target.id:
-            await interaction.response.send_message(f"⚠️ Already connected to {target.mention}.", ephemeral=True)
+    # Check bot permissions in target channel
+    bot_member = guild.me or guild.get_member(bot.user.id)
+    if bot_member:
+        perms = target.permissions_for(bot_member)
+        if not perms.connect:
+            await interaction.followup.send(f"❌ Missing Permissions: The bot lacks permission to **Connect** to {target.mention}.", ephemeral=True)
             return
-        await vc.move_to(target)
-        await interaction.response.send_message(f"🔊 Moved to {target.mention}.")
-    else:
+
+    vc = guild.voice_client
+
+    # Case 1: Already in the target channel
+    if vc and vc.is_connected() and vc.channel and vc.channel.id == target.id:
+        await interaction.followup.send(f"⚠️ Already connected to {target.mention}.", ephemeral=True)
+        return
+
+    # Case 2: Connected in another channel -> move cleanly
+    if vc and vc.is_connected():
         try:
-            await target.connect()
-            await interaction.response.send_message(f"🔊 Successfully connected to {target.mention}!")
+            await vc.move_to(target)
+            await interaction.followup.send(f"🔊 Successfully moved to {target.mention}!")
+            return
         except Exception as e:
-            await interaction.response.send_message(f"❌ Failed to connect: {e}", ephemeral=True)
+            print(f"[Voice Move Error] {e}", flush=True)
+            try:
+                await vc.disconnect(force=True)
+            except Exception:
+                pass
+
+    # Case 3: Stale or dead voice client -> force disconnect before reconnecting
+    if vc and not vc.is_connected():
+        try:
+            await vc.disconnect(force=True)
+        except Exception:
+            pass
+
+    # Case 4: Connect fresh
+    try:
+        await target.connect(timeout=15.0, reconnect=True)
+        await interaction.followup.send(f"🔊 Successfully connected to {target.mention}!")
+    except asyncio.TimeoutError:
+        try:
+            if guild.voice_client:
+                await guild.voice_client.disconnect(force=True)
+            await asyncio.sleep(1)
+            await target.connect(timeout=15.0, reconnect=True)
+            await interaction.followup.send(f"🔊 Successfully connected to {target.mention}!")
+        except Exception as err:
+            await interaction.followup.send(f"❌ Connection timed out connecting to {target.mention}. Discord voice gateway did not respond: {err}", ephemeral=True)
+    except discord.ClientException as e:
+        if "Already connected" in str(e) and guild.voice_client:
+            await interaction.followup.send(f"🔊 Connected to {guild.voice_client.channel.mention if guild.voice_client.channel else target.mention}!")
+        else:
+            await interaction.followup.send(f"❌ Voice error: {e}", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Failed to connect to {target.mention}: {e}", ephemeral=True)
+
 
 @bot.tree.command(name="leave", description="Disconnect the bot from the voice channel")
 @check_bot_admin()
 async def leave_voice(interaction: discord.Interaction):
-    vc = interaction.guild.voice_client
-    if not vc or not vc.is_connected():
-        await interaction.response.send_message("❌ The bot is not currently in any voice channel.", ephemeral=True)
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
         return
-    await vc.disconnect()
-    await interaction.response.send_message("👋 Disconnected from voice channel.")
+
+    vc = guild.voice_client
+    if not vc or not vc.is_connected():
+        if vc:
+            try:
+                await vc.disconnect(force=True)
+            except Exception:
+                pass
+        await interaction.response.send_message("❌ The bot is not currently connected to any voice channel in this server.", ephemeral=True)
+        return
+
+    channel_name = vc.channel.name if vc.channel else "the voice channel"
+    try:
+        await vc.disconnect(force=True)
+        await interaction.response.send_message(f"👋 Disconnected from **{channel_name}**.")
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Error disconnecting: {e}", ephemeral=True)
 
 # ==============================================================================
 # VOICE CHANNEL LOCK & UNLOCK (/lock, /unlock)
