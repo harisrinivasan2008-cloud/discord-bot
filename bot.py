@@ -336,6 +336,40 @@ def set_greet_config(guild_id: int, greet_cfg: dict):
     config[g_key]["greet"] = greet_cfg
     save_server_config(config)
 
+def get_guild_showcase_channels(guild: discord.Guild) -> str:
+    if not guild:
+        return "• 📜 *Check server channel list*"
+
+    rules_ch = guild.rules_channel
+    if not rules_ch:
+        rules_ch = discord.utils.find(lambda c: any(k in c.name.lower() for k in ["rule", "guideline", "info"]), guild.text_channels)
+
+    chat_ch = discord.utils.find(lambda c: any(k in c.name.lower() for k in ["general", "chat", "lounge", "talk"]), guild.text_channels)
+    news_ch = discord.utils.find(lambda c: any(k in c.name.lower() for k in ["announcement", "news", "update"]), guild.text_channels)
+
+    greet_cfg = get_greet_config(guild.id)
+    c_ids = greet_cfg.get("channel_ids", [])
+    welcome_chs = [f"<#{cid}>" for cid in c_ids if guild.get_channel(cid)]
+
+    lines = []
+    if welcome_chs:
+        lines.append(f"• 👋 **Welcome Lounge**: {', '.join(welcome_chs)}")
+    if rules_ch:
+        lines.append(f"• 📜 **Rules & Info**: {rules_ch.mention}")
+    if chat_ch:
+        lines.append(f"• 💬 **Main Chat**: {chat_ch.mention}")
+    if news_ch and news_ch != chat_ch and news_ch != rules_ch:
+        lines.append(f"• 📢 **Announcements**: {news_ch.mention}")
+
+    if not lines:
+        sample_chs = [c.mention for c in guild.text_channels[:3] if c.permissions_for(guild.default_role).view_channel]
+        if sample_chs:
+            lines.append(f"• 📌 **Featured Channels**: {', '.join(sample_chs)}")
+        else:
+            lines.append("• 📜 *Explore all channels in the channel sidebar!*")
+
+    return "\n".join(lines)
+
 def build_welcome_card(member: discord.Member | discord.User, template_id: int = 1, custom_msg: str = None, banner_url: str = None) -> tuple[str, discord.Embed]:
     guild = getattr(member, "guild", None)
     avatar = getattr(member, "display_avatar", None)
@@ -345,71 +379,89 @@ def build_welcome_card(member: discord.Member | discord.User, template_id: int =
     created_ts = int(created_at.timestamp()) if created_at else int(time.time())
     member_count = guild.member_count if guild else 1
 
-    if guild and guild.owner:
-        founder_tag = guild.owner.mention
-    else:
-        exact_founder = discord.utils.find(lambda r: r.name.lower().strip() == "founder", guild.roles) if guild else None
-        founder_tag = exact_founder.mention if exact_founder else f"<@{BOT_OWNER_ID}>"
-
     final_banner = banner_url or (guild.banner.url if guild and guild.banner else None)
-    msg_clean = custom_msg.strip() if custom_msg and custom_msg.strip() else None
+    channels_display = get_guild_showcase_channels(guild)
+
+    # Transmission / Custom message formatted in BOLD
+    if custom_msg and custom_msg.strip():
+        msg_clean = f"> **\"{custom_msg.strip()}\"**"
+    else:
+        msg_clean = None
 
     if template_id == 2:
-        # Template 2: Monarch Royal Deluxe
+        # Template 2: Monarch Royal Deluxe (Regal Imperial Gold)
         embed = discord.Embed(
-            title=f"👑 IMPERIAL COURT • WELCOME TO {guild.name.upper() if guild else 'THE SERVER'} 👑",
-            description=f"### Royal Greetings, {member.mention}!\nBy imperial decree, your arrival marks member **#{member_count}** in the kingdom.",
-            color=discord.Color.gold()
+            title=f"👑 ［ IMPERIAL COURT • WELCOME ］ 👑",
+            description=(
+                f"### ⚜️ **Proclamation of Arrival: {member.mention}**\n"
+                f"👑 ═════════════════════════════════ 👑\n"
+                f"By decree of the server court, your entrance marks noble citizen **#{member_count}** in **{guild.name if guild else 'the Kingdom'}**!"
+            ),
+            color=discord.Color.from_rgb(255, 183, 3)
         )
         embed.set_thumbnail(url=avatar_url)
-        embed.add_field(name="🛡️ Distinguished Guest", value=f"{member.mention} (`{member.name}`)", inline=True)
-        embed.add_field(name="🏰 Crown Founder", value=founder_tag, inline=True)
-        embed.add_field(name="📅 Account Age", value=f"<t:{created_ts}:D> (<t:{created_ts}:R>)", inline=True)
-        embed.add_field(name="📜 Kingdom Guidelines", value="Please read the server rules and treat all members with honor.", inline=False)
-        if msg_clean:
-            embed.add_field(name="💬 Royal Decree", value=f"> *\"{msg_clean}\"*", inline=False)
+        embed.add_field(name="🛡️ **Honored Citizen**", value=f"**{member.display_name}** (`@{member.name}`)", inline=True)
+        embed.add_field(name="📅 **Account Registered**", value=f"<t:{created_ts}:D>\n*(<t:{created_ts}:R>)*", inline=True)
+        embed.add_field(name="🏰 **Kingdom Navigation**", value=channels_display, inline=False)
+        embed.add_field(
+            name="💬 **Imperial Proclamation**",
+            value=msg_clean or "> **\"May your reign here be honorable, prosperous, and legendary! Welcome to the court.\"**",
+            inline=False
+        )
         if final_banner:
             embed.set_image(url=final_banner)
-        embed.set_footer(text=f"Royal Welcome • Member #{member_count} • {guild.name if guild else 'Server'}")
-        content = f"👑 **All hail and welcome** {member.mention} to **{guild.name if guild else 'the server'}**! | Paging Founder: {founder_tag}"
+        embed.set_footer(text=f"⚜️ Royal Court Registry • Citizen #{member_count} • {guild.name if guild else 'Server'}")
+        content = f"👑 **All hail and welcome** {member.mention} to **{guild.name if guild else 'the server'}**!"
 
     elif template_id == 3:
-        # Template 3: Modern Aesthetic Luxe
+        # Template 3: Aesthetic Velvet Twilight (Deep Violet / Neon Amethyst)
         embed = discord.Embed(
-            title=f"✨ New Arrival • Welcome to {guild.name if guild else 'the server'} ✨",
-            description=f"Welcome to the community, {member.mention}! We are thrilled to have you here.",
-            color=discord.Color.from_rgb(88, 101, 242)
+            title=f"✨ ［ AESTHETIC SANCTUARY • WELCOME ］ ✨",
+            description=(
+                f"### 🌸 **Welcome to the family, {member.mention}!**\n"
+                f"✦ · · ──────────────────────── · · ✦\n"
+                f"We are beyond excited to welcome you to **{guild.name if guild else 'our community'}**!\n"
+                f"You have arrived as our cherished member **#{member_count}**."
+            ),
+            color=discord.Color.from_rgb(131, 56, 236)
         )
         embed.set_thumbnail(url=avatar_url)
-        embed.add_field(name="👤 Member", value=f"`{member.name}` ({member.mention})", inline=True)
-        embed.add_field(name="📊 Member Count", value=f"**#{member_count}**", inline=True)
-        embed.add_field(name="👑 Founder", value=founder_tag, inline=True)
-        embed.add_field(name="⏰ Joined At", value=f"<t:{int(time.time())}:f>", inline=False)
-        if msg_clean:
-            embed.add_field(name="💭 Note", value=f"> *\"{msg_clean}\"*", inline=False)
+        embed.add_field(name="👤 **New Friend**", value=f"**{member.name}** ({member.mention})", inline=True)
+        embed.add_field(name="⏰ **Joined Discord**", value=f"<t:{created_ts}:D>\n*(<t:{created_ts}:R>)*", inline=True)
+        embed.add_field(name="📌 **Explore Our Spaces**", value=channels_display, inline=False)
+        embed.add_field(
+            name="💭 **Heartfelt Note**",
+            value=msg_clean or "> **\"Make yourself at home, grab some roles, and enjoy the cozy vibes!\"**",
+            inline=False
+        )
         if final_banner:
             embed.set_image(url=final_banner)
-        embed.set_footer(text=f"Aesthetic Luxe • {guild.name if guild else 'Server'}")
-        content = f"✨ Welcome {member.mention} to **{guild.name if guild else 'the server'}**!"
+        embed.set_footer(text=f"✨ Aesthetic Sanctuary • Member #{member_count} • {guild.name if guild else 'Server'}")
+        content = f"✨ **Sending warm hugs and welcome to** {member.mention}!"
 
     else:
-        # Template 1: Cyberpunk Neon
+        # Template 1: Cyberpunk Neon Matrix (Electric Cyan / Neon)
         embed = discord.Embed(
-            title=f"⚡ WELCOME TO {guild.name.upper() if guild else 'THE SERVER'} ⚡",
-            description=f"### Access Granted, {member.mention}!\nYou are connection **#{member_count}** in the mainframe.",
+            title=f"⚡ ［ SYSTEM INGRESS: ACCESS GRANTED ］ ⚡",
+            description=(
+                f"### 🌐 **Welcome to {guild.name.upper() if guild else 'THE MAINFRAME'}, {member.mention}!**\n"
+                f"◈━━━━━━━━━━━━━━━━━━━━━━━━━━━━━◈\n"
+                f"🛰️ Access clearance verified. You are connection sequence **#{member_count}** on the grid."
+            ),
             color=discord.Color.from_rgb(0, 240, 255)
         )
         embed.set_thumbnail(url=avatar_url)
-        embed.add_field(name="🏷️ Identity", value=f"**{member.name}** (`{member.id}`)", inline=True)
-        embed.add_field(name="👑 Founder", value=founder_tag, inline=True)
-        embed.add_field(name="📅 Account Created", value=f"<t:{created_ts}:D> (<t:{created_ts}:R>)", inline=True)
-        if msg_clean:
-            embed.add_field(name="💬 Transmission", value=f"> *\"{msg_clean}\"*", inline=False)
-        else:
-            embed.add_field(name="💬 Transmission", value="> *\"Suit up, check the server rules, and enjoy your time!\"*", inline=False)
+        embed.add_field(name="🏷️ **Operative Identity**", value=f"**{member.name}**\n`ID: {member.id}`", inline=True)
+        embed.add_field(name="📅 **Account Registered**", value=f"<t:{created_ts}:D>\n*(<t:{created_ts}:R>)*", inline=True)
+        embed.add_field(name="📍 **Server Access Points**", value=channels_display, inline=False)
+        embed.add_field(
+            name="💬 **Transmission**",
+            value=msg_clean or "> **\"Suit up, check the mainframe channels, and enjoy your journey with us!\"**",
+            inline=False
+        )
         if final_banner:
             embed.set_image(url=final_banner)
-        embed.set_footer(text=f"Cyberpunk Neon • Member #{member_count} • {guild.name if guild else 'Server'}")
+        embed.set_footer(text=f"⚡ Cyberpunk Ingress • Node #{member_count} • {guild.name if guild else 'Server'}")
         content = f"⚡ **Transmission incoming** for {member.mention}! Welcome to **{guild.name if guild else 'the server'}**!"
 
     return content, embed
@@ -1539,9 +1591,55 @@ async def before_auto_bump_loop():
     await bot.wait_until_ready()
 
 # ==============================================================================
+# SINGLE-FLIGHT 24/7 VOICE ENGINE (Zero Race Conditions)
+# ==============================================================================
+voice_connect_locks = defaultdict(asyncio.Lock)
+voice_connecting_flag = defaultdict(bool)
+
+async def safe_voice_connect(guild: discord.Guild, channel: discord.VoiceChannel | discord.StageChannel, reason: str = "24/7 Engine") -> bool:
+    """Safely connects to a voice channel with strict single-flight locking to prevent race conditions and timeouts."""
+    if not guild or not channel:
+        return False
+
+    if voice_connecting_flag[guild.id]:
+        return False  # Handshake already in progress, avoid collision!
+
+    async with voice_connect_locks[guild.id]:
+        # Double check if already connected to target channel
+        vc = guild.voice_client
+        if vc and vc.is_connected() and vc.channel and vc.channel.id == channel.id:
+            return True
+
+        voice_connecting_flag[guild.id] = True
+        try:
+            if vc and vc.is_connected():
+                # Already connected in another channel, move cleanly
+                await vc.move_to(channel)
+                print(f"[{reason}] Moved bot to #{channel.name} in {guild.name}.", flush=True)
+                return True
+
+            # Force disconnect stale voice clients
+            if vc:
+                try:
+                    await vc.disconnect(force=True)
+                except Exception:
+                    pass
+                await asyncio.sleep(0.5)
+
+            print(f"[{reason}] Connecting bot to #{channel.name} in {guild.name} (DAVE E2EE)...", flush=True)
+            await channel.connect(timeout=25.0, reconnect=True, self_deaf=True)
+            print(f"[{reason}] Successfully connected bot to #{channel.name} in {guild.name}!", flush=True)
+            return True
+        except Exception as e:
+            print(f"[{reason} Error] Could not connect to #{channel.name}: {e}", flush=True)
+            return False
+        finally:
+            voice_connecting_flag[guild.id] = False
+
+# ==============================================================================
 # 24/7 STAY-IN-VOICE RECONNECT WATCHDOG LOOP
 # ==============================================================================
-@tasks.loop(seconds=20)
+@tasks.loop(seconds=60)
 async def stay_vc_watchdog_loop():
     """Keeps the bot connected in 24/7 voice channels automatically."""
     config = load_server_config()
@@ -1556,7 +1654,7 @@ async def stay_vc_watchdog_loop():
             continue
 
         guild = bot.get_guild(guild_id)
-        if not guild:
+        if not guild or voice_connecting_flag[guild.id]:
             continue
 
         channel_id = stay_cfg.get("channel_id")
@@ -1565,24 +1663,8 @@ async def stay_vc_watchdog_loop():
             continue
 
         vc = guild.voice_client
-        if vc is None or not vc.is_connected():
-            try:
-                if vc:
-                    try:
-                        await vc.disconnect(force=True)
-                    except Exception:
-                        pass
-                print(f"[24/7 Voice Watchdog] Auto-reconnecting to #{channel.name} in {guild.name}...", flush=True)
-                await channel.connect(timeout=30.0, reconnect=True, self_deaf=True)
-                print(f"[24/7 Voice Watchdog] Successfully connected to #{channel.name} in {guild.name}.", flush=True)
-            except Exception as e:
-                print(f"[24/7 Voice Watchdog Error] Failed to connect to #{channel.name}: {e}", flush=True)
-        elif vc.channel and vc.channel.id != channel.id:
-            try:
-                print(f"[24/7 Voice Watchdog] Returning to 24/7 channel #{channel.name} in {guild.name}...", flush=True)
-                await vc.move_to(channel)
-            except Exception as e:
-                print(f"[24/7 Voice Watchdog Error] Failed to move back: {e}", flush=True)
+        if vc is None or not vc.is_connected() or (vc.channel and vc.channel.id != channel.id):
+            await safe_voice_connect(guild, channel, reason="24/7 Watchdog")
 
 @stay_vc_watchdog_loop.before_loop
 async def before_stay_vc_watchdog_loop():
@@ -3765,62 +3847,27 @@ async def join_voice(interaction: discord.Interaction, channel: discord.VoiceCha
 
     vc = guild.voice_client
 
+    # Save 24/7 destination
+    set_stay_vc_config(guild.id, target.id, enabled=True)
+
     # Case 1: Already in the target channel
     if vc and vc.is_connected() and vc.channel and vc.channel.id == target.id:
-        set_stay_vc_config(guild.id, target.id, enabled=True)
         await interaction.followup.send(f"🔊 Already connected to {target.mention}!\n🛡️ **24/7 Stay-in-VC Mode** is active and guarding this channel.")
         return
 
-    # Case 2: Connected in another channel -> move cleanly
-    if vc and vc.is_connected():
-        try:
-            await vc.move_to(target)
-            set_stay_vc_config(guild.id, target.id, enabled=True)
-            await interaction.followup.send(f"🔊 Successfully moved to {target.mention}!\n🛡️ **24/7 Stay-in-VC Mode** is active: The bot will stay connected 24 hours.")
-            return
-        except Exception as e:
-            print(f"[Voice Move Error] {e}", flush=True)
-            try:
-                await vc.disconnect(force=True)
-            except Exception:
-                pass
-
-    # Case 3: Stale or dead voice client -> force disconnect before reconnecting
-    if vc and not vc.is_connected():
-        try:
-            await vc.disconnect(force=True)
-        except Exception:
-            pass
-
-    # Case 4: Connect fresh with DAVE protocol & self_deaf=True
-    try:
-        await target.connect(timeout=30.0, reconnect=True, self_deaf=True)
-        set_stay_vc_config(guild.id, target.id, enabled=True)
+    # Perform safe locked connection
+    success = await safe_voice_connect(guild, target, reason="Join Command")
+    if success:
         await interaction.followup.send(
             f"🔊 Successfully connected to {target.mention}!\n"
-            f"🛡️ **24/7 Stay-in-VC Mode** is active: The bot will stay connected 24/7 with auto-reconnection."
+            f"🛡️ **24/7 Stay-in-VC Mode** is active: The bot will guard this channel and auto-reconnect if dropped."
         )
-    except asyncio.TimeoutError:
-        try:
-            if guild.voice_client:
-                await guild.voice_client.disconnect(force=True)
-            await asyncio.sleep(1.5)
-            await target.connect(timeout=30.0, reconnect=True, self_deaf=True)
-            set_stay_vc_config(guild.id, target.id, enabled=True)
-            await interaction.followup.send(
-                f"🔊 Successfully connected to {target.mention}!\n"
-                f"🛡️ **24/7 Stay-in-VC Mode** is active: The bot will stay connected 24/7."
-            )
-        except Exception as err:
-            await interaction.followup.send(f"❌ Connection error: Could not complete voice handshake with {target.mention}: {err}", ephemeral=True)
-    except discord.ClientException as e:
-        if "Already connected" in str(e) and guild.voice_client:
-            set_stay_vc_config(guild.id, target.id, enabled=True)
-            await interaction.followup.send(f"🔊 Connected to {guild.voice_client.channel.mention if guild.voice_client.channel else target.mention}!\n🛡️ **24/7 Mode** active.")
+    else:
+        vc = guild.voice_client
+        if vc and vc.is_connected() and vc.channel and vc.channel.id == target.id:
+            await interaction.followup.send(f"🔊 Successfully connected to {target.mention}!\n🛡️ **24/7 Mode** is active.")
         else:
-            await interaction.followup.send(f"❌ Voice error: {e}", ephemeral=True)
-    except Exception as e:
-        await interaction.followup.send(f"❌ Failed to connect to {target.mention}: {e}", ephemeral=True)
+            await interaction.followup.send(f"🔊 Voice connection initiated for {target.mention}. The 24/7 engine is maintaining the connection.")
 
 
 @bot.tree.command(name="leave", description="Disconnect the bot from voice and turn off 24/7 mode")
@@ -4038,25 +4085,14 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
         stay_cfg = get_stay_vc_config(member.guild.id)
         if stay_cfg.get("enabled"):
             target_cid = stay_cfg.get("channel_id")
-            if target_cid and (after.channel is None or after.channel.id != target_cid):
-                target_channel = member.guild.get_channel(target_cid)
-                if target_channel and isinstance(target_channel, (discord.VoiceChannel, discord.StageChannel)):
-                    print(f"[24/7 Voice] Bot disconnected or moved from #{target_channel.name} in {member.guild.name}. Auto-restoring in 2s...", flush=True)
-                    await asyncio.sleep(2.0)
-                    try:
-                        vc = member.guild.voice_client
-                        if vc and vc.is_connected():
-                            await vc.move_to(target_channel)
-                        else:
-                            if vc:
-                                try:
-                                    await vc.disconnect(force=True)
-                                except Exception:
-                                    pass
-                            await target_channel.connect(timeout=30.0, reconnect=True, self_deaf=True)
-                        print(f"[24/7 Voice] Auto-restored connection to #{target_channel.name}.", flush=True)
-                    except Exception as e:
-                        print(f"[24/7 Auto-Rejoin Error] {e}", flush=True)
+            # Only trigger if bot was previously connected and has now completely disconnected, and no handshake is running
+            if target_cid and before.channel is not None and after.channel is None:
+                if not voice_connecting_flag[member.guild.id]:
+                    target_channel = member.guild.get_channel(target_cid)
+                    if target_channel and isinstance(target_channel, (discord.VoiceChannel, discord.StageChannel)):
+                        print(f"[24/7 Voice] Disconnected from #{target_channel.name} in {member.guild.name}. Restoring connection...", flush=True)
+                        await asyncio.sleep(2.5)
+                        await safe_voice_connect(member.guild, target_channel, reason="Auto-Restore")
         return
 
     cfg = load_follow_config()
