@@ -76,6 +76,32 @@ def save_server_config(config: dict):
     except Exception as e:
         print(f"Error saving server_config.json: {e}", flush=True)
 
+def get_server_admin_ids(guild_id: int) -> set:
+    config = load_server_config()
+    return set(config.get(str(guild_id), {}).get("admin_ids", []))
+
+def add_server_admin(guild_id: int, user_id: int):
+    config = load_server_config()
+    g_key = str(guild_id)
+    if g_key not in config:
+        config[g_key] = {}
+    admins = set(config[g_key].get("admin_ids", []))
+    admins.add(user_id)
+    config[g_key]["admin_ids"] = sorted(list(admins))
+    save_server_config(config)
+
+def remove_server_admin(guild_id: int, user_id: int) -> bool:
+    config = load_server_config()
+    g_key = str(guild_id)
+    if g_key in config and "admin_ids" in config[g_key]:
+        admins = set(config[g_key]["admin_ids"])
+        if user_id in admins:
+            admins.remove(user_id)
+            config[g_key]["admin_ids"] = sorted(list(admins))
+            save_server_config(config)
+            return True
+    return False
+
 def get_default_prefix(guild_id: int) -> str | None:
     config = load_server_config()
     return config.get(str(guild_id), {}).get("default_prefix")
@@ -180,18 +206,32 @@ def build_farewell_card(member: discord.Member | discord.User, guild: discord.Gu
     content = f"👋 **Farewell** {member.mention} | Paging Founder: {founder_tag}"
     return content, embed
 
-def is_user_admin(user_id: int) -> bool:
-    # 1. Supreme Bot Owner is ALWAYS permanently authorized across all servers
+def is_user_admin(user_id: int, guild: discord.Guild = None) -> bool:
+    # 1. Supreme Bot Owner is ALWAYS permanently authorized globally across all servers
     if user_id == BOT_OWNER_ID:
         return True
     if bot.owner_id and user_id == bot.owner_id:
         return True
-    # 2. Check if user is in authorized admins list
+
+    if not guild:
+        # Fallback for DM or unknown guild context
+        return user_id in load_admin_ids()
+
+    # 2. Server Owner is the DEFAULT administrator for their server
+    if guild.owner_id and user_id == guild.owner_id:
+        return True
+
+    # 3. Check per-server authorized administrators
+    server_admins = get_server_admin_ids(guild.id)
+    if user_id in server_admins:
+        return True
+
+    # 4. Global fallback
     admin_ids = load_admin_ids()
     return user_id in admin_ids
 
 def is_authorized_admin(interaction: discord.Interaction) -> bool:
-    return is_user_admin(interaction.user.id)
+    return is_user_admin(interaction.user.id, interaction.guild)
 
 def check_bot_admin():
     async def predicate(interaction: discord.Interaction) -> bool:
@@ -210,7 +250,7 @@ def is_spam_exempt(member: discord.Member) -> bool:
         return False
 
     # 1. Supreme Bot Owner and Authorized Admins are always exempt
-    if is_user_admin(member.id):
+    if is_user_admin(member.id, member.guild):
         return True
 
     # 2. Members with the "monarch" role (case-insensitive) are exempt
@@ -1428,89 +1468,135 @@ async def bump_status(interaction: discord.Interaction):
 
 bot.tree.add_command(bump_group)
 
-admin_group = app_commands.Group(name="admin", description="Manage authorized bot administrators")
+admin_group = app_commands.Group(name="admin", description="Manage authorized bot administrators for this server")
 
-@admin_group.command(name="add", description="Grant a user full access to use this bot")
+@admin_group.command(name="add", description="Authorize a member as a bot administrator in this server")
 @app_commands.describe(member="The member to authorize as a bot administrator")
 @check_bot_admin()
 async def admin_add(interaction: discord.Interaction, member: discord.Member):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
+        return
+
+    # Only Server Owner or Supreme Bot Owner can add admins
+    if interaction.user.id != guild.owner_id and interaction.user.id != BOT_OWNER_ID:
+        await interaction.response.send_message(
+            f"🔒 **Access Denied**: Only the **Server Owner** (<@{guild.owner_id}>) or the **Supreme Bot Owner** can add administrators for this server.",
+            ephemeral=True
+        )
+        return
+
     if member.id == BOT_OWNER_ID:
         await interaction.response.send_message(
-            f"👑 {member.mention} is the supreme Bot Owner and already has permanent global access.",
+            f"👑 {member.mention} is the Supreme Bot Owner and already has permanent global access.",
             ephemeral=True
         )
         return
 
-    admin_ids = load_admin_ids()
-    if member.id in admin_ids:
+    if member.id == guild.owner_id:
         await interaction.response.send_message(
-            f"⚠️ {member.mention} already has bot administrator access.",
+            f"👑 {member.mention} is the Server Owner and is already an administrator by default.",
             ephemeral=True
         )
         return
 
-    admin_ids.add(member.id)
-    save_admin_ids(admin_ids)
+    server_admins = get_server_admin_ids(guild.id)
+    if member.id in server_admins:
+        await interaction.response.send_message(
+            f"⚠️ {member.mention} is already an authorized bot administrator in **{guild.name}**.",
+            ephemeral=True
+        )
+        return
+
+    add_server_admin(guild.id, member.id)
     await interaction.response.send_message(
-        f"✅ Successfully granted bot admin access to {member.mention}."
+        f"✅ Successfully granted bot administrator access to {member.mention} for **{guild.name}**!"
     )
 
-@admin_group.command(name="remove", description="Revoke a user's access to this bot")
-@app_commands.describe(member="The member to remove from bot administrators")
+
+@admin_group.command(name="remove", description="Revoke a member's bot administrator access in this server")
+@app_commands.describe(member="The member whose bot administrator access should be revoked")
 @check_bot_admin()
 async def admin_remove(interaction: discord.Interaction, member: discord.Member):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
+        return
+
+    # Only Server Owner or Supreme Bot Owner can remove admins
+    if interaction.user.id != guild.owner_id and interaction.user.id != BOT_OWNER_ID:
+        await interaction.response.send_message(
+            f"🔒 **Access Denied**: Only the **Server Owner** (<@{guild.owner_id}>) or the **Supreme Bot Owner** can remove administrators for this server.",
+            ephemeral=True
+        )
+        return
+
     if member.id == BOT_OWNER_ID:
         await interaction.response.send_message(
-            "❌ Cannot revoke access from the Bot Owner (permanent supreme administrator).",
+            "❌ Cannot revoke access from the Supreme Bot Owner (permanent global administrator).",
             ephemeral=True
         )
         return
 
-    admin_ids = load_admin_ids()
-    if member.id not in admin_ids:
+    if member.id == guild.owner_id:
         await interaction.response.send_message(
-            f"⚠️ {member.mention} is not in the bot administrators list.",
+            "❌ Cannot revoke access from the Server Owner (permanent default administrator for this server).",
             ephemeral=True
         )
         return
 
-    admin_ids.remove(member.id)
-    save_admin_ids(admin_ids)
+    if not remove_server_admin(guild.id, member.id):
+        await interaction.response.send_message(
+            f"⚠️ {member.mention} is not in the bot administrator list for **{guild.name}**.",
+            ephemeral=True
+        )
+        return
+
     await interaction.response.send_message(
-        f"✅ Successfully revoked bot admin access from {member.mention}."
+        f"✅ Successfully revoked bot administrator access from {member.mention} for **{guild.name}**."
     )
 
-@admin_group.command(name="list", description="Show all users authorized to access this bot")
+
+@admin_group.command(name="list", description="Show all users authorized to manage the bot in this server")
 @check_bot_admin()
 async def admin_list(interaction: discord.Interaction):
-    admin_ids = load_admin_ids()
-    owner_str = f"👑 <@{BOT_OWNER_ID}> (`{BOT_OWNER_ID}`) *(Supreme Bot Owner - Global)*"
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
+        return
+
+    server_admins = get_server_admin_ids(guild.id)
+    server_owner_str = f"👑 <@{guild.owner_id}> (`{guild.owner_id}`) *(Server Owner - Default Admin)*"
+    supreme_owner_str = f"👑 <@{BOT_OWNER_ID}> (`{BOT_OWNER_ID}`) *(Supreme Bot Owner - Global)*"
 
     admin_list_text = []
-    for uid in sorted(admin_ids):
-        if uid == BOT_OWNER_ID:
+    for uid in sorted(server_admins):
+        if uid == BOT_OWNER_ID or uid == guild.owner_id:
             continue
         admin_list_text.append(f"🛡️ <@{uid}> (`{uid}`)")
 
     embed = discord.Embed(
-        title="🔐 Authorized Bot Administrators",
-        description="Only users on this list are permitted to execute bot commands across servers.",
+        title=f"🔐 Bot Administrators • {guild.name}",
+        description="Users authorized to execute bot administration commands in this server.",
         color=discord.Color.gold()
     )
-    embed.add_field(name="Supreme Bot Owner", value=owner_str, inline=False)
+    embed.add_field(name="Server Owner (Default Admin)", value=server_owner_str, inline=False)
+    embed.add_field(name="Supreme Bot Owner (Global)", value=supreme_owner_str, inline=False)
+
     if admin_list_text:
         embed.add_field(
-            name=f"Configured Admins ({len(admin_list_text)})",
+            name=f"Server Admins ({len(admin_list_text)})",
             value="\n".join(admin_list_text),
             inline=False
         )
     else:
         embed.add_field(
-            name="Configured Admins",
-            value="*No additional admins added yet. Use `/admin add` to authorize members.*",
+            name="Server Admins",
+            value="*No additional admins added yet. The Server Owner can use `/admin add` to authorize members.*",
             inline=False
         )
-    embed.set_footer(text=f"Total: {len(admin_list_text) + 1} Authorized User(s)")
+    embed.set_footer(text=f"Server: {guild.name} • Total: {len(admin_list_text) + 2} Authorized")
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
