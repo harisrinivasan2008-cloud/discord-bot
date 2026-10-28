@@ -4857,32 +4857,137 @@ bot.tree.add_command(antinuke_group)
 
 
 # ==============================================================================
-# 19. AUTOROLE SYSTEM (/autorole add, /autorole status, /autorole botadd, /autorole botstatus)
+# 19. AUTOROLE SYSTEM (/autorole add, /autorole status, /autorole disable, /autorole botadd, /autorole botstatus, /autorole botdisable)
 # ==============================================================================
+class RoleSelectView(discord.ui.View):
+    def __init__(self, author_id: int, is_bot: bool = False):
+        super().__init__(timeout=120)
+        self.author_id = author_id
+        self.is_bot = is_bot
+
+    @discord.ui.select(
+        cls=discord.ui.RoleSelect,
+        placeholder="🔍 Select any server role from this dropdown...",
+        min_values=1,
+        max_values=1
+    )
+    async def on_role_select(self, interaction: discord.Interaction, select: discord.ui.RoleSelect):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("🔒 You cannot use this menu.", ephemeral=True)
+            return
+
+        role = select.values[0]
+        cfg = get_autorole_config(interaction.guild.id)
+        if self.is_bot:
+            cfg["bot_role_id"] = role.id
+            set_autorole_config(interaction.guild.id, cfg)
+            embed = discord.Embed(
+                title="🤖 Bot Autorole Configured",
+                description=f"✅ New bot accounts will automatically receive {role.mention} upon joining.",
+                color=discord.Color.green()
+            )
+        else:
+            cfg["human_role_id"] = role.id
+            set_autorole_config(interaction.guild.id, cfg)
+            embed = discord.Embed(
+                title="🏷️ Human Autorole Configured",
+                description=f"✅ New human members will automatically receive {role.mention} upon joining.",
+                color=discord.Color.green()
+            )
+
+        if interaction.guild.me.top_role.position <= role.position:
+            embed.set_footer(text="⚠️ Notice: Move the bot's role higher than this role in Server Settings > Roles so it can assign it!")
+
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(embed=embed, view=self)
+
+async def autorole_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    guild = interaction.guild
+    if not guild:
+        return []
+
+    choices = []
+    current_lower = current.strip().lower()
+
+    # Filter out divider roles, @everyone, and bot-managed roles
+    valid_roles = []
+    for r in guild.roles:
+        if r.is_default() or r.managed:
+            continue
+        cleaned = re.sub(r"[\s\-_=~*#|─—–•·═]+", "", r.name)
+        if len(cleaned) == 0:
+            continue
+        valid_roles.append(r)
+
+    # Sort roles from highest position to lowest
+    valid_roles.sort(key=lambda r: r.position, reverse=True)
+
+    for r in valid_roles:
+        if not current_lower or current_lower in r.name.lower():
+            display_name = f"🏷️ {r.name}"[:100]
+            choices.append(app_commands.Choice(name=display_name, value=str(r.id)))
+            if len(choices) >= 25:
+                break
+
+    return choices
+
 autorole_group = app_commands.Group(name="autorole", description="Automatically assign roles to joining users and bots")
 
 @autorole_group.command(name="add", description="Set the default role automatically assigned to joining users")
-@app_commands.describe(role="The role to automatically grant to new human members")
-async def cmd_autorole_add(interaction: discord.Interaction, role: discord.Role):
+@app_commands.describe(role="Choose a role from autocomplete, or leave empty to use interactive role selector")
+@app_commands.autocomplete(role=autorole_autocomplete)
+async def cmd_autorole_add(interaction: discord.Interaction, role: str = None):
     if not is_authorized_admin(interaction):
         await interaction.response.send_message("🔒 **Access Denied**: Bot administrators and owners only.", ephemeral=True)
         return
-    cfg = get_autorole_config(interaction.guild.id)
-    if cfg.get("human_role_id") == role.id:
+
+    guild = interaction.guild
+    if not role:
+        embed = discord.Embed(
+            title="🏷️ Select Human Autorole",
+            description=(
+                "Choose the default role for new human members using the selector below.\n\n"
+                "• 💡 *You can select any server role from the dropdown menu.*\n"
+                "• ⚠️ *Make sure the bot's role is higher than the selected role in Server Settings > Roles.*"
+            ),
+            color=discord.Color.blue()
+        )
+        view = RoleSelectView(interaction.user.id, is_bot=False)
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        return
+
+    resolved_role = None
+    cleaned = role.strip("<@&> ")
+    if cleaned.isdigit():
+        resolved_role = guild.get_role(int(cleaned))
+    if not resolved_role:
+        resolved_role = discord.utils.find(lambda r: r.name.lower() == role.lower(), guild.roles)
+
+    if not resolved_role:
+        await interaction.response.send_message(f"❌ Could not find role `{role}` in this server.", ephemeral=True)
+        return
+
+    cfg = get_autorole_config(guild.id)
+    if cfg.get("human_role_id") == resolved_role.id:
         embed = discord.Embed(
             title="ℹ️ Autorole Status",
-            description=f"⚠️ **Human Autorole is already TURNED ON for {role.mention}!**",
+            description=f"⚠️ **Human Autorole is already TURNED ON for {resolved_role.mention}!**",
             color=discord.Color.gold()
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
         return
-    cfg["human_role_id"] = role.id
-    set_autorole_config(interaction.guild.id, cfg)
+
+    cfg["human_role_id"] = resolved_role.id
+    set_autorole_config(guild.id, cfg)
+
     embed = discord.Embed(
         title="🏷️ Human Autorole Configured",
-        description=f"✅ New human members will automatically receive {role.mention} upon joining.",
+        description=f"✅ New human members will automatically receive {resolved_role.mention} upon joining.",
         color=discord.Color.green()
     )
+    if guild.me.top_role.position <= resolved_role.position:
+        embed.set_footer(text="⚠️ Notice: Move the bot's role higher than this role in Server Settings > Roles so it can assign it!")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @autorole_group.command(name="status", description="Show the current autorole configuration")
@@ -4897,32 +5002,82 @@ async def cmd_autorole_status(interaction: discord.Interaction):
         title=f"🏷️ Autorole Configuration • {interaction.guild.name}",
         color=discord.Color.blue()
     )
-    embed.add_field(name="👤 Human Member Autorole", value=h_role.mention if h_role else "*Not configured*", inline=True)
-    embed.add_field(name="🤖 Bot Autorole", value=b_role.mention if b_role else "*Not configured*", inline=True)
+    embed.add_field(name="👤 Human Member Autorole", value=h_role.mention if h_role else "*Not configured (Disabled)*", inline=True)
+    embed.add_field(name="🤖 Bot Autorole", value=b_role.mention if b_role else "*Not configured (Disabled)*", inline=True)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-@autorole_group.command(name="botadd", description="Set the default role automatically assigned to joining bots")
-@app_commands.describe(role="The role to automatically grant to new bot accounts")
-async def cmd_autorole_botadd(interaction: discord.Interaction, role: discord.Role):
+@autorole_group.command(name="disable", description="Disable automatic role assignment for new human members")
+async def cmd_autorole_disable(interaction: discord.Interaction):
     if not is_authorized_admin(interaction):
         await interaction.response.send_message("🔒 **Access Denied**: Bot administrators and owners only.", ephemeral=True)
         return
     cfg = get_autorole_config(interaction.guild.id)
-    if cfg.get("bot_role_id") == role.id:
+    if not cfg.get("human_role_id"):
+        await interaction.response.send_message("ℹ️ Human Autorole is already disabled.", ephemeral=True)
+        return
+    cfg["human_role_id"] = None
+    set_autorole_config(interaction.guild.id, cfg)
+    embed = discord.Embed(
+        title="🏷️ Human Autorole Disabled",
+        description="✅ Automatic role assignment for new human members has been turned off.",
+        color=discord.Color.red()
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@autorole_group.command(name="botadd", description="Set the default role automatically assigned to joining bots")
+@app_commands.describe(role="Choose a role from autocomplete, or leave empty to use interactive role selector")
+@app_commands.autocomplete(role=autorole_autocomplete)
+async def cmd_autorole_botadd(interaction: discord.Interaction, role: str = None):
+    if not is_authorized_admin(interaction):
+        await interaction.response.send_message("🔒 **Access Denied**: Bot administrators and owners only.", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    if not role:
+        embed = discord.Embed(
+            title="🤖 Select Bot Autorole",
+            description=(
+                "Choose the default role for newly invited bot accounts using the selector below.\n\n"
+                "• 💡 *You can select any server role from the dropdown menu.*\n"
+                "• ⚠️ *Make sure the bot's role is higher than the selected role in Server Settings > Roles.*"
+            ),
+            color=discord.Color.blue()
+        )
+        view = RoleSelectView(interaction.user.id, is_bot=True)
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        return
+
+    resolved_role = None
+    cleaned = role.strip("<@&> ")
+    if cleaned.isdigit():
+        resolved_role = guild.get_role(int(cleaned))
+    if not resolved_role:
+        resolved_role = discord.utils.find(lambda r: r.name.lower() == role.lower(), guild.roles)
+
+    if not resolved_role:
+        await interaction.response.send_message(f"❌ Could not find role `{role}` in this server.", ephemeral=True)
+        return
+
+    cfg = get_autorole_config(guild.id)
+    if cfg.get("bot_role_id") == resolved_role.id:
         embed = discord.Embed(
             title="ℹ️ Autorole Status",
-            description=f"⚠️ **Bot Autorole is already TURNED ON for {role.mention}!**",
+            description=f"⚠️ **Bot Autorole is already TURNED ON for {resolved_role.mention}!**",
             color=discord.Color.gold()
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
         return
-    cfg["bot_role_id"] = role.id
-    set_autorole_config(interaction.guild.id, cfg)
+
+    cfg["bot_role_id"] = resolved_role.id
+    set_autorole_config(guild.id, cfg)
+
     embed = discord.Embed(
         title="🤖 Bot Autorole Configured",
-        description=f"✅ New bot accounts will automatically receive {role.mention} upon joining.",
+        description=f"✅ New bot accounts will automatically receive {resolved_role.mention} upon joining.",
         color=discord.Color.green()
     )
+    if guild.me.top_role.position <= resolved_role.position:
+        embed.set_footer(text="⚠️ Notice: Move the bot's role higher than this role in Server Settings > Roles so it can assign it!")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @autorole_group.command(name="botstatus", description="Show the current bot autorole status")
@@ -4934,8 +5089,26 @@ async def cmd_autorole_botstatus(interaction: discord.Interaction):
     b_role = interaction.guild.get_role(cfg.get("bot_role_id")) if cfg.get("bot_role_id") else None
     embed = discord.Embed(
         title=f"🤖 Bot Autorole Status • {interaction.guild.name}",
-        description=f"Active Bot Role: {b_role.mention if b_role else '*Not configured*'}",
+        description=f"Active Bot Role: {b_role.mention if b_role else '*Not configured (Disabled)*'}",
         color=discord.Color.blue()
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@autorole_group.command(name="botdisable", description="Disable automatic role assignment for new bot accounts")
+async def cmd_autorole_botdisable(interaction: discord.Interaction):
+    if not is_authorized_admin(interaction):
+        await interaction.response.send_message("🔒 **Access Denied**: Bot administrators and owners only.", ephemeral=True)
+        return
+    cfg = get_autorole_config(interaction.guild.id)
+    if not cfg.get("bot_role_id"):
+        await interaction.response.send_message("ℹ️ Bot Autorole is already disabled.", ephemeral=True)
+        return
+    cfg["bot_role_id"] = None
+    set_autorole_config(interaction.guild.id, cfg)
+    embed = discord.Embed(
+        title="🤖 Bot Autorole Disabled",
+        description="✅ Automatic role assignment for new bot accounts has been turned off.",
+        color=discord.Color.red()
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
