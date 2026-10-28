@@ -588,6 +588,7 @@ REACTION_EMOJIS = ["🔥", "👑", "👀"]
 user_message_times = defaultdict(list)
 user_last_messages = defaultdict(list)
 user_warn_counts = {}          # Tracks how many spam warnings each user has received
+guardian_response_times = {}   # Tracks cooldown to prevent repeating DM/mention messages
 
 # Global task cancellation tracking for /stop command
 active_spam_count = defaultdict(int)
@@ -1888,23 +1889,42 @@ async def on_message(message: discord.Message):
         is_bot_mention = True
 
     if is_dm or is_bot_mention:
-        guardian_text = (
-            "⛩️  𝐈𝐃𝐄𝐍𝐓𝐈𝐓𝐘 𝐂𝐎𝐍𝐅𝐈𝐑𝐌𝐄𝐃  ⛩️\n"
-            "⛥ 𝐈 𝐚𝐦 𝐭𝐡𝐞 𝐨𝐟𝐟𝐢𝐜𝐢𝐚𝐥 𝐠𝐮𝐚𝐫𝐝𝐢𝐚𝐧 𝐨𝐟 𝐇𝐞𝐥𝐥𝐟𝐢𝐫𝐞 𝐂𝐥𝐮𝐛.⛥\n"
-            "⸸ 𝐈 𝐝𝐨𝐧'𝐭 𝐬𝐥𝐞𝐞𝐩. 𝐈 𝐝𝐨𝐧'𝐭 𝐟𝐞𝐚𝐫. 𝐈 𝐩𝐫𝐨𝐭𝐞𝐜𝐭 𝐭𝐡𝐞 𝐤𝐢𝐧𝐠𝐝𝐨𝐦. ⸸  𝐎𝐧𝐥𝐲 𝐭𝐡𝐞 𝐰𝐨𝐫𝐭𝐡𝐲 𝐞𝐧𝐭𝐞𝐫 𝐭𝐡𝐞 𝐢𝐧𝐧𝐞𝐫 𝐜𝐢𝐫𝐜𝐥𝐞.👹"
-        )
-        guardian_embed = discord.Embed(
-            description=guardian_text,
-            color=discord.Color.from_rgb(180, 0, 0)
-        )
-        guardian_embed.set_image(url="https://cdn.discordapp.com/banners/1437070336335282258/a_9ee491ae60616f9ff0007b5382f210ca.gif?size=1024")
-        guardian_embed.set_footer(text="𝐇𝐄𝐋𝐋𝐅𝐈𝐑𝐄 𝐂𝐋𝐔𝐁 • Eternal Guardian Defense")
-        try:
-            await message.channel.send(content=guardian_text, embed=guardian_embed)
-        except Exception as e:
-            print(f"[Guardian Response Error] {e}", flush=True)
-        if is_dm:
-            return
+        now = time.time()
+        uid = message.author.id
+
+        # 60s cooldown per user to prevent repeating the message again and again
+        if now - guardian_response_times.get(uid, 0) < 60.0:
+            if is_dm:
+                return
+        else:
+            guardian_response_times[uid] = now
+
+            # Above the banner image
+            content_top = (
+                "🔱 𝐇𝐄𝐋𝐋𝐅𝐈𝐑𝐄 𝐒𝐘𝐒𝐓𝐄𝐌 𝐀𝐂𝐓𝐈𝐕𝐀𝐓𝐄𝐃 🔱\n"
+                " 𖤍𓆰𝐆𝐫𝐞𝐞𝐭𝐢𝐧𝐠𝐬, 𝐌𝐨𝐫𝐭𝐚𝐥. 𝐘𝐨𝐮 𝐡𝐚𝐯𝐞 𝐞𝐧𝐭𝐞𝐫𝐞𝐝 𝐭𝐡𝐞 𝐝𝐨𝐦𝐚𝐢𝐧 𝐨𝐟 𝐇𝐄𝐋𝐋𝐅𝐈𝐑𝐄 𝐂𝐋𝐔𝐁. 👁️⃤ 𝐖𝐡𝐚𝐭 𝐛𝐫𝐢𝐧𝐠𝐬 𝐲𝐨𝐮 𝐡𝐞𝐫𝐞? 𝐂𝐡𝐨𝐨𝐬𝐞 𝐲𝐨𝐮𝐫 𝐩𝐚𝐭𝐡 𝐛𝐞𝐥𝐨𝐰.  ⚔️ 𝐒𝐞𝐫𝐯𝐞𝐫 𝐒𝐮𝐩𝐩𝐨𝐫𝐭 ⚜️ 𝐇𝐄𝐋𝐋𝐅𝐈𝐑𝐄 𝐂𝐨𝐦𝐦𝐮𝐧𝐢𝐭𝐲 ⚜️ 𝐎𝐰𝐧𝐞𝐫 𝐂𝐨𝐧𝐭𝐚𝐜𝐭  𝐓𝐡𝐞 𝐟𝐥𝐚𝐦𝐞𝐬 𝐚𝐫𝐞 𝐰𝐚𝐭𝐜𝐡𝐢𝐧𝐠 𝐲𝐨𝐮.🕯️"
+            )
+
+            # The banner image only (no text on the banner embed)
+            embed_banner = discord.Embed(color=discord.Color.from_rgb(180, 0, 0))
+            embed_banner.set_image(url="https://cdn.discordapp.com/banners/1437070336335282258/a_9ee491ae60616f9ff0007b5382f210ca.gif?size=1024")
+
+            # Below the banner image
+            embed_bottom = discord.Embed(
+                description=(
+                    "🔱 𝐎𝐖𝐍𝐄𝐑 𝐀𝐂𝐂𝐄𝐒𝐒  𝐒𝐞𝐚𝐫𝐜𝐡𝐢𝐧𝐠 𝐟𝐨𝐫 𝐭𝐡𝐞 𝐎𝐯𝐞𝐫𝐥𝐨𝐫𝐝... 🕷️ 𝐓𝐡𝐞 𝐭𝐡𝐫𝐨𝐧𝐞 𝐛𝐞𝐥𝐨𝐧𝐠𝐬 𝐭𝐨 𝐭𝐡𝐞 𝐜𝐫𝐞𝐚𝐭𝐨𝐫 𝐨𝐟 🩸𝐇𝐄𝐋𝐋𝐅𝐈𝐑𝐄 𝐂𝐋𝐔𝐁🩸📩 𝐍𝐞𝐞𝐝 𝐚𝐬𝐬𝐢𝐬𝐭𝐚𝐧𝐜𝐞? 𝐂𝐨𝐧𝐭𝐚𝐜𝐭 𝐭𝐡𝐞 𝐬𝐞𝐫𝐯𝐞𝐫 𝐬𝐭𝐚𝐟𝐟.\n"
+                    "Bot Owner : brok3nnvrdies"
+                ),
+                color=discord.Color.from_rgb(180, 0, 0)
+            )
+
+            try:
+                await message.channel.send(content=content_top, embeds=[embed_banner, embed_bottom])
+            except Exception as e:
+                print(f"[Guardian Response Error] {e}", flush=True)
+
+            if is_dm:
+                return
 
     # ================= AUTOMATED ANTI-SPAM & AUTOMOD SYSTEM =================
     # Members with "monarch" role, extra owners, whitelisted members, or bot admins are exempt from punishment
