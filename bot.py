@@ -1417,7 +1417,7 @@ async def bump_now(interaction: discord.Interaction):
             f"• **Interval**: {interval_mins} minutes\n\n"
             f"*If using Disboard slash commands, run `/bump` in {channel.mention} now!*"
         ),
-        color=discord.Color.nitro_pink()
+        color=discord.Color.from_rgb(255, 115, 250)
     )
     embed.set_footer(text=f"Triggered by {interaction.user.display_name}")
     await channel.send(content=ping_str if ping_str else None, embed=embed)
