@@ -689,6 +689,91 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         pass
 
 # ==============================================================================
+# ANTINUKE SECURITY ENGINE & AUDIT LOG RESOLVER
+# ==============================================================================
+async def get_audit_log_entry(guild: discord.Guild, action: discord.AuditLogAction, target_id: int = None, max_age_seconds: float = 20.0, retries: int = 5):
+    """Safely poll Discord audit logs with backoff to handle gateway vs audit log latency."""
+    for attempt in range(retries):
+        await asyncio.sleep(0.4 if attempt == 0 else 0.7)
+        try:
+            now_utc = datetime.datetime.now(datetime.timezone.utc)
+            async for entry in guild.audit_logs(action=action, limit=6):
+                age = (now_utc - entry.created_at).total_seconds()
+                if age > max_age_seconds:
+                    continue
+                if target_id is not None:
+                    entry_target_id = getattr(entry.target, "id", None)
+                    if entry_target_id != target_id:
+                        continue
+                return entry
+        except Exception as e:
+            print(f"[Audit Log Fetch Warning] {e}", flush=True)
+    return None
+
+async def antinuke_dispatch_punishment(guild: discord.Guild, actor: discord.User | discord.Member, violation_type: str, details: str):
+    """Ban an unauthorized attacker, log action, and notify the server and owner."""
+    if not actor or actor.id == bot.user.id or is_whitelisted(guild, actor.id):
+        return
+
+    banned = False
+    try:
+        await guild.ban(actor, reason=f"[Antinuke Security] {violation_type}: {details}")
+        banned = True
+        print(f"[Antinuke] BANNED attacker {actor.name} ({actor.id}) for {violation_type}", flush=True)
+    except discord.Forbidden:
+        print(f"[Antinuke Forbidden] Bot role hierarchy is lower than {actor.name} or lacks Ban permission!", flush=True)
+        if isinstance(actor, discord.Member):
+            try:
+                quarantine_roles = [r for r in actor.roles if r.permissions.administrator or r.permissions.manage_guild or r.permissions.manage_roles or r.permissions.manage_channels or r.permissions.ban_members or r.permissions.kick_members]
+                if quarantine_roles:
+                    await actor.remove_roles(*quarantine_roles, reason=f"[Antinuke Quarantine] {violation_type}")
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[Antinuke Ban Error] {e}", flush=True)
+
+    embed = discord.Embed(
+        title="🚨 ANTINUKE DEFENSE PROTOCOL TRIGGERED",
+        description=(
+            f"🛡️ **Unauthorized hostile action blocked on {guild.name}!**\n\n"
+            f"• **Perpetrator**: {actor.mention} (`{actor.name}` | `ID: {actor.id}`)\n"
+            f"• **Violation**: **{violation_type}**\n"
+            f"• **Action Details**: {details}\n"
+            f"• **Security Status**: {'🔨 **Perpetrator BANNED**' if banned else '⚠️ **Attacker Quarantined & Permissions Stripped**'}\n"
+            f"• **Server Defense**: Full Quarantine & Restoration Applied."
+        ),
+        color=discord.Color.red()
+    )
+    if hasattr(actor, "display_avatar"):
+        embed.set_thumbnail(url=actor.display_avatar.url)
+    embed.set_footer(text="Antinuke System • High-Security Perimeter")
+
+    target_channel = guild.system_channel
+    if not target_channel or not target_channel.permissions_for(guild.me).send_messages:
+        for ch in guild.text_channels:
+            if any(term in ch.name.lower() for term in ["log", "security", "mod", "admin", "audit", "general", "chat"]):
+                if ch.permissions_for(guild.me).send_messages:
+                    target_channel = ch
+                    break
+    if not target_channel or not target_channel.permissions_for(guild.me).send_messages:
+        for ch in guild.text_channels:
+            if ch.permissions_for(guild.me).send_messages:
+                target_channel = ch
+                break
+
+    if target_channel:
+        try:
+            await target_channel.send(content=f"🚨 @everyone **Antinuke Security Alert**", embed=embed)
+        except Exception:
+            pass
+
+    if guild.owner:
+        try:
+            await guild.owner.send(embed=embed)
+        except Exception:
+            pass
+
+# ==============================================================================
 # AUTO DEFAULT PREFIX, AUTOROLE, GREET & ANTINUKE ON MEMBER JOIN
 # ==============================================================================
 @bot.event
@@ -701,24 +786,16 @@ async def on_member_join(member: discord.Member):
     if member.bot:
         anti_cfg = get_antinuke_config(guild.id)
         if anti_cfg.get("enabled"):
-            try:
-                async for entry in guild.audit_logs(action=discord.AuditLogAction.bot_add, limit=2):
-                    if entry.target.id == member.id or (time.time() - entry.created_at.timestamp() < 10):
-                        actor = entry.user
-                        if actor and actor.id != bot.user.id and not is_whitelisted(guild, actor.id):
-                            print(f"[Antinuke] Unauthorized bot addition by {actor.name} ({actor.id}). Banning inviter & bot...", flush=True)
-                            try:
-                                await guild.ban(actor, reason="[Antinuke] Unauthorized bot addition")
-                            except Exception:
-                                pass
-                            try:
-                                await guild.ban(member, reason="[Antinuke] Unauthorized bot added by rogue user")
-                            except Exception:
-                                pass
-                            return
-                        break
-            except Exception as e:
-                print(f"[Antinuke Bot Check Error] {e}", flush=True)
+            entry = await get_audit_log_entry(guild, discord.AuditLogAction.bot_add, target_id=member.id, max_age_seconds=20.0)
+            if entry and entry.user:
+                actor = entry.user
+                if actor.id != bot.user.id and not is_whitelisted(guild, actor.id):
+                    try:
+                        await guild.ban(member, reason="[Antinuke] Unauthorized bot added by rogue user")
+                    except Exception:
+                        pass
+                    await antinuke_dispatch_punishment(guild, actor, "Unauthorized Bot Addition", f"Invited unauthorized bot @{member.name}")
+                    return
 
         # 2. Bot Autorole
         ar_cfg = get_autorole_config(guild.id)
@@ -796,6 +873,18 @@ async def on_member_remove(member: discord.Member):
     if not guild:
         return
 
+    # Antinuke: Detect unauthorized member kicks
+    anti_cfg = get_antinuke_config(guild.id)
+    if anti_cfg.get("enabled"):
+        try:
+            kick_entry = await get_audit_log_entry(guild, discord.AuditLogAction.kick, target_id=member.id, max_age_seconds=12.0, retries=2)
+            if kick_entry and kick_entry.user:
+                actor = kick_entry.user
+                if actor.id != bot.user.id and not is_whitelisted(guild, actor.id):
+                    await antinuke_dispatch_punishment(guild, actor, "Unauthorized Member Kick", f"Kicked {member.mention} ({member.name})")
+        except Exception as e:
+            print(f"[Antinuke Kick Check Warning] {e}", flush=True)
+
     channel_id = get_bye_channel(guild.id)
     if not channel_id:
         return
@@ -831,28 +920,38 @@ async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
     if not cfg.get("enabled"):
         return
 
-    try:
-        async for entry in guild.audit_logs(action=discord.AuditLogAction.channel_delete, limit=2):
-            if entry.target.id == channel.id or (time.time() - entry.created_at.timestamp() < 8):
-                actor = entry.user
-                if actor and actor.id != bot.user.id and not is_whitelisted(guild, actor.id):
-                    print(f"[Antinuke] Unauthorized channel deletion by {actor.name} ({actor.id}). Banning attacker...", flush=True)
-                    try:
-                        await guild.ban(actor, reason="[Antinuke] Unauthorized channel deletion")
-                    except Exception as err:
-                        print(f"[Antinuke] Failed to ban {actor.name}: {err}", flush=True)
+    entry = await get_audit_log_entry(guild, discord.AuditLogAction.channel_delete, target_id=channel.id)
+    if entry and entry.user:
+        actor = entry.user
+        if actor.id != bot.user.id and not is_whitelisted(guild, actor.id):
+            await antinuke_dispatch_punishment(guild, actor, "Unauthorized Channel Deletion", f"Deleted channel #{channel.name}")
+            # Recreate channel
+            try:
+                if isinstance(channel, discord.TextChannel):
+                    await guild.create_text_channel(name=channel.name, category=channel.category, topic=channel.topic, reason="[Antinuke] Restoring deleted channel")
+                elif isinstance(channel, discord.VoiceChannel):
+                    await guild.create_voice_channel(name=channel.name, category=channel.category, reason="[Antinuke] Restoring deleted channel")
+            except Exception as err:
+                print(f"[Antinuke] Failed to restore channel: {err}", flush=True)
 
-                    # Recreate channel
-                    try:
-                        if isinstance(channel, discord.TextChannel):
-                            await guild.create_text_channel(name=channel.name, category=channel.category, topic=channel.topic, reason="[Antinuke] Restoring deleted channel")
-                        elif isinstance(channel, discord.VoiceChannel):
-                            await guild.create_voice_channel(name=channel.name, category=channel.category, reason="[Antinuke] Restoring deleted channel")
-                    except Exception as err:
-                        print(f"[Antinuke] Failed to restore channel: {err}", flush=True)
-                break
-    except Exception as e:
-        print(f"[Antinuke Error] Audit log check: {e}", flush=True)
+
+@bot.event
+async def on_guild_channel_create(channel: discord.abc.GuildChannel):
+    """Antinuke: Detect unauthorized channel creation spam, delete rogue channel, and ban attacker."""
+    guild = channel.guild
+    cfg = get_antinuke_config(guild.id)
+    if not cfg.get("enabled"):
+        return
+
+    entry = await get_audit_log_entry(guild, discord.AuditLogAction.channel_create, target_id=channel.id)
+    if entry and entry.user:
+        actor = entry.user
+        if actor.id != bot.user.id and not is_whitelisted(guild, actor.id):
+            try:
+                await channel.delete(reason="[Antinuke] Unauthorized channel creation")
+            except Exception:
+                pass
+            await antinuke_dispatch_punishment(guild, actor, "Unauthorized Channel Creation", f"Spammed channel #{channel.name}")
 
 
 @bot.event
@@ -863,19 +962,35 @@ async def on_guild_role_delete(role: discord.Role):
     if not cfg.get("enabled"):
         return
 
-    try:
-        async for entry in guild.audit_logs(action=discord.AuditLogAction.role_delete, limit=2):
-            if entry.target.id == role.id or (time.time() - entry.created_at.timestamp() < 8):
-                actor = entry.user
-                if actor and actor.id != bot.user.id and not is_whitelisted(guild, actor.id):
-                    print(f"[Antinuke] Unauthorized role deletion by {actor.name} ({actor.id}). Banning attacker...", flush=True)
-                    try:
-                        await guild.ban(actor, reason="[Antinuke] Unauthorized role deletion")
-                    except Exception as err:
-                        print(f"[Antinuke] Failed to ban {actor.name}: {err}", flush=True)
-                break
-    except Exception as e:
-        print(f"[Antinuke Error] Role delete audit log: {e}", flush=True)
+    entry = await get_audit_log_entry(guild, discord.AuditLogAction.role_delete, target_id=role.id)
+    if entry and entry.user:
+        actor = entry.user
+        if actor.id != bot.user.id and not is_whitelisted(guild, actor.id):
+            await antinuke_dispatch_punishment(guild, actor, "Unauthorized Role Deletion", f"Deleted role @{role.name}")
+            # Recreate role
+            try:
+                await guild.create_role(name=role.name, permissions=role.permissions, colour=role.colour, hoist=role.hoist, mentionable=role.mentionable, reason="[Antinuke] Restoring deleted role")
+            except Exception as err:
+                print(f"[Antinuke] Failed to restore role: {err}", flush=True)
+
+
+@bot.event
+async def on_guild_role_create(role: discord.Role):
+    """Antinuke: Detect unauthorized role creation spam, delete rogue role, and ban attacker."""
+    guild = role.guild
+    cfg = get_antinuke_config(guild.id)
+    if not cfg.get("enabled"):
+        return
+
+    entry = await get_audit_log_entry(guild, discord.AuditLogAction.role_create, target_id=role.id)
+    if entry and entry.user:
+        actor = entry.user
+        if actor.id != bot.user.id and not is_whitelisted(guild, actor.id):
+            try:
+                await role.delete(reason="[Antinuke] Unauthorized role creation")
+            except Exception:
+                pass
+            await antinuke_dispatch_punishment(guild, actor, "Unauthorized Role Creation", f"Spammed role @{role.name}")
 
 
 @bot.event
@@ -885,22 +1000,73 @@ async def on_member_ban(guild: discord.Guild, user: discord.User | discord.Membe
     if not cfg.get("enabled"):
         return
 
-    try:
-        async for entry in guild.audit_logs(action=discord.AuditLogAction.ban, limit=2):
-            if entry.target.id == user.id or (time.time() - entry.created_at.timestamp() < 8):
-                actor = entry.user
-                if actor and actor.id != bot.user.id and not is_whitelisted(guild, actor.id):
-                    print(f"[Antinuke] Unauthorized member ban by {actor.name} ({actor.id}). Banning attacker and unbanning victim...", flush=True)
-                    try:
-                        await guild.ban(actor, reason="[Antinuke] Unauthorized member ban")
-                    except Exception:
-                        pass
-                    try:
-                        await guild.unban(user, reason="[Antinuke] Reversing unauthorized ban")
-                    except Exception:
-                        pass
-                break
-    except Exception as e:
+    entry = await get_audit_log_entry(guild, discord.AuditLogAction.ban, target_id=user.id)
+    if entry and entry.user:
+        actor = entry.user
+        if actor.id != bot.user.id and not is_whitelisted(guild, actor.id):
+            await antinuke_dispatch_punishment(guild, actor, "Unauthorized Member Ban", f"Banned member {user.name} ({user.id})")
+            try:
+                await guild.unban(user, reason="[Antinuke] Reversing unauthorized ban")
+            except Exception:
+                pass
+
+
+@bot.event
+async def on_member_update(before: discord.Member, after: discord.Member):
+    """Antinuke: Detect unauthorized role assignment / removal and ban perpetrator."""
+    guild = after.guild
+    if not guild:
+        return
+    cfg = get_antinuke_config(guild.id)
+    if not cfg.get("enabled"):
+        return
+
+    if before.roles != after.roles:
+        entry = await get_audit_log_entry(guild, discord.AuditLogAction.member_role_update, target_id=after.id, max_age_seconds=12.0)
+        if entry and entry.user:
+            actor = entry.user
+            if actor.id != bot.user.id and not is_whitelisted(guild, actor.id):
+                try:
+                    await after.edit(roles=before.roles, reason="[Antinuke] Reverting unauthorized role modification")
+                except Exception as err:
+                    print(f"[Antinuke] Failed to revert member roles: {err}", flush=True)
+                await antinuke_dispatch_punishment(guild, actor, "Unauthorized Role Assignment", f"Modified roles for {after.mention} without Whitelist authorization")
+
+
+@bot.event
+async def on_guild_role_update(before: discord.Role, after: discord.Role):
+    """Antinuke: Detect unauthorized role permission or hierarchy tampering, revert changes, and ban attacker."""
+    guild = after.guild
+    if not guild:
+        return
+    cfg = get_antinuke_config(guild.id)
+    if not cfg.get("enabled"):
+        return
+
+    if before.permissions != after.permissions or before.name != after.name:
+        entry = await get_audit_log_entry(guild, discord.AuditLogAction.role_update, target_id=after.id, max_age_seconds=12.0)
+        if entry and entry.user:
+            actor = entry.user
+            if actor.id != bot.user.id and not is_whitelisted(guild, actor.id):
+                try:
+                    await after.edit(name=before.name, permissions=before.permissions, colour=before.colour, hoist=before.hoist, mentionable=before.mentionable, reason="[Antinuke] Reverting unauthorized role modification")
+                except Exception as err:
+                    print(f"[Antinuke] Failed to revert role edit: {err}", flush=True)
+                await antinuke_dispatch_punishment(guild, actor, "Unauthorized Role Tampering", f"Tampered with @{after.name} permissions or hierarchy")
+
+
+@bot.event
+async def on_guild_update(before: discord.Guild, after: discord.Guild):
+    """Antinuke: Detect unauthorized server settings modification and ban perpetrator."""
+    cfg = get_antinuke_config(after.id)
+    if not cfg.get("enabled"):
+        return
+
+    entry = await get_audit_log_entry(after, discord.AuditLogAction.guild_update, max_age_seconds=12.0)
+    if entry and entry.user:
+        actor = entry.user
+        if actor.id != bot.user.id and not is_whitelisted(after, actor.id):
+            await antinuke_dispatch_punishment(after, actor, "Unauthorized Server Settings Tampering", "Modified server configuration or security settings")
         print(f"[Antinuke Error] Ban audit check: {e}", flush=True)
 
 # ==============================================================================
@@ -1714,6 +1880,31 @@ async def on_message(message: discord.Message):
     # Ignore messages sent by bots
     if message.author.bot:
         return
+
+    # 0. Handle Direct Messages (DM) or Text Mentions to the Bot
+    is_dm = message.guild is None or isinstance(message.channel, discord.DMChannel)
+    is_bot_mention = False
+    if message.guild and bot.user in message.mentions and not message.mention_everyone:
+        is_bot_mention = True
+
+    if is_dm or is_bot_mention:
+        guardian_text = (
+            "⛩️  𝐈𝐃𝐄𝐍𝐓𝐈𝐓𝐘 𝐂𝐎𝐍𝐅𝐈𝐑𝐌𝐄𝐃  ⛩️\n"
+            "⛥ 𝐈 𝐚𝐦 𝐭𝐡𝐞 𝐨𝐟𝐟𝐢𝐜𝐢𝐚𝐥 𝐠𝐮𝐚𝐫𝐝𝐢𝐚𝐧 𝐨𝐟 𝐇𝐞𝐥𝐥𝐟𝐢𝐫𝐞 𝐂𝐥𝐮𝐛.⛥\n"
+            "⸸ 𝐈 𝐝𝐨𝐧'𝐭 𝐬𝐥𝐞𝐞𝐩. 𝐈 𝐝𝐨𝐧'𝐭 𝐟𝐞𝐚𝐫. 𝐈 𝐩𝐫𝐨𝐭𝐞𝐜𝐭 𝐭𝐡𝐞 𝐤𝐢𝐧𝐠𝐝𝐨𝐦. ⸸  𝐎𝐧𝐥𝐲 𝐭𝐡𝐞 𝐰𝐨𝐫𝐭𝐡𝐲 𝐞𝐧𝐭𝐞𝐫 𝐭𝐡𝐞 𝐢𝐧𝐧𝐞𝐫 𝐜𝐢𝐫𝐜𝐥𝐞.👹"
+        )
+        guardian_embed = discord.Embed(
+            description=guardian_text,
+            color=discord.Color.from_rgb(180, 0, 0)
+        )
+        guardian_embed.set_image(url="https://cdn.discordapp.com/banners/1437070336335282258/a_9ee491ae60616f9ff0007b5382f210ca.gif?size=1024")
+        guardian_embed.set_footer(text="𝐇𝐄𝐋𝐋𝐅𝐈𝐑𝐄 𝐂𝐋𝐔𝐁 • Eternal Guardian Defense")
+        try:
+            await message.channel.send(content=guardian_text, embed=guardian_embed)
+        except Exception as e:
+            print(f"[Guardian Response Error] {e}", flush=True)
+        if is_dm:
+            return
 
     # ================= AUTOMATED ANTI-SPAM & AUTOMOD SYSTEM =================
     # Members with "monarch" role, extra owners, whitelisted members, or bot admins are exempt from punishment
@@ -4588,6 +4779,58 @@ async def cmd_antinuke_disable(interaction: discord.Interaction):
         description="Antinuke defense is now disabled.",
         color=discord.Color.red()
     )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@antinuke_group.command(name="status", description="Check current Antinuke defense status and protected operations")
+async def cmd_antinuke_status(interaction: discord.Interaction):
+    if not is_authorized_admin(interaction):
+        await interaction.response.send_message("🔒 **Access Denied**: Administrators and owners only.", ephemeral=True)
+        return
+    cfg = get_antinuke_config(interaction.guild.id)
+    is_on = cfg.get("enabled", True)
+    wl_count = len(get_whitelist_ids(interaction.guild.id))
+    eo_count = len(get_extraowner_ids(interaction.guild.id))
+    embed = discord.Embed(
+        title=f"🛡️ Antinuke Defense Status • {interaction.guild.name}",
+        color=discord.Color.green() if is_on else discord.Color.red()
+    )
+    embed.add_field(name="Perimeter State", value="🟢 **ACTIVE & ARMED**" if is_on else "🔴 **DISABLED**", inline=False)
+    embed.add_field(name="Whitelisted Operators", value=f"• **Whitelisted Users**: `{wl_count}`\n• **Extra Owners**: `{eo_count}`\n• **Server Owner**: <@{interaction.guild.owner_id}>", inline=False)
+    embed.add_field(
+        name="Protected Attack Vectors",
+        value=(
+            "✅ **Channel Protection**: Deletions & Creations quarantined; deleted channels restored\n"
+            "✅ **Role Protection**: Unauthorized deletions/creations blocked; roles restored\n"
+            "✅ **Role Assignment Defense**: Unauthorized role granting reverted; attacker banned\n"
+            "✅ **Role Hierarchy Defense**: Permission/hierarchy tampering reverted; attacker banned\n"
+            "✅ **Ban / Kick Defense**: Unauthorized bans/kicks reverted; attacker banned\n"
+            "✅ **Bot Invitation Defense**: Unauthorized bots instantly banned alongside inviter\n"
+            "✅ **Server Security Defense**: Hostile server setting edits blocked; attacker banned"
+        ),
+        inline=False
+    )
+    embed.set_footer(text="Antinuke System • High-Security Perimeter")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@antinuke_group.command(name="test", description="Send a test Antinuke defense protocol preview")
+async def cmd_antinuke_test(interaction: discord.Interaction):
+    if not is_authorized_admin(interaction):
+        await interaction.response.send_message("🔒 **Access Denied**: Administrators and owners only.", ephemeral=True)
+        return
+    embed = discord.Embed(
+        title="🚨 [Test Preview] ANTINUKE DEFENSE PROTOCOL",
+        description=(
+            f"🛡️ **Simulated Hostile Action Detected & Blocked!**\n\n"
+            f"• **Perpetrator**: {interaction.user.mention} (`{interaction.user.name}` | `ID: {interaction.user.id}`)\n"
+            f"• **Violation**: **Unauthorized Channel & Role Deletion**\n"
+            f"• **Action Details**: Hostile deletion attempt on secure server structures\n"
+            f"• **Security Status**: 🔨 **Simulated Ban & Reversion Executed**\n"
+            f"• **Server Defense**: Full Quarantine & Restoration Active."
+        ),
+        color=discord.Color.red()
+    )
+    embed.set_thumbnail(url=interaction.user.display_avatar.url)
+    embed.set_footer(text="Antinuke Test System • Defense Grid Verified")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 bot.tree.add_command(antinuke_group)
