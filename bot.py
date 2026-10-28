@@ -11,12 +11,23 @@ import struct
 import io
 import datetime
 import threading
+import logging
 from collections import defaultdict, deque
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
 from dotenv import load_dotenv
 from aiohttp import web
+
+# Configure logging for Discord gateway monitoring
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+logging.getLogger("discord.gateway").setLevel(logging.INFO)
+logging.getLogger("discord.client").setLevel(logging.INFO)
+logging.getLogger("discord.http").setLevel(logging.WARNING)
 
 # Initialize Opus for Discord voice connections
 if not discord.opus.is_loaded():
@@ -311,25 +322,52 @@ intents.message_content = True  # Required to read mentions in messages
 intents.members = True          # Required for roles inspection, join dates, and member management
 intents.voice_states = True     # Required for voice channel management (mute, deafen, move)
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(
+    command_prefix="!",
+    intents=intents,
+    heartbeat_timeout=120.0,
+    max_messages=1000
+)
 
-# Optional Web server for cloud health checks
+_commands_synced = False
+
+# Optional Web server for cloud health checks (only runs if PORT is explicitly set)
 async def start_web_server():
+    port_env = os.getenv("PORT")
+    if not port_env:
+        return
+
     async def handle_ping(request):
         return web.Response(text="Discord Bot is active and running!")
 
-    app = web.Application()
-    app.router.add_get("/", handle_ping)
-    app.router.add_get("/health", handle_ping)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.getenv("PORT", 10000))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    print(f"Health-check web server active on port {port}", flush=True)
+    try:
+        app = web.Application()
+        app.router.add_get("/", handle_ping)
+        app.router.add_get("/health", handle_ping)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        port = int(port_env)
+        site = web.TCPSite(runner, "0.0.0.0", port)
+        await site.start()
+        print(f"Health-check web server active on port {port}", flush=True)
+    except Exception as e:
+        print(f"Web server notice: {e}", flush=True)
+
+@bot.event
+async def on_connect():
+    print(f"🟢 [Gateway] Connected to Discord Gateway. Latency: {bot.latency * 1000:.1f}ms", flush=True)
+
+@bot.event
+async def on_disconnect():
+    print("🔴 [Gateway] Disconnected from Discord Gateway! Auto-reconnecting...", flush=True)
+
+@bot.event
+async def on_resumed():
+    print(f"🔄 [Gateway] Session successfully resumed. Latency: {bot.latency * 1000:.1f}ms", flush=True)
 
 @bot.event
 async def on_ready():
+    global _commands_synced
     print("=" * 45, flush=True)
     print(f"Logged in as: {bot.user.name} (ID: {bot.user.id})", flush=True)
     print(f"Connected to {len(bot.guilds)} server(s)", flush=True)
@@ -344,12 +382,14 @@ async def on_ready():
     if not auto_bump_loop.is_running():
         auto_bump_loop.start()
 
-    # Sync slash commands globally across Discord
-    try:
-        synced = await bot.tree.sync()
-        print(f"Successfully synced {len(synced)} slash command(s).", flush=True)
-    except Exception as e:
-        print(f"Failed to sync slash commands: {e}", flush=True)
+    # Sync slash commands once per process lifecycle to prevent hitting Discord rate limits (429)
+    if not _commands_synced:
+        try:
+            synced = await bot.tree.sync()
+            _commands_synced = True
+            print(f"Successfully synced {len(synced)} slash command(s).", flush=True)
+        except Exception as e:
+            print(f"Failed to sync slash commands: {e}", flush=True)
 
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
@@ -1105,6 +1145,10 @@ async def auto_bump_loop():
                 print(f"[Auto-Bump] Sent bump notification in #{channel.name} ({guild.name})", flush=True)
             except Exception as e:
                 print(f"[Auto-Bump] Error sending reminder card: {e}", flush=True)
+
+@auto_bump_loop.before_loop
+async def before_auto_bump_loop():
+    await bot.wait_until_ready()
 
 
 # ==============================================================================
@@ -3496,7 +3540,7 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
         return
 
     cfg = load_follow_config()
-    if not cfg.get("enabled", True):
+    if not cfg.get("enabled", False):
         return
 
     followed_ids = set(cfg.get("followed_user_ids", []))
@@ -3617,7 +3661,7 @@ async def main():
         except Exception as e:
             print(f"Web server warning: {e}", flush=True)
     async with bot:
-        await bot.start(TOKEN)
+        await bot.start(TOKEN, reconnect=True)
 
 if __name__ == "__main__":
     print("=== Discord Bot Process Starting ===", flush=True)

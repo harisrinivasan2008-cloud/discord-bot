@@ -1,9 +1,31 @@
 {
   "1555671020764004352": {
-    "default_prefix": "CC"
+    "default_prefix": "CC",
+    "bye_channel_id": 1564372869369176154,
+    "bump": {
+      "enabled": true,
+      "channel_id": 1561396840413536337,
+      "interval_minutes": 120,
+      "bump_text": "/bump",
+      "ping_role_id": null,
+      "next_bump_timestamp": 1793209086.054658
+    }
   },
   "1437070336335282258": {
-    "default_prefix": "\ud835\udc07\ud835\udc05\ud835\udc02"
+    "default_prefix": "\ud835\udc07\ud835\udc05\ud835\udc02",
+    "bump": {
+      "enabled": true,
+      "channel_id": 1553995280196837427,
+      "interval_minutes": 120,
+      "bump_text": "/bump",
+      "ping_role_id": null,
+      "next_bump_timestamp": 1793209436.0093842
+    },
+    "admin_ids": [
+      766916252828172308,
+      1379455262708203550
+    ],
+    "bye_channel_id": 1470105111404482670
   },
   "1070279574761517087": {
     "default_prefix": "\ud835\ude3c\ud835\ude42\ud835\ude4a"
