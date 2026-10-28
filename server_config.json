@@ -8,10 +8,10 @@
       "interval_minutes": 120,
       "bump_text": "/bump",
       "ping_role_id": null,
-      "next_bump_timestamp": 1793209086.054658
+      "next_bump_timestamp": 1793216305.5990188
     },
     "stay_vc": {
-      "enabled": true,
+      "enabled": false,
       "channel_id": 1555679442716598352
     },
     "extraowner_ids": [
@@ -44,7 +44,7 @@
       "interval_minutes": 120,
       "bump_text": "/bump",
       "ping_role_id": null,
-      "next_bump_timestamp": 1793209436.0093842
+      "next_bump_timestamp": 1793216665.6104138
     },
     "admin_ids": [
       766916252828172308,
@@ -54,7 +54,11 @@
     "extraowner_ids": [
       766916252828172308,
       1379455262708203550
-    ]
+    ],
+    "stay_vc": {
+      "enabled": true,
+      "channel_id": 1553986891760664636
+    }
   },
   "1070279574761517087": {
     "default_prefix": "\ud835\ude3c\ud835\ude42\ud835\ude4a"
