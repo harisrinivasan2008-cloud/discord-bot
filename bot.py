@@ -2265,11 +2265,13 @@ async def role_members(interaction: discord.Interaction, role: discord.Role):
         await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
         return
 
+    await interaction.response.defer()
+
     members = role.members
     total = len(members)
 
     if total == 0:
-        await interaction.response.send_message(f"ℹ️ No members currently have the **{role.name}** role.", ephemeral=True)
+        await interaction.followup.send(f"ℹ️ No members currently have the **{role.name}** role.", ephemeral=True)
         return
 
     pct = (total / max(1, guild.member_count)) * 100
@@ -2294,7 +2296,7 @@ async def role_members(interaction: discord.Interaction, role: discord.Role):
     else:
         embed.set_footer(text=f"Total members: {total}")
 
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 
 # ==============================================================================
@@ -4585,11 +4587,16 @@ async def cmd_follow(
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+_web_server_initialized = False
+
 async def main():
-    try:
-        await start_web_server()
-    except Exception:
-        pass
+    global _web_server_initialized
+    if not _web_server_initialized:
+        try:
+            await start_web_server()
+            _web_server_initialized = True
+        except Exception as e:
+            print(f"Web server warning: {e}", flush=True)
     async with bot:
         await bot.start(TOKEN)
 
@@ -4602,20 +4609,25 @@ if __name__ == "__main__":
 
     print(f"DISCORD_TOKEN loaded successfully ({len(TOKEN)} characters).", flush=True)
 
-    try:
-        asyncio.run(main())
-    except discord.errors.PrivilegedIntentsRequired:
-        print("\n" + "!" * 60, flush=True)
-        print("CRITICAL ERROR: Privileged Gateway Intents are NOT enabled!", flush=True)
-        print("Enable 'Server Members Intent' and 'Message Content Intent' in Discord Dev Portal.", flush=True)
-        print("!" * 60 + "\n", flush=True)
-        sys.exit(1)
-    except discord.errors.LoginFailure:
-        print("\n" + "!" * 60, flush=True)
-        print("CRITICAL ERROR: Invalid Discord Bot Token!", flush=True)
-        print("!" * 60 + "\n", flush=True)
-        sys.exit(1)
-    except Exception as e:
-        print(f"CRITICAL ERROR while running bot: {e}", flush=True)
-        traceback.print_exc()
-        sys.exit(1)
+    retry_delay = 5
+    while True:
+        try:
+            asyncio.run(main())
+        except (KeyboardInterrupt, SystemExit):
+            print("\nBot process terminated.", flush=True)
+            break
+        except discord.errors.PrivilegedIntentsRequired:
+            print("\n" + "!" * 60, flush=True)
+            print("CRITICAL ERROR: Privileged Gateway Intents are NOT enabled!", flush=True)
+            print("Enable 'Server Members Intent' and 'Message Content Intent' in Discord Dev Portal.", flush=True)
+            print("!" * 60 + "\n", flush=True)
+            sys.exit(1)
+        except discord.errors.LoginFailure:
+            print("\n" + "!" * 60, flush=True)
+            print("CRITICAL ERROR: Invalid Discord Bot Token!", flush=True)
+            print("!" * 60 + "\n", flush=True)
+            sys.exit(1)
+        except Exception as e:
+            print(f"[Auto-Reconnect] Connection lost/interrupted: {e}. Reconnecting in {int(retry_delay)}s...", flush=True)
+            time.sleep(retry_delay)
+            retry_delay = min(retry_delay * 1.5, 30)
