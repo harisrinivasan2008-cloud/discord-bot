@@ -3531,6 +3531,8 @@ async def cmd_follow(
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+_web_server_initialized = False
+
 async def main():
     global _web_server_initialized
     if not _web_server_initialized:
