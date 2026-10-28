@@ -1068,6 +1068,27 @@ async def auto_bump_loop():
                 print(f"[Auto-Bump] Error sending reminder card: {e}", flush=True)
 
 
+# ==============================================================================
+# SNIPE & DELETED MESSAGES CACHE (Last 20 per channel)
+# ==============================================================================
+deleted_messages_cache = defaultdict(lambda: deque(maxlen=20))
+
+@bot.event
+async def on_message_delete(message: discord.Message):
+    if not message.guild or message.author.bot:
+        return
+    deleted_messages_cache[message.channel.id].appendleft({
+        "author_id": message.author.id,
+        "author_name": message.author.display_name,
+        "author_avatar": message.author.display_avatar.url,
+        "author_mention": message.author.mention,
+        "content": message.content or "*[No text content]*",
+        "created_at": int(message.created_at.timestamp()) if message.created_at else None,
+        "deleted_at": int(time.time()),
+        "attachments": [a.url for a in message.attachments if a.url]
+    })
+
+
 @bot.event
 async def on_message(message: discord.Message):
     # Detect bump confirmation or cooldown messages from Bump Bots (Disboard, Olympus, etc.)
@@ -1853,24 +1874,101 @@ async def show_info(interaction: discord.Interaction, member: discord.Member = N
     await interaction.response.send_message(embed=embed)
 
 # ==============================================================================
-# 5. AVATAR COMMAND
+# 5. AVATAR & BANNER COMMANDS (User & Server)
 # ==============================================================================
-@bot.tree.command(name="avatar", description="Display a member's avatar in full size")
-@app_commands.describe(member="The member whose avatar you want to view (defaults to yourself)")
+@bot.tree.command(name="avatar", description="Display a member's avatar or the server's icon in full resolution")
+@app_commands.describe(
+    member="The member whose avatar you want to view (defaults to yourself)",
+    server_icon="Set to True to view this server's icon instead of a user avatar"
+)
 @check_bot_admin()
-async def avatar(interaction: discord.Interaction, member: discord.Member = None):
+async def avatar(interaction: discord.Interaction, member: discord.Member = None, server_icon: bool = False):
+    if server_icon:
+        guild = interaction.guild
+        if not guild or not guild.icon:
+            await interaction.response.send_message("❌ This server does not have an icon set.", ephemeral=True)
+            return
+        icon_url = guild.icon.url
+        embed = discord.Embed(
+            title=f"🏛️ Server Icon • {guild.name}",
+            color=discord.Color.blurple()
+        )
+        embed.set_image(url=icon_url)
+        embed.add_field(name="Direct Link", value=f"[Open in Browser]({icon_url})", inline=False)
+        embed.set_footer(text=f"Requested by {interaction.user.display_name}")
+        await interaction.response.send_message(embed=embed)
+        return
+
     target = member or interaction.user
     avatar_url = target.display_avatar.url
-
     embed = discord.Embed(
         title=f"🖼️ Avatar of {target.display_name}",
         color=target.color if target.color.value != 0 else discord.Color.blue()
     )
     embed.set_image(url=avatar_url)
-    embed.add_field(name="Direct Link", value=f"[Open in Browser]({avatar_url})", inline=False)
-    embed.set_footer(text=f"Requested by {interaction.user.display_name}")
 
+    links = [f"[Display Avatar]({avatar_url})"]
+    if getattr(target, "guild_avatar", None):
+        links.append(f"[Server Avatar]({target.guild_avatar.url})")
+    if getattr(target, "avatar", None):
+        links.append(f"[Global Avatar]({target.avatar.url})")
+
+    embed.add_field(name="Direct Links", value=" • ".join(links), inline=False)
+    embed.set_footer(text=f"Requested by {interaction.user.display_name}")
     await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="banner", description="Display a user's banner or the server's banner in full resolution")
+@app_commands.describe(
+    member="The member whose banner you want to view (defaults to yourself)",
+    server_banner="Set to True to view this server's banner instead of a user banner"
+)
+@check_bot_admin()
+async def banner(interaction: discord.Interaction, member: discord.Member = None, server_banner: bool = False):
+    if server_banner:
+        guild = interaction.guild
+        if not guild or not guild.banner:
+            await interaction.response.send_message("❌ This server does not have a banner set.", ephemeral=True)
+            return
+        banner_url = guild.banner.url
+        embed = discord.Embed(
+            title=f"🚩 Server Banner • {guild.name}",
+            color=discord.Color.blurple()
+        )
+        embed.set_image(url=banner_url)
+        embed.add_field(name="Direct Link", value=f"[Open in Browser]({banner_url})", inline=False)
+        embed.set_footer(text=f"Requested by {interaction.user.display_name}")
+        await interaction.response.send_message(embed=embed)
+        return
+
+    target = member or interaction.user
+    await interaction.response.defer()
+    try:
+        user = await bot.fetch_user(target.id)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Failed to fetch user profile: {e}", ephemeral=True)
+        return
+
+    if not user.banner:
+        color_info = f"Hex: `#{user.accent_color.value:06x}`" if user.accent_color else "No custom banner or accent color."
+        embed = discord.Embed(
+            title=f"🎨 Profile Banner • {target.display_name}",
+            description=f"**{target.display_name}** does not have an image banner set.\n• **Accent Color**: {color_info}",
+            color=user.accent_color or discord.Color.blue()
+        )
+        embed.set_thumbnail(url=target.display_avatar.url)
+        await interaction.followup.send(embed=embed)
+        return
+
+    banner_url = user.banner.url
+    embed = discord.Embed(
+        title=f"🚩 Banner of {target.display_name}",
+        color=user.accent_color or discord.Color.blue()
+    )
+    embed.set_image(url=banner_url)
+    embed.add_field(name="Direct Link", value=f"[Open in Browser]({banner_url})", inline=False)
+    embed.set_footer(text=f"Requested by {interaction.user.display_name}")
+    await interaction.followup.send(embed=embed)
 
 # ==============================================================================
 # 6. SPAM MESSAGES COMMAND (/spam)
@@ -2017,6 +2115,228 @@ async def clear_messages(
         await send_clear_reply(f"❌ Failed to delete messages: {e}")
     except Exception as e:
         await send_clear_reply(f"❌ Unexpected error while deleting messages: {e}")
+
+
+# ==============================================================================
+# UNBAN & BANLIST COMMANDS (/unban, /banlist)
+# ==============================================================================
+@bot.tree.command(name="unban", description="Unban a user from this server using their Discord user ID")
+@app_commands.describe(
+    user_id="The Discord user ID of the banned user (e.g. 123456789012345678)",
+    reason="Optional reason for unbanning"
+)
+@check_bot_admin()
+async def unban_user(interaction: discord.Interaction, user_id: str, reason: str = "Unbanned by moderator"):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
+        return
+
+    clean_id = re.sub(r"\D", "", user_id.strip())
+    if not clean_id:
+        await interaction.response.send_message("❌ Please provide a valid numeric user ID.", ephemeral=True)
+        return
+
+    target_id = int(clean_id)
+    await interaction.response.defer()
+
+    try:
+        user = await bot.fetch_user(target_id)
+    except Exception:
+        user = discord.Object(id=target_id)
+
+    try:
+        await guild.unban(user, reason=f"{reason} (Moderator: {interaction.user.display_name})")
+        user_name = getattr(user, "name", f"User ID `{target_id}`")
+        embed = discord.Embed(
+            title="🔓 User Successfully Unbanned",
+            description=f"**{user_name}** (`{target_id}`) has been unbanned from **{guild.name}**.",
+            color=discord.Color.green()
+        )
+        embed.add_field(name="Responsible Moderator", value=interaction.user.mention, inline=True)
+        embed.add_field(name="Reason", value=reason, inline=False)
+        await interaction.followup.send(embed=embed)
+    except discord.NotFound:
+        await interaction.followup.send(f"❌ User with ID `{target_id}` is not banned in this server.", ephemeral=True)
+    except discord.Forbidden:
+        await interaction.followup.send("❌ Missing Permissions: The bot requires the **Ban Members** permission to unban users.", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Failed to unban user: {e}", ephemeral=True)
+
+
+@bot.tree.command(name="banlist", description="List all users currently banned from this server")
+@app_commands.describe(limit="Maximum number of bans to display (1 to 100, default: 25)")
+@check_bot_admin()
+async def list_bans(interaction: discord.Interaction, limit: int = 25):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+    try:
+        bans = [entry async for entry in guild.bans(limit=limit)]
+    except discord.Forbidden:
+        await interaction.followup.send("❌ Missing Permissions: The bot requires the **Ban Members** permission to view the audit ban list.", ephemeral=True)
+        return
+    except Exception as e:
+        await interaction.followup.send(f"❌ Failed to fetch ban list: {e}", ephemeral=True)
+        return
+
+    if not bans:
+        await interaction.followup.send("🛡️ There are currently **no banned users** in this server.")
+        return
+
+    lines = []
+    for i, ban in enumerate(bans, 1):
+        reason = ban.reason or "*No reason provided*"
+        if len(reason) > 40:
+            reason = reason[:37] + "..."
+        lines.append(f"`{i}.` **{ban.user.name}** (`{ban.user.id}`) — *{reason}*")
+
+    embed = discord.Embed(
+        title=f"🔨 Banned Users in {guild.name}",
+        description=f"Showing **{len(bans)}** banned user(s):\n\n" + "\n".join(lines[:25]),
+        color=discord.Color.red()
+    )
+    if len(bans) > 25:
+        embed.set_footer(text=f"Truncated. {len(bans) - 25} more bans not shown.")
+    else:
+        embed.set_footer(text=f"Total listed: {len(bans)}")
+
+    await interaction.followup.send(embed=embed)
+
+
+# ==============================================================================
+# UNTIMEOUT COMMAND (/untimeout)
+# ==============================================================================
+@bot.tree.command(name="untimeout", description="Remove timeout from a timed-out member")
+@app_commands.describe(
+    member="The member whose timeout you want to remove",
+    reason="Optional reason for removing the timeout"
+)
+@check_bot_admin()
+async def untimeout_member(interaction: discord.Interaction, member: discord.Member, reason: str = "Timeout removed by moderator"):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
+        return
+
+    if not member.is_timed_out():
+        await interaction.response.send_message(f"ℹ️ {member.mention} is not currently timed out.", ephemeral=True)
+        return
+
+    try:
+        await member.timeout(None, reason=f"{reason} (Moderator: {interaction.user.display_name})")
+        embed = discord.Embed(
+            title="🔊 Timeout Removed",
+            description=f"Timeout has been removed for **{member.display_name}** ({member.mention})!",
+            color=discord.Color.green()
+        )
+        embed.set_thumbnail(url=member.display_avatar.url)
+        embed.add_field(name="Moderator", value=interaction.user.mention, inline=True)
+        embed.add_field(name="Reason", value=reason, inline=False)
+        await interaction.response.send_message(embed=embed)
+    except discord.Forbidden:
+        await interaction.response.send_message("❌ Missing Permissions: The bot needs the **Moderate Members** permission and a role higher than the target.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Failed to remove timeout: {e}", ephemeral=True)
+
+
+# ==============================================================================
+# ROLE MEMBERS COMMAND (/rolemembers)
+# ==============================================================================
+@bot.tree.command(name="rolemembers", description="List all server members who have a specific role")
+@app_commands.describe(role="The role whose members you want to list")
+@check_bot_admin()
+async def role_members(interaction: discord.Interaction, role: discord.Role):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
+        return
+
+    members = role.members
+    total = len(members)
+
+    if total == 0:
+        await interaction.response.send_message(f"ℹ️ No members currently have the **{role.name}** role.", ephemeral=True)
+        return
+
+    pct = (total / max(1, guild.member_count)) * 100
+    embed = discord.Embed(
+        title=f"👥 Members with {role.name}",
+        description=f"Total: **{total}** member(s) ({pct:.1f}% of server)\nRole Color: `#{role.color.value:06x}`\n\n",
+        color=role.color if role.color.value != 0 else discord.Color.blue()
+    )
+
+    lines = []
+    for i, m in enumerate(members[:60], 1):
+        nick_str = f" (**{m.nick}**)" if m.nick else ""
+        lines.append(f"`{i}.` {m.mention}{nick_str} • `{m.name}`")
+
+    content_str = "\n".join(lines)
+    if len(content_str) > 3800:
+        content_str = content_str[:3750] + "\n*... [List truncated due to size]*"
+
+    embed.description += content_str
+    if total > 60:
+        embed.set_footer(text=f"Showing first 60 of {total} members.")
+    else:
+        embed.set_footer(text=f"Total members: {total}")
+
+    await interaction.response.send_message(embed=embed)
+
+
+# ==============================================================================
+# SNIPE COMMAND — Show recently deleted messages (/snipe)
+# ==============================================================================
+@bot.tree.command(name="snipe", description="Display recently deleted messages in this or a targeted channel")
+@app_commands.describe(
+    channel="The channel to inspect (defaults to current channel)",
+    index="Which deleted message to view (1 = most recent, 2 = 2nd most recent, up to 10)"
+)
+@check_bot_admin()
+async def snipe_message(interaction: discord.Interaction, channel: discord.TextChannel = None, index: int = 1):
+    target_channel = channel or interaction.channel
+    if not isinstance(target_channel, discord.TextChannel):
+        await interaction.response.send_message("❌ Please select a valid text channel.", ephemeral=True)
+        return
+
+    channel_msgs = deleted_messages_cache.get(target_channel.id)
+    if not channel_msgs or len(channel_msgs) == 0:
+        await interaction.response.send_message(f"🔍 No recently deleted messages found in {target_channel.mention}.", ephemeral=True)
+        return
+
+    if index < 1 or index > len(channel_msgs):
+        await interaction.response.send_message(f"❌ Index must be between 1 and {len(channel_msgs)} (available deleted messages in this channel).", ephemeral=True)
+        return
+
+    entry = channel_msgs[index - 1]
+
+    embed = discord.Embed(
+        title="🗑️ Recently Deleted Message",
+        description=f"> {entry['content']}",
+        color=discord.Color.dark_red()
+    )
+    embed.set_author(name=entry["author_name"], icon_url=entry["author_avatar"])
+    embed.add_field(name="👤 Author", value=f"{entry['author_mention']} (`{entry['author_id']}`)", inline=True)
+    embed.add_field(name="📍 Channel", value=target_channel.mention, inline=True)
+
+    time_str = f"<t:{entry['deleted_at']}:R>"
+    if entry.get("created_at"):
+        time_str += f"\n*Sent: <t:{entry['created_at']}:R>*"
+    embed.add_field(name="🕒 Deleted At", value=time_str, inline=False)
+
+    if entry.get("attachments"):
+        attach_links = [f"[Attachment {i+1}]({u})" for i, u in enumerate(entry["attachments"])]
+        embed.add_field(name="📎 Attachments", value=" • ".join(attach_links), inline=False)
+        for u in entry["attachments"]:
+            if any(u.lower().endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".gif", ".webp"]):
+                embed.set_image(url=u)
+                break
+
+    embed.set_footer(text=f"Deleted Message {index}/{len(channel_msgs)} • Snipe System")
+    await interaction.response.send_message(embed=embed)
 
 # ==============================================================================
 # BYE — Automatic Farewell Card System (/bye, /byestatus, /byedisable)
