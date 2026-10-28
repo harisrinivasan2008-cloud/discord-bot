@@ -34,6 +34,13 @@
       "banner_url": "https://cdn.discordapp.com/banners/1437070336335282258/a_9ee491ae60616f9ff0007b5382f210ca.gif?size=1024",
       "message": "Welcoming You Buddy",
       "template": 1
+    },
+    "automod": {
+      "enabled": true,
+      "channels": []
+    },
+    "antinuke": {
+      "enabled": true
     }
   },
   "1437070336335282258": {
@@ -44,11 +51,14 @@
       "interval_minutes": 120,
       "bump_text": "/bump",
       "ping_role_id": null,
-      "next_bump_timestamp": 1793216665.6104138
+      "next_bump_timestamp": 1793217395.5984843
     },
     "admin_ids": [
       766916252828172308,
-      1379455262708203550
+      1058003050641490000,
+      1361181185660686346,
+      1379455262708203550,
+      1556655815484514337
     ],
     "bye_channel_id": 1470105111404482670,
     "extraowner_ids": [
@@ -58,6 +68,14 @@
     "stay_vc": {
       "enabled": true,
       "channel_id": 1553986891760664636
+    },
+    "automod": {
+      "enabled": true,
+      "channels": []
+    },
+    "autorole": {
+      "human_role_id": 1547583132062973983,
+      "bot_role_id": null
     }
   },
   "1070279574761517087": {

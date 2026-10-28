@@ -284,7 +284,7 @@ def is_whitelisted(guild: discord.Guild, user_id: int) -> bool:
 # ==============================================================================
 def get_automod_config(guild_id: int) -> dict:
     config = load_server_config()
-    return config.get(str(guild_id), {}).get("automod", {"enabled": False, "channels": []})
+    return config.get(str(guild_id), {}).get("automod", {"enabled": True, "channels": []})
 
 def set_automod_config(guild_id: int, automod_cfg: dict):
     config = load_server_config()
@@ -553,7 +553,7 @@ def check_bot_admin():
         return False
     return app_commands.check(predicate)
 
-def is_spam_exempt(member: discord.Member) -> bool:
+def is_automod_exempt(member: discord.Member) -> bool:
     if not isinstance(member, discord.Member):
         return False
 
@@ -566,22 +566,10 @@ def is_spam_exempt(member: discord.Member) -> bool:
         if role.name.lower() == "monarch":
             return True
 
-    # 3. Members with the Server Tag / Prefix in their name or nickname
-    if member.guild:
-        server_prefix = get_default_prefix(member.guild.id)
-        if server_prefix:
-            tag_raw = server_prefix.strip().lower()
-            tag_clean = tag_raw.strip("[](){}<>|# ").lower()
-
-            display_name = member.display_name.lower()
-            user_name = member.name.lower()
-
-            if tag_raw and (tag_raw in display_name or tag_raw in user_name):
-                return True
-            if tag_clean and (tag_clean in display_name or tag_clean in user_name):
-                return True
-
     return False
+
+def is_spam_exempt(member: discord.Member) -> bool:
+    return is_automod_exempt(member)
 
 
 # Helper function to get list of target user IDs (supports comma or space separated)
@@ -1728,49 +1716,118 @@ async def on_message(message: discord.Message):
         return
 
     # ================= AUTOMATED ANTI-SPAM & AUTOMOD SYSTEM =================
-    # Members with the server tag, "monarch" role, extra owners, whitelisted members, or bot admins are 100% exempt
-    if message.guild and isinstance(message.author, discord.Member) and not is_spam_exempt(message.author):
-        # 1. Automod Enforcement (Invite links, mass mentions, emoji floods -> Delete & 5m Timeout)
+    # Members with "monarch" role, extra owners, whitelisted members, or bot admins are exempt from punishment
+    if message.guild and isinstance(message.author, discord.Member):
         automod_cfg = get_automod_config(message.guild.id)
         if automod_cfg.get("enabled"):
             target_channels = automod_cfg.get("channels", [])
             if not target_channels or message.channel.id in target_channels:
+                is_exempt = is_automod_exempt(message.author)
                 automod_violation = None
+                timeout_mins = 0
 
-                # Check Discord Invite Links
+                # 1. Check Discord Invite Links (Delete invite link; 12m timeout for non-exempt)
                 if re.search(r"(discord\.gg|discord\.com/invite|discordapp\.com/invite)/[a-zA-Z0-9]+", message.content):
-                    automod_violation = "Unauthorized Discord Invite Link"
-                # Check Mass Mentions (5+)
-                elif len(message.mentions) >= 5:
-                    automod_violation = f"Mass Mentions ({len(message.mentions)} users tagged)"
-                # Check Excessive Emojis (10+)
-                elif len(re.findall(r"<a?:\w+:\d+>|[\U00010000-\U0010ffff]", message.content)) >= 10:
-                    automod_violation = "Excessive Emoji Spam (10+ emojis)"
+                    try:
+                        await message.delete()
+                    except Exception:
+                        pass
+                    if is_exempt:
+                        embed = discord.Embed(
+                            title="🛡️ Automod Security Action",
+                            description=f"⚠️ {message.author.mention}, Discord invite links are prohibited.\n*(Message removed. Timeout bypassed for Monarch / Admin / Owner)*",
+                            color=discord.Color.gold()
+                        )
+                        embed.set_footer(text="Automod System • Server Security Defense")
+                        try:
+                            alert = await message.channel.send(content=message.author.mention, embed=embed)
+                            await asyncio.sleep(6)
+                            await alert.delete()
+                        except Exception:
+                            pass
+                        return
+                    else:
+                        automod_violation = "Unauthorized Discord Invite Link"
+                        timeout_mins = 12
 
-                if automod_violation:
+                # For non-exempt members, check other violations
+                elif not is_exempt:
+                    now = time.time()
+                    uid = message.author.id
+
+                    # 2. Check Mass Mentions (4+ users or 3+ roles -> 12 mins)
+                    if len(message.mentions) >= 4 or len(message.role_mentions) >= 3:
+                        automod_violation = f"Mass Mentions ({len(message.mentions)} users tagged)"
+                        timeout_mins = 12
+
+                    # 3. Check Rapid Message Flooding (4+ messages in 4s -> 12 mins)
+                    else:
+                        user_message_times[uid] = [t for t in user_message_times[uid] if now - t < 4.0]
+                        user_message_times[uid].append(now)
+                        if len(user_message_times[uid]) >= 4:
+                            automod_violation = "Rapid Message Flooding (4+ messages in 4s)"
+                            timeout_mins = 12
+                            user_message_times[uid].clear()
+
+                    # 4. Check Excessive Emojis (10+ emojis -> 5 mins)
+                    if not automod_violation and len(re.findall(r"<a?:\w+:\d+>|[\U00010000-\U0010ffff]", message.content)) >= 10:
+                        automod_violation = "Excessive Emoji Spam (10+ emojis)"
+                        timeout_mins = 5
+
+                    # 5. Check Repeated Text Spam (3 identical messages in 10s -> 5 mins)
+                    if not automod_violation:
+                        cleaned_text = message.content.strip().lower()
+                        if len(cleaned_text) > 1:
+                            history = [entry for entry in user_last_messages[uid] if now - entry[1] < 10.0]
+                            history.append((cleaned_text, now))
+                            user_last_messages[uid] = history
+                            if sum(1 for text, _ in history if text == cleaned_text) >= 3:
+                                automod_violation = "Repeated Text Spam (3 identical messages in 10s)"
+                                timeout_mins = 5
+                                user_last_messages[uid].clear()
+
+                if automod_violation and timeout_mins > 0:
                     try:
                         await message.delete()
                     except Exception:
                         pass
                     try:
-                        await message.author.timeout(datetime.timedelta(minutes=5), reason=f"Automod: {automod_violation}")
+                        await message.author.timeout(datetime.timedelta(minutes=timeout_mins), reason=f"Automod: {automod_violation}")
                     except Exception as err:
                         print(f"[Automod Timeout Error] {err}", flush=True)
 
                     embed = discord.Embed(
                         title="🛡️ Automod Security Action",
                         description=(
-                            f"⚠️ {message.author.mention} was **timed out for 5 minutes**.\n\n"
-                            f"• **Reason**: {automod_violation}\n"
-                            f"• **Channel**: {message.channel.mention}"
+                            f"⚠️ {message.author.mention} was **timed out for {timeout_mins} minutes**.\n\n"
+                            f"• **Violation**: {automod_violation}\n"
+                            f"• **Channel**: {message.channel.mention}\n"
+                            f"• **Duration**: `{timeout_mins} Minutes`\n"
+                            f"• **Enforcement**: Immediate Removal & Timeout"
                         ),
                         color=discord.Color.red()
                     )
-                    embed.set_footer(text="Automod System • Server Security Defense")
+                    embed.set_footer(text=f"Automod System • {timeout_mins}m Defense Penalty")
                     try:
                         alert = await message.channel.send(content=message.author.mention, embed=embed)
                         await asyncio.sleep(8)
                         await alert.delete()
+                    except Exception:
+                        pass
+
+                    try:
+                        dm_embed = discord.Embed(
+                            title=f"🛡️ Automod Timeout Notification • {message.guild.name}",
+                            description=(
+                                f"You have been timed out in **{message.guild.name}** for **{timeout_mins} minutes**.\n\n"
+                                f"• **Violation**: {automod_violation}\n"
+                                f"• **Channel**: {message.channel.name}\n"
+                                f"• **Duration**: `{timeout_mins} Minutes`\n\n"
+                                "Please follow server guidelines to avoid further administrative penalties."
+                            ),
+                            color=discord.Color.red()
+                        )
+                        await message.author.send(embed=dm_embed)
                     except Exception:
                         pass
                     return
@@ -2009,6 +2066,16 @@ async def bump_notify(
 
     if interval_minutes < 5:
         await interaction.response.send_message("❌ Interval must be at least 5 minutes.", ephemeral=True)
+        return
+
+    current_bump = get_bump_config(guild.id)
+    if current_bump.get("enabled") and current_bump.get("channel_id") == channel.id and current_bump.get("interval_minutes") == interval_minutes and current_bump.get("ping_role_id") == (ping_role.id if ping_role else None):
+        embed = discord.Embed(
+            title="ℹ️ Bump Status",
+            description=f"⚠️ **Bump notifications are already TURNED ON in {channel.mention}!**",
+            color=discord.Color.gold()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
         return
 
     now = time.time()
@@ -4217,6 +4284,14 @@ async def cmd_whitelist_add(interaction: discord.Interaction, user: discord.Memb
     if not is_server_owner_or_extraowner(interaction.guild, interaction.user.id):
         await interaction.response.send_message("🔒 **Access Denied**: Only the Server Owner and Extra Owners can whitelist members.", ephemeral=True)
         return
+    if is_whitelisted(interaction.guild, user.id):
+        embed = discord.Embed(
+            title="ℹ️ Whitelist Status",
+            description=f"⚠️ **{user.mention} (`{user.name}`) is already TURNED ON in the Whitelist!**",
+            color=discord.Color.gold()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
     add_whitelist_user(interaction.guild.id, user.id)
     embed = discord.Embed(
         title="🛡️ Member Whitelisted",
@@ -4278,6 +4353,14 @@ async def cmd_extraowner_set(interaction: discord.Interaction, user: discord.Mem
     if interaction.user.id != interaction.guild.owner_id and interaction.user.id != BOT_OWNER_ID:
         await interaction.response.send_message("🔒 **Access Denied**: Only the primary Server Owner or Bot Owner can designate Extra Owners.", ephemeral=True)
         return
+    if user.id in get_extraowner_ids(interaction.guild.id):
+        embed = discord.Embed(
+            title="ℹ️ Extra Owner Status",
+            description=f"⚠️ **{user.mention} (`{user.name}`) is already TURNED ON as an Extra Owner!**",
+            color=discord.Color.gold()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
     add_extraowner(interaction.guild.id, user.id)
     embed = discord.Embed(
         title="👑 Extra Owner Appointed",
@@ -4338,13 +4421,26 @@ async def cmd_automod_enable(interaction: discord.Interaction):
     if not is_authorized_admin(interaction):
         await interaction.response.send_message("🔒 **Access Denied**: Administrators and owners only.", ephemeral=True)
         return
+    cfg = get_automod_config(interaction.guild.id)
+    if cfg.get("enabled") and not cfg.get("channels"):
+        embed = discord.Embed(
+            title="ℹ️ Automod Status",
+            description="⚠️ **Automod is already TURNED ON server-wide!**",
+            color=discord.Color.gold()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
     set_automod_config(interaction.guild.id, {"enabled": True, "channels": []})
     embed = discord.Embed(
         title="🛡️ Automod Enabled Server-Wide",
         description=(
             "✅ **Automod is now active across all channels!**\n\n"
-            "• **Filters**: Invite links, mass mentions, rapid message flooding, emoji spam.\n"
-            "• **Punishment**: Immediate message deletion & 5-minute timeout.\n"
+            "• **Filters & Timeouts**:\n"
+            "  - **Discord Invite Links**: 12 Minutes Timeout\n"
+            "  - **Mass Mentions (4+)**: 12 Minutes Timeout\n"
+            "  - **Rapid Message Flooding (4+ in 4s)**: 12 Minutes Timeout\n"
+            "  - **Emoji Spam (10+)**: 5 Minutes Timeout\n"
+            "  - **Repeated Text Spam**: 5 Minutes Timeout\n"
             "• **Exemptions**: Monarch role, Admins, Extra Owners, Server Owner, and Whitelisted members."
         ),
         color=discord.Color.green()
@@ -4358,16 +4454,62 @@ async def cmd_automod_channel(interaction: discord.Interaction, channel: discord
         await interaction.response.send_message("🔒 **Access Denied**: Administrators and owners only.", ephemeral=True)
         return
     cfg = get_automod_config(interaction.guild.id)
-    channels = set(cfg.get("channels", []))
+    existing_channels = cfg.get("channels", [])
+    if cfg.get("enabled") and channel.id in existing_channels:
+        embed = discord.Embed(
+            title="ℹ️ Automod Status",
+            description=f"⚠️ **Automod is already TURNED ON in {channel.mention}!**",
+            color=discord.Color.gold()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+    channels = set(existing_channels)
     channels.add(channel.id)
     cfg["enabled"] = True
     cfg["channels"] = sorted(list(channels))
     set_automod_config(interaction.guild.id, cfg)
     embed = discord.Embed(
         title="🛡️ Automod Channel Enabled",
-        description=f"✅ Automod protection enabled in {channel.mention}.\nAny unauthorized spam or invite links in this channel will trigger a 5-minute timeout.",
+        description=(
+            f"✅ Automod protection enabled in {channel.mention}.\n\n"
+            "• **Timeouts**: 12 mins (Invites, Flooding, Mass Mentions) / 5 mins (Emoji Spam)\n"
+            "• **Exemptions**: Monarch role, Admins, Extra Owners, Server Owner, and Whitelisted members."
+        ),
         color=discord.Color.green()
     )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@automod_group.command(name="test", description="Send a test Automod action preview for a violation type")
+@app_commands.describe(violation="The violation type to test")
+@app_commands.choices(violation=[
+    app_commands.Choice(name="🔗 Discord Invite Link (12m Timeout)", value="invite"),
+    app_commands.Choice(name="📢 Mass Mentions (12m Timeout)", value="mentions"),
+    app_commands.Choice(name="⚡ Rapid Message Flooding (12m Timeout)", value="flood"),
+    app_commands.Choice(name="😀 Excessive Emoji Spam (5m Timeout)", value="emoji")
+])
+async def cmd_automod_test(interaction: discord.Interaction, violation: app_commands.Choice[str]):
+    if not is_authorized_admin(interaction):
+        await interaction.response.send_message("🔒 **Access Denied**: Administrators and owners only.", ephemeral=True)
+        return
+    v_map = {
+        "invite": ("Unauthorized Discord Invite Link", 12),
+        "mentions": ("Mass Mentions (4+ users tagged)", 12),
+        "flood": ("Rapid Message Flooding (4+ messages in 4s)", 12),
+        "emoji": ("Excessive Emoji Spam (10+ emojis)", 5)
+    }
+    v_name, v_mins = v_map.get(violation.value, ("Automod Violation", 5))
+    embed = discord.Embed(
+        title="🛡️ [Test Preview] Automod Security Action",
+        description=(
+            f"⚠️ {interaction.user.mention} would be **timed out for {v_mins} minutes**.\n\n"
+            f"• **Violation**: {v_name}\n"
+            f"• **Channel**: {interaction.channel.mention}\n"
+            f"• **Duration**: `{v_mins} Minutes`\n"
+            f"• **Enforcement**: Immediate Removal & Timeout"
+        ),
+        color=discord.Color.red()
+    )
+    embed.set_footer(text=f"Automod Test System • {v_mins}m Defense Penalty")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @automod_group.command(name="disable", description="Disable Automod on the server")
@@ -4410,6 +4552,15 @@ antinuke_group = app_commands.Group(name="antinuke", description="Antinuke serve
 async def cmd_antinuke_enable(interaction: discord.Interaction):
     if not is_server_owner_or_extraowner(interaction.guild, interaction.user.id):
         await interaction.response.send_message("🔒 **Access Denied**: Only the Server Owner and Extra Owners can enable Antinuke.", ephemeral=True)
+        return
+    cfg = get_antinuke_config(interaction.guild.id)
+    if cfg.get("enabled"):
+        embed = discord.Embed(
+            title="ℹ️ Antinuke Status",
+            description="⚠️ **Antinuke is already TURNED ON on this server!**",
+            color=discord.Color.gold()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
         return
     set_antinuke_config(interaction.guild.id, True)
     embed = discord.Embed(
@@ -4454,6 +4605,14 @@ async def cmd_autorole_add(interaction: discord.Interaction, role: discord.Role)
         await interaction.response.send_message("🔒 **Access Denied**: Bot administrators and owners only.", ephemeral=True)
         return
     cfg = get_autorole_config(interaction.guild.id)
+    if cfg.get("human_role_id") == role.id:
+        embed = discord.Embed(
+            title="ℹ️ Autorole Status",
+            description=f"⚠️ **Human Autorole is already TURNED ON for {role.mention}!**",
+            color=discord.Color.gold()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
     cfg["human_role_id"] = role.id
     set_autorole_config(interaction.guild.id, cfg)
     embed = discord.Embed(
@@ -4486,6 +4645,14 @@ async def cmd_autorole_botadd(interaction: discord.Interaction, role: discord.Ro
         await interaction.response.send_message("🔒 **Access Denied**: Bot administrators and owners only.", ephemeral=True)
         return
     cfg = get_autorole_config(interaction.guild.id)
+    if cfg.get("bot_role_id") == role.id:
+        embed = discord.Embed(
+            title="ℹ️ Autorole Status",
+            description=f"⚠️ **Bot Autorole is already TURNED ON for {role.mention}!**",
+            color=discord.Color.gold()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
     cfg["bot_role_id"] = role.id
     set_autorole_config(interaction.guild.id, cfg)
     embed = discord.Embed(
@@ -4520,9 +4687,17 @@ async def cmd_hideall(interaction: discord.Interaction):
     if not is_server_owner_or_extraowner(interaction.guild, interaction.user.id):
         await interaction.response.send_message("🔒 **Access Denied**: Only the Server Owner and Extra Owners can execute Hide All.", ephemeral=True)
         return
+    guild = interaction.guild
+    if guild.channels and all(ch.overwrites_for(guild.default_role).view_channel is False for ch in guild.channels):
+        embed = discord.Embed(
+            title="ℹ️ Hide Status",
+            description="⚠️ **All channels are already HIDDEN (TURNED ON)!**",
+            color=discord.Color.gold()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
     await interaction.response.defer(ephemeral=True)
     count = 0
-    guild = interaction.guild
     for ch in guild.channels:
         try:
             await ch.set_permissions(guild.default_role, view_channel=False, reason=f"Hide All by {interaction.user}")
@@ -4568,8 +4743,16 @@ async def cmd_lockall(interaction: discord.Interaction):
     if not is_authorized_admin(interaction):
         await interaction.response.send_message("🔒 **Access Denied**: Administrators and owners only.", ephemeral=True)
         return
-    await interaction.response.defer(ephemeral=True)
     guild = interaction.guild
+    if guild.voice_channels and all(vc.overwrites_for(guild.default_role).connect is False for vc in guild.voice_channels):
+        embed = discord.Embed(
+            title="ℹ️ Lock Status",
+            description="⚠️ **All voice channels are already LOCKED (TURNED ON)!**",
+            color=discord.Color.gold()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
     count = 0
     for vc in guild.voice_channels:
         try:
@@ -4622,15 +4805,33 @@ async def cmd_slowmode_enable(interaction: discord.Interaction, seconds: app_com
     if not is_authorized_admin(interaction):
         await interaction.response.send_message("🔒 **Access Denied**: Administrators and owners only.", ephemeral=True)
         return
-    await interaction.response.defer(ephemeral=True)
     if channel:
+        if channel.slowmode_delay == seconds:
+            embed = discord.Embed(
+                title="ℹ️ Slowmode Status",
+                description=f"⚠️ **Slowmode ({seconds}s) is already TURNED ON in {channel.mention}!**",
+                color=discord.Color.gold()
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
         await channel.edit(slowmode_delay=seconds)
         embed = discord.Embed(
             title="⏱️ Slowmode Enabled",
             description=f"✅ Set slowmode to **{seconds}s** in {channel.mention}.",
             color=discord.Color.green()
         )
+        await interaction.followup.send(embed=embed, ephemeral=True)
     else:
+        if interaction.guild.text_channels and all(ch.slowmode_delay == seconds for ch in interaction.guild.text_channels):
+            embed = discord.Embed(
+                title="ℹ️ Slowmode Status",
+                description=f"⚠️ **Server-Wide Slowmode ({seconds}s) is already TURNED ON across all channels!**",
+                color=discord.Color.gold()
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
         count = 0
         for ch in interaction.guild.text_channels:
             try:
@@ -4644,7 +4845,7 @@ async def cmd_slowmode_enable(interaction: discord.Interaction, seconds: app_com
             description=f"✅ Set slowmode to **{seconds}s** across **{count}** text channels in **{interaction.guild.name}**.",
             color=discord.Color.green()
         )
-    await interaction.followup.send(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
 @slowmode_group.command(name="disable", description="Disable slowmode in all channels or a specific channel")
 @app_commands.describe(channel="Channel to disable slowmode on (optional, defaults to all text channels)")
@@ -4751,6 +4952,14 @@ async def cmd_greet_channel(interaction: discord.Interaction, channel: discord.T
         await interaction.response.send_message("🔒 **Access Denied**: Administrators and owners only.", ephemeral=True)
         return
     cfg = get_greet_config(interaction.guild.id)
+    if cfg.get("enabled") and cfg.get("channel_ids") == [channel.id]:
+        embed = discord.Embed(
+            title="ℹ️ Welcome Status",
+            description=f"⚠️ **Welcome cards are already TURNED ON in {channel.mention}!**",
+            color=discord.Color.gold()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
     cfg["enabled"] = True
     cfg["channel_ids"] = [channel.id]
     set_greet_config(interaction.guild.id, cfg)
