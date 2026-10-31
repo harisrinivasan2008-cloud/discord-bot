@@ -6386,8 +6386,10 @@ async def cmd_reactionrole_create(
     emoji6: str = None,
     role6: discord.Role = None
 ):
+    await interaction.response.defer(ephemeral=True)
+
     if not is_server_owner_or_extraowner(interaction.guild, interaction.user.id):
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "🔒 **Access Denied**: Only the Server Owner, Extra Owners, or Supreme Bot Owner can set up reaction roles.",
             ephemeral=True
         )
@@ -6395,7 +6397,7 @@ async def cmd_reactionrole_create(
 
     bot_member = interaction.guild.get_member(bot.user.id)
     if not interaction.guild.me.guild_permissions.manage_roles:
-        await interaction.response.send_message("❌ I need the **Manage Roles** permission to assign reaction roles.", ephemeral=True)
+        await interaction.followup.send("❌ I need the **Manage Roles** permission to assign reaction roles.", ephemeral=True)
         return
 
     pairs = [(emoji1, role1)]
@@ -6407,13 +6409,11 @@ async def cmd_reactionrole_create(
 
     for em, ro in pairs:
         if bot_member and ro >= bot_member.top_role:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"❌ Hierarchy error: My bot role ({bot_member.top_role.name}) must be placed above **{ro.name}** in Server Settings -> Roles.",
                 ephemeral=True
             )
             return
-
-    await interaction.response.defer(ephemeral=True)
 
     role_lines = []
     roles_map = {}
@@ -6436,11 +6436,24 @@ async def cmd_reactionrole_create(
         return
 
     for em, _ in pairs:
+        clean_em = em.strip()
         try:
-            await msg.add_reaction(em.strip())
+            await msg.add_reaction(clean_em)
             await asyncio.sleep(0.3)
         except Exception as e:
-            print(f"[Reaction Role] Warning: could not add reaction {em}: {e}", flush=True)
+            resolved = False
+            custom_match = re.search(r":(\w+):(\d+)>?", clean_em)
+            if custom_match:
+                e_id = int(custom_match.group(2))
+                custom_obj = bot.get_emoji(e_id)
+                if custom_obj:
+                    try:
+                        await msg.add_reaction(custom_obj)
+                        resolved = True
+                    except Exception:
+                        pass
+            if not resolved:
+                print(f"[Reaction Role] Warning: could not add reaction {clean_em}: {e}", flush=True)
 
     rr_config = get_reaction_roles_config(interaction.guild.id)
     rr_config[str(msg.id)] = {
@@ -6467,27 +6480,29 @@ async def cmd_reactionrole_add(
     role: discord.Role,
     channel: discord.TextChannel = None
 ):
+    await interaction.response.defer(ephemeral=True)
+
     if not is_server_owner_or_extraowner(interaction.guild, interaction.user.id):
-        await interaction.response.send_message("🔒 **Access Denied**: Only the Server Owner, Extra Owners, or Supreme Bot Owner can configure reaction roles.", ephemeral=True)
+        await interaction.followup.send("🔒 **Access Denied**: Only the Server Owner, Extra Owners, or Supreme Bot Owner can configure reaction roles.", ephemeral=True)
         return
 
     bot_member = interaction.guild.get_member(bot.user.id)
     if bot_member and role >= bot_member.top_role:
-        await interaction.response.send_message(f"❌ Cannot assign {role.mention}: My bot role must be higher than this role.", ephemeral=True)
+        await interaction.followup.send(f"❌ Cannot assign {role.mention}: My bot role must be higher than this role.", ephemeral=True)
         return
 
     target_channel = channel or interaction.channel
     try:
         msg = await target_channel.fetch_message(int(message_id))
     except Exception:
-        await interaction.response.send_message(f"❌ Could not find message `{message_id}` in {target_channel.mention}.", ephemeral=True)
+        await interaction.followup.send(f"❌ Could not find message `{message_id}` in {target_channel.mention}.", ephemeral=True)
         return
 
     clean_emoji = emoji.strip()
     try:
         await msg.add_reaction(clean_emoji)
     except Exception as e:
-        await interaction.response.send_message(f"❌ Failed to add reaction `{clean_emoji}` to message: {e}", ephemeral=True)
+        await interaction.followup.send(f"❌ Failed to add reaction `{clean_emoji}` to message: {e}", ephemeral=True)
         return
 
     rr_config = get_reaction_roles_config(interaction.guild.id)
@@ -6501,7 +6516,7 @@ async def cmd_reactionrole_add(
     rr_config[msg_key]["roles"][clean_emoji] = role.id
     set_reaction_roles_config(interaction.guild.id, rr_config)
 
-    await interaction.response.send_message(f"✅ Reaction role attached! Reacting with {clean_emoji} on message `{message_id}` will grant {role.mention}.", ephemeral=True)
+    await interaction.followup.send(f"✅ Reaction role attached! Reacting with {clean_emoji} on message `{message_id}` will grant {role.mention}.", ephemeral=True)
 
 @reactionrole_group.command(name="list", description="List all active reaction role panels in this server")
 async def cmd_reactionrole_list(interaction: discord.Interaction):
@@ -6530,14 +6545,16 @@ async def cmd_reactionrole_list(interaction: discord.Interaction):
     emoji="Optional: remove only this specific emoji from the message"
 )
 async def cmd_reactionrole_remove(interaction: discord.Interaction, message_id: str, emoji: str = None):
+    await interaction.response.defer(ephemeral=True)
+
     if not is_server_owner_or_extraowner(interaction.guild, interaction.user.id):
-        await interaction.response.send_message("🔒 **Access Denied**: Only the Server Owner, Extra Owners, or Supreme Bot Owner can remove reaction roles.", ephemeral=True)
+        await interaction.followup.send("🔒 **Access Denied**: Only the Server Owner, Extra Owners, or Supreme Bot Owner can remove reaction roles.", ephemeral=True)
         return
 
     rr_config = get_reaction_roles_config(interaction.guild.id)
     msg_key = str(message_id).strip()
     if msg_key not in rr_config:
-        await interaction.response.send_message(f"❌ Message `{message_id}` is not registered as a reaction role panel.", ephemeral=True)
+        await interaction.followup.send(f"❌ Message `{message_id}` is not registered as a reaction role panel.", ephemeral=True)
         return
 
     if emoji:
@@ -6545,13 +6562,13 @@ async def cmd_reactionrole_remove(interaction: discord.Interaction, message_id: 
         if clean_emoji in rr_config[msg_key].get("roles", {}):
             del rr_config[msg_key]["roles"][clean_emoji]
             set_reaction_roles_config(interaction.guild.id, rr_config)
-            await interaction.response.send_message(f"✅ Removed reaction role for {clean_emoji} from message `{message_id}`.", ephemeral=True)
+            await interaction.followup.send(f"✅ Removed reaction role for {clean_emoji} from message `{message_id}`.", ephemeral=True)
         else:
-            await interaction.response.send_message(f"❌ Emoji `{clean_emoji}` was not registered on message `{message_id}`.", ephemeral=True)
+            await interaction.followup.send(f"❌ Emoji `{clean_emoji}` was not registered on message `{message_id}`.", ephemeral=True)
     else:
         del rr_config[msg_key]
         set_reaction_roles_config(interaction.guild.id, rr_config)
-        await interaction.response.send_message(f"✅ All reaction roles for message `{message_id}` have been deleted.", ephemeral=True)
+        await interaction.followup.send(f"✅ All reaction roles for message `{message_id}` have been deleted.", ephemeral=True)
 
 @bot.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
