@@ -236,6 +236,8 @@ def remove_extraowner(guild_id: int, user_id: int) -> bool:
 def is_server_owner_or_extraowner(guild: discord.Guild, user_id: int) -> bool:
     if user_id == BOT_OWNER_ID:
         return True
+    if bot.owner_id and user_id == bot.owner_id:
+        return True
     if not guild:
         return False
     if guild.owner_id and user_id == guild.owner_id:
@@ -335,6 +337,81 @@ def set_greet_config(guild_id: int, greet_cfg: dict):
         config[g_key] = {}
     config[g_key]["greet"] = greet_cfg
     save_server_config(config)
+
+# ==============================================================================
+# BIRTHDAY, REACTION ROLES & LEVELING CONFIG HELPERS
+# ==============================================================================
+def get_birthday_config(guild_id: int) -> dict:
+    config = load_server_config()
+    return config.get(str(guild_id), {}).get("birthdays", {
+        "enabled": True,
+        "channel_id": None,
+        "input_channel_id": None,
+        "users": {},
+        "last_wished": {}
+    })
+
+def set_birthday_config(guild_id: int, bday_cfg: dict):
+    config = load_server_config()
+    g_key = str(guild_id)
+    if g_key not in config:
+        config[g_key] = {}
+    config[g_key]["birthdays"] = bday_cfg
+    save_server_config(config)
+
+def get_reaction_roles_config(guild_id: int) -> dict:
+    config = load_server_config()
+    return config.get(str(guild_id), {}).get("reaction_roles", {})
+
+def set_reaction_roles_config(guild_id: int, rr_cfg: dict):
+    config = load_server_config()
+    g_key = str(guild_id)
+    if g_key not in config:
+        config[g_key] = {}
+    config[g_key]["reaction_roles"] = rr_cfg
+    save_server_config(config)
+
+def get_leveling_config(guild_id: int) -> dict:
+    config = load_server_config()
+    return config.get(str(guild_id), {}).get("leveling", {
+        "enabled": True,
+        "channel_id": None,
+        "users": {}
+    })
+
+def set_leveling_config(guild_id: int, lvl_cfg: dict):
+    config = load_server_config()
+    g_key = str(guild_id)
+    if g_key not in config:
+        config[g_key] = {}
+    config[g_key]["leveling"] = lvl_cfg
+    save_server_config(config)
+
+def xp_needed_for_level(level: int) -> int:
+    return 100 + (level * 75)
+
+def is_exempt_from_leveling(member: discord.Member) -> bool:
+    if not isinstance(member, discord.Member) or member.bot:
+        return True
+    if member.id == BOT_OWNER_ID:
+        return True
+    if bot.owner_id and member.id == bot.owner_id:
+        return True
+    guild = member.guild
+    if not guild:
+        return True
+    if guild.owner_id and member.id == guild.owner_id:
+        return True
+    if is_server_owner_or_extraowner(guild, member.id):
+        return True
+    if is_user_admin(member.id, guild):
+        return True
+    if member.guild_permissions.administrator:
+        return True
+    return False
+
+# In-memory cooldowns for XP gains (Guild ID -> Member ID -> Timestamp)
+user_xp_cooldowns = defaultdict(dict)
 
 def get_guild_showcase_channels(guild: discord.Guild) -> str:
     if not guild:
@@ -601,6 +678,7 @@ intents = discord.Intents.default()
 intents.message_content = True  # Required to read mentions in messages
 intents.members = True          # Required for roles inspection, join dates, and member management
 intents.voice_states = True     # Required for voice channel management (mute, deafen, move)
+intents.reactions = True        # Required for reaction roles assignment
 
 bot = commands.Bot(
     command_prefix="!",
@@ -663,6 +741,8 @@ async def on_ready():
         auto_bump_loop.start()
     if not stay_vc_watchdog_loop.is_running():
         stay_vc_watchdog_loop.start()
+    if not birthday_check_loop.is_running():
+        birthday_check_loop.start()
 
     # Sync slash commands once per process lifecycle to prevent hitting Discord rate limits (429)
     if not _commands_synced:
@@ -1917,7 +1997,7 @@ async def on_message(message: discord.Message):
             embed_bottom = discord.Embed(
                 description=(
                     "🔱 𝐎𝐖𝐍𝐄𝐑 𝐀𝐂𝐂𝐄𝐒𝐒  𝐒𝐞𝐚𝐫𝐜𝐡𝐢𝐧𝐠 𝐟𝐨𝐫 𝐭𝐡𝐞 𝐎𝐯𝐞𝐫𝐥𝐨𝐫𝐝... 🕷️ 𝐓𝐡𝐞 𝐭𝐡𝐫𝐨𝐧𝐞 𝐛𝐞𝐥𝐨𝐧𝐠𝐬 𝐭𝐨 𝐭𝐡𝐞 𝐜𝐫𝐞𝐚𝐭𝐨𝐫 𝐨𝐟 🩸𝐇𝐄𝐋𝐋𝐅𝐈𝐑𝐄 𝐂𝐋𝐔𝐁🩸📩 𝐍𝐞𝐞𝐝 𝐚𝐬𝐬𝐢𝐬𝐭𝐚𝐧𝐜𝐞? 𝐂𝐨𝐧𝐭𝐚𝐜𝐭 𝐭𝐡𝐞 𝐬𝐞𝐫𝐯𝐞𝐫 𝐬𝐭𝐚𝐟𝐟.\n"
-                    "Bot Owner : brok3nnvrdies"
+                    f"𝐁𝐨𝐭 𝐎𝐰𝐧𝐞𝐫 : <@{BOT_OWNER_ID}>"
                 ),
                 color=discord.Color.from_rgb(180, 0, 0)
             )
@@ -2250,6 +2330,12 @@ async def on_message(message: discord.Message):
                     except discord.HTTPException as e:
                         print(f"Failed to add reaction: {e}", flush=True)
 
+    # Leveling System: Award cute XP to regular server members (not bot admins/owners/extraowners)
+    try:
+        await handle_message_leveling(message)
+    except Exception as lvl_err:
+        print(f"[Leveling Error] {lvl_err}", flush=True)
+
     await bot.process_commands(message)
 
 
@@ -2376,10 +2462,10 @@ async def admin_add(interaction: discord.Interaction, member: discord.Member):
         await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
         return
 
-    # Only Server Owner or Supreme Bot Owner can add admins
-    if interaction.user.id != guild.owner_id and interaction.user.id != BOT_OWNER_ID:
+    # Only Server Owner, Extra Owners, or Supreme Bot Owner can add admins
+    if not is_server_owner_or_extraowner(guild, interaction.user.id):
         await interaction.response.send_message(
-            f"🔒 **Access Denied**: Only the **Server Owner** (<@{guild.owner_id}>) or the **Supreme Bot Owner** can add administrators for this server.",
+            f"🔒 **Access Denied**: Only the **Server Owner**, **Extra Owners**, or the **Supreme Bot Owner** can add administrators for this server.",
             ephemeral=True
         )
         return
@@ -2421,10 +2507,10 @@ async def admin_remove(interaction: discord.Interaction, member: discord.Member)
         await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
         return
 
-    # Only Server Owner or Supreme Bot Owner can remove admins
-    if interaction.user.id != guild.owner_id and interaction.user.id != BOT_OWNER_ID:
+    # Only Server Owner, Extra Owners, or Supreme Bot Owner can remove admins
+    if not is_server_owner_or_extraowner(guild, interaction.user.id):
         await interaction.response.send_message(
-            f"🔒 **Access Denied**: Only the **Server Owner** (<@{guild.owner_id}>) or the **Supreme Bot Owner** can remove administrators for this server.",
+            f"🔒 **Access Denied**: Only the **Server Owner**, **Extra Owners**, or the **Supreme Bot Owner** can remove administrators for this server.",
             ephemeral=True
         )
         return
@@ -2439,6 +2525,13 @@ async def admin_remove(interaction: discord.Interaction, member: discord.Member)
     if member.id == guild.owner_id:
         await interaction.response.send_message(
             "❌ Cannot revoke access from the Server Owner (permanent default administrator for this server).",
+            ephemeral=True
+        )
+        return
+
+    if member.id in get_extraowner_ids(guild.id):
+        await interaction.response.send_message(
+            "❌ Cannot revoke access from an Extra Owner using `/admin remove`. Use `/extraowner remove` instead.",
             ephemeral=True
         )
         return
@@ -4586,8 +4679,8 @@ extraowner_group = app_commands.Group(name="extraowner", description="Server ext
 @extraowner_group.command(name="set", description="Designate a member as an Extra Owner of the server")
 @app_commands.describe(user="The member to designate as an Extra Owner")
 async def cmd_extraowner_set(interaction: discord.Interaction, user: discord.Member):
-    if interaction.user.id != interaction.guild.owner_id and interaction.user.id != BOT_OWNER_ID:
-        await interaction.response.send_message("🔒 **Access Denied**: Only the primary Server Owner or Bot Owner can designate Extra Owners.", ephemeral=True)
+    if not is_server_owner_or_extraowner(interaction.guild, interaction.user.id):
+        await interaction.response.send_message("🔒 **Access Denied**: Only the Server Owner, Extra Owners, or Supreme Bot Owner can designate Extra Owners.", ephemeral=True)
         return
     if user.id in get_extraowner_ids(interaction.guild.id):
         embed = discord.Embed(
@@ -4608,8 +4701,8 @@ async def cmd_extraowner_set(interaction: discord.Interaction, user: discord.Mem
 @extraowner_group.command(name="remove", description="Remove an Extra Owner from the server")
 @app_commands.describe(user="The member to remove from Extra Owners")
 async def cmd_extraowner_remove(interaction: discord.Interaction, user: discord.Member):
-    if interaction.user.id != interaction.guild.owner_id and interaction.user.id != BOT_OWNER_ID:
-        await interaction.response.send_message("🔒 **Access Denied**: Only the primary Server Owner or Bot Owner can remove Extra Owners.", ephemeral=True)
+    if not is_server_owner_or_extraowner(interaction.guild, interaction.user.id):
+        await interaction.response.send_message("🔒 **Access Denied**: Only the Server Owner, Extra Owners, or Supreme Bot Owner can remove Extra Owners.", ephemeral=True)
         return
     removed = remove_extraowner(interaction.guild.id, user.id)
     if removed:
@@ -5485,6 +5578,991 @@ async def cmd_greet_templates(interaction: discord.Interaction):
     await interaction.followup.send(content="**Template 3: Aesthetic Modern Luxe**", embed=t3_embed, ephemeral=True)
 
 bot.tree.add_command(greet_group)
+
+
+# ==============================================================================
+# LEVELING SYSTEM ENGINE (Cute notifications, Member-only XP, /rank, /leaderboard)
+# ==============================================================================
+async def handle_message_leveling(message: discord.Message):
+    if not message.guild or message.author.bot:
+        return
+    if is_exempt_from_leveling(message.author):
+        return
+
+    lvl_cfg = get_leveling_config(message.guild.id)
+    if not lvl_cfg.get("enabled", True):
+        return
+
+    now = time.time()
+    last_time = user_xp_cooldowns[message.guild.id].get(message.author.id, 0)
+    # 45-second cooldown to prevent spamming
+    if now - last_time < 45.0:
+        return
+    user_xp_cooldowns[message.guild.id][message.author.id] = now
+
+    users = lvl_cfg.get("users", {})
+    u_key = str(message.author.id)
+    u_data = users.get(u_key, {"xp": 0, "level": 0, "total_xp": 0})
+
+    current_level = u_data.get("level", 0)
+    current_xp = u_data.get("xp", 0)
+    total_xp = u_data.get("total_xp", 0)
+
+    earned = random.randint(15, 25)
+    current_xp += earned
+    total_xp += earned
+
+    needed = xp_needed_for_level(current_level)
+    leveled_up = False
+
+    while current_xp >= needed:
+        current_xp -= needed
+        current_level += 1
+        needed = xp_needed_for_level(current_level)
+        leveled_up = True
+
+    u_data["xp"] = current_xp
+    u_data["level"] = current_level
+    u_data["total_xp"] = total_xp
+    users[u_key] = u_data
+    lvl_cfg["users"] = users
+    set_leveling_config(message.guild.id, lvl_cfg)
+
+    if leveled_up:
+        cute_phrases = [
+            "🌸 *Level up! You're shining brighter than ever!* ✨",
+            "🧁 *Yaaay! Look at you go, sweetest chatter!* 💖",
+            "🎀 *Ding ding! Super cute milestone unlocked!* 🌷",
+            "🍡 *Squishy sweet progress! Keep glowing bright!* 🌈",
+            "🍓 *Berry amazing job! You leveled up!* 🍰",
+            "⭐ *Sparkle sparkle! You're leveling up so fast!* 🍬"
+        ]
+        phrase = random.choice(cute_phrases)
+
+        # Very cute, small, catchy embed that only mentions the particular user
+        embed = discord.Embed(
+            description=f"✨ **Yay {message.author.mention}!** You just reached **Level {current_level}**! 🌸\n{phrase}",
+            color=discord.Color.from_rgb(255, 182, 193)
+        )
+        if message.author.display_avatar:
+            embed.set_thumbnail(url=message.author.display_avatar.url)
+        embed.set_footer(text=f"Total XP: {total_xp:,} 💖")
+
+        target_ch = message.channel
+        channel_id = lvl_cfg.get("channel_id")
+        if channel_id:
+            dest_ch = message.guild.get_channel(channel_id)
+            if dest_ch and isinstance(dest_ch, discord.TextChannel):
+                target_ch = dest_ch
+
+        try:
+            await target_ch.send(content=message.author.mention, embed=embed)
+        except Exception as e:
+            print(f"[Leveling Send Warning] {e}", flush=True)
+
+
+@bot.tree.command(name="rank", description="Display your or another member's cute rank, level, and XP status")
+@app_commands.describe(member="Member to view (defaults to yourself)")
+async def cmd_rank(interaction: discord.Interaction, member: discord.Member = None):
+    target = member or interaction.user
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("❌ This command must be used in a server.", ephemeral=True)
+        return
+
+    # If member is an owner/extraowner/admin who is exempt from leveling
+    if is_exempt_from_leveling(target):
+        embed = discord.Embed(
+            title="👑 Sovereign Guardian 👑",
+            description=f"✨ {target.mention} is an **Imperial Server Leader / Guardian** and reigns supreme above regular levels! 💖👑",
+            color=discord.Color.gold()
+        )
+        if target.display_avatar:
+            embed.set_thumbnail(url=target.display_avatar.url)
+        await interaction.response.send_message(embed=embed)
+        return
+
+    lvl_cfg = get_leveling_config(guild.id)
+    users = lvl_cfg.get("users", {})
+    u_key = str(target.id)
+    u_data = users.get(u_key, {"xp": 0, "level": 0, "total_xp": 0})
+
+    level = u_data.get("level", 0)
+    current_xp = u_data.get("xp", 0)
+    total_xp = u_data.get("total_xp", 0)
+    needed = xp_needed_for_level(level)
+
+    percent = min(100, int((current_xp / max(1, needed)) * 100))
+    filled = int(percent / 10)
+    bar = "▰" * filled + "▱" * (10 - filled)
+
+    sorted_users = sorted(users.items(), key=lambda x: x[1].get("total_xp", 0), reverse=True)
+    rank_pos = 1
+    for i, (uid, _) in enumerate(sorted_users, 1):
+        if uid == u_key:
+            rank_pos = i
+            break
+    else:
+        rank_pos = len(sorted_users) + 1
+
+    embed = discord.Embed(
+        title="🌸 Cute Level Status 🌸",
+        description=(
+            f"🎀 **Member:** {target.mention}\n"
+            f"👑 **Server Rank:** `#{rank_pos}` of `{max(1, len(sorted_users))}`\n"
+            f"✨ **Level:** `{level}`\n"
+            f"💖 **XP:** `{current_xp} / {needed}` (`{percent}%`)\n"
+            f"`{bar}`\n"
+            f"⭐ **Total XP:** `{total_xp:,}`"
+        ),
+        color=discord.Color.from_rgb(255, 182, 193)
+    )
+    if target.display_avatar:
+        embed.set_thumbnail(url=target.display_avatar.url)
+    embed.set_footer(text="Keep chatting cutie to level up! 🧁✨")
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="leaderboard", description="Display the top ranked chatters in this server")
+async def cmd_leaderboard(interaction: discord.Interaction):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("❌ This command must be used in a server.", ephemeral=True)
+        return
+
+    lvl_cfg = get_leveling_config(guild.id)
+    users = lvl_cfg.get("users", {})
+    if not users:
+        await interaction.response.send_message("🧁 No members have earned XP yet. Start chatting to climb the ranks! ✨", ephemeral=True)
+        return
+
+    sorted_users = sorted(users.items(), key=lambda x: x[1].get("total_xp", 0), reverse=True)[:10]
+
+    lines = []
+    medals = ["🥇", "🥈", "🥉", "🌸", "🌸", "🌸", "🌸", "🌸", "🌸", "🌸"]
+    for i, (uid_str, data) in enumerate(sorted_users):
+        medal = medals[i] if i < len(medals) else "🌸"
+        lvl = data.get("level", 0)
+        txp = data.get("total_xp", 0)
+        lines.append(f"{medal} **#{i+1}** <@{uid_str}> • **Level {lvl}** (`{txp:,}` XP)")
+
+    embed = discord.Embed(
+        title="🏆 Server Chat Leaderboard 🏆",
+        description="\n".join(lines),
+        color=discord.Color.from_rgb(255, 182, 193)
+    )
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+    embed.set_footer(text="Only regular members gain levels • Admins & Owners reign supreme! 👑")
+    await interaction.response.send_message(embed=embed)
+
+
+leveling_group = app_commands.Group(name="leveling", description="Server leveling system management")
+
+@leveling_group.command(name="setup", description="Configure where cute level up announcements are sent")
+@app_commands.describe(channel="Text channel for level up cards (leave empty to send in current chat)")
+async def cmd_leveling_setup(interaction: discord.Interaction, channel: discord.TextChannel = None):
+    if not is_server_owner_or_extraowner(interaction.guild, interaction.user.id):
+        await interaction.response.send_message("🔒 **Access Denied**: Only the Server Owner, Extra Owners, or Supreme Bot Owner can configure leveling.", ephemeral=True)
+        return
+
+    lvl_cfg = get_leveling_config(interaction.guild.id)
+    lvl_cfg["channel_id"] = channel.id if channel else None
+    set_leveling_config(interaction.guild.id, lvl_cfg)
+
+    dest = channel.mention if channel else "the chat where the member leveled up"
+    await interaction.response.send_message(f"✅ Level up announcement channel updated! Cute level cards will be sent to **{dest}**.")
+
+@leveling_group.command(name="toggle", description="Enable or disable the leveling system in this server")
+@app_commands.describe(enabled="True to enable leveling, False to disable")
+async def cmd_leveling_toggle(interaction: discord.Interaction, enabled: bool):
+    if not is_server_owner_or_extraowner(interaction.guild, interaction.user.id):
+        await interaction.response.send_message("🔒 **Access Denied**: Only the Server Owner, Extra Owners, or Supreme Bot Owner can configure leveling.", ephemeral=True)
+        return
+
+    lvl_cfg = get_leveling_config(interaction.guild.id)
+    lvl_cfg["enabled"] = enabled
+    set_leveling_config(interaction.guild.id, lvl_cfg)
+
+    status = "enabled 🌸" if enabled else "disabled ⏸️"
+    await interaction.response.send_message(f"✅ Leveling system is now **{status}** in **{interaction.guild.name}**.")
+
+
+# ==============================================================================
+# BIRTHDAY SYSTEM (/birthday set, /birthday setup, /birthday view, /birthday upcoming)
+# ==============================================================================
+birthday_group = app_commands.Group(name="birthday", description="Birthday celebration and automated wishes system")
+
+MONTH_NAMES = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
+DAYS_IN_MONTH = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+
+@birthday_group.command(name="setup", description="Configure birthday announcement and input channels")
+@app_commands.describe(
+    announcement_channel="The channel where birthday celebrations and wishes will be posted",
+    input_channel="Optional: restrict /birthday set commands to this specific channel"
+)
+async def cmd_birthday_setup(
+    interaction: discord.Interaction,
+    announcement_channel: discord.TextChannel,
+    input_channel: discord.TextChannel = None
+):
+    if not is_server_owner_or_extraowner(interaction.guild, interaction.user.id):
+        await interaction.response.send_message(
+            "🔒 **Access Denied**: Only the Server Owner, Extra Owners, or Supreme Bot Owner can configure the Birthday System channels.",
+            ephemeral=True
+        )
+        return
+
+    bday_cfg = get_birthday_config(interaction.guild.id)
+    bday_cfg["enabled"] = True
+    bday_cfg["channel_id"] = announcement_channel.id
+    bday_cfg["input_channel_id"] = input_channel.id if input_channel else None
+    set_birthday_config(interaction.guild.id, bday_cfg)
+
+    desc = f"🎉 **Birthday Announcement Channel:** {announcement_channel.mention}\n"
+    if input_channel:
+        desc += f"📝 **Birthday Input Channel:** {input_channel.mention} *(Members must register birthdays here)*\n"
+    else:
+        desc += "📝 **Birthday Input Channel:** *Any server channel*\n"
+
+    embed = discord.Embed(
+        title="🎂 Birthday System Configured",
+        description=desc + "\nMembers can now register their special day using `/birthday set`!",
+        color=discord.Color.from_rgb(255, 105, 180)
+    )
+    await interaction.response.send_message(embed=embed)
+
+@birthday_group.command(name="set", description="Register your birthday so the server can celebrate your special day!")
+@app_commands.describe(
+    month="Your birth month (1-12)",
+    day="Your birth day (1-31)",
+    year="Optional: birth year (1920-2026)"
+)
+async def cmd_birthday_set(
+    interaction: discord.Interaction,
+    month: app_commands.Range[int, 1, 12],
+    day: app_commands.Range[int, 1, 31],
+    year: app_commands.Range[int, 1920, 2026] = None
+):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("❌ This command must be used in a server.", ephemeral=True)
+        return
+
+    bday_cfg = get_birthday_config(guild.id)
+    input_ch_id = bday_cfg.get("input_channel_id")
+    if input_ch_id and interaction.channel_id != input_ch_id:
+        if not is_server_owner_or_extraowner(guild, interaction.user.id):
+            await interaction.response.send_message(
+                f"⚠️ Please register your birthday in the designated channel: <#{input_ch_id}>",
+                ephemeral=True
+            )
+            return
+
+    max_days = DAYS_IN_MONTH[month - 1]
+    if day > max_days:
+        await interaction.response.send_message(
+            f"❌ Invalid date: **{MONTH_NAMES[month - 1]}** only has up to **{max_days}** days.",
+            ephemeral=True
+        )
+        return
+
+    users = bday_cfg.get("users", {})
+    users[str(interaction.user.id)] = {
+        "month": month,
+        "day": day,
+        "year": year
+    }
+    bday_cfg["users"] = users
+    set_birthday_config(guild.id, bday_cfg)
+
+    m_name = MONTH_NAMES[month - 1]
+    year_str = f", {year}" if year else ""
+    embed = discord.Embed(
+        title="🎂 Birthday Saved! 🎈",
+        description=f"✨ **{interaction.user.mention}**, your birthday has been saved as **{m_name} {day}{year_str}**!\nWe can't wait to celebrate with you on your special day! 🥳🍰",
+        color=discord.Color.from_rgb(255, 105, 180)
+    )
+    if interaction.user.display_avatar:
+        embed.set_thumbnail(url=interaction.user.display_avatar.url)
+    await interaction.response.send_message(embed=embed)
+
+@birthday_group.command(name="view", description="Check your or another member's registered birthday")
+@app_commands.describe(member="The member whose birthday you want to check (defaults to yourself)")
+async def cmd_birthday_view(interaction: discord.Interaction, member: discord.Member = None):
+    target = member or interaction.user
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("❌ This command must be used in a server.", ephemeral=True)
+        return
+
+    bday_cfg = get_birthday_config(guild.id)
+    users = bday_cfg.get("users", {})
+    u_data = users.get(str(target.id))
+    if not u_data:
+        msg = f"{target.mention} hasn't registered their birthday yet! Use `/birthday set` to save it." if target != interaction.user else "You haven't registered your birthday yet! Use `/birthday set` to register."
+        await interaction.response.send_message(f"🍰 {msg}", ephemeral=True)
+        return
+
+    month = u_data.get("month")
+    day = u_data.get("day")
+    year = u_data.get("year")
+    m_name = MONTH_NAMES[month - 1]
+
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    this_year_bday = datetime.datetime(now_utc.year, month, day, tzinfo=datetime.timezone.utc)
+    if this_year_bday.date() < now_utc.date():
+        next_bday = datetime.datetime(now_utc.year + 1, month, day, tzinfo=datetime.timezone.utc)
+    else:
+        next_bday = this_year_bday
+
+    days_left = (next_bday.date() - now_utc.date()).days
+    if days_left == 0:
+        countdown_str = "🎉 **IT IS TODAY! HAPPY BIRTHDAY!** 🎂🥳"
+    elif days_left == 1:
+        countdown_str = "⏳ **Tomorrow is the big day!** 🎈"
+    else:
+        countdown_str = f"⏳ **{days_left}** days remaining until their special day!"
+
+    embed = discord.Embed(
+        title=f"🎂 {target.display_name}'s Birthday",
+        description=f"🎈 **Date:** **{m_name} {day}**{f' ({year})' if year else ''}\n{countdown_str}",
+        color=discord.Color.from_rgb(255, 105, 180)
+    )
+    if target.display_avatar:
+        embed.set_thumbnail(url=target.display_avatar.url)
+    await interaction.response.send_message(embed=embed)
+
+@birthday_group.command(name="upcoming", description="View upcoming birthdays in this server")
+async def cmd_birthday_upcoming(interaction: discord.Interaction):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("❌ This command must be used in a server.", ephemeral=True)
+        return
+
+    bday_cfg = get_birthday_config(guild.id)
+    users = bday_cfg.get("users", {})
+    if not users:
+        await interaction.response.send_message("🎂 No birthdays registered in this server yet! Use `/birthday set` to add yours.", ephemeral=True)
+        return
+
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    upcoming_list = []
+
+    for uid_str, data in users.items():
+        month = data.get("month")
+        day = data.get("day")
+        if not month or not day:
+            continue
+        try:
+            this_bday = datetime.datetime(now_utc.year, month, day, tzinfo=datetime.timezone.utc)
+            if this_bday.date() < now_utc.date():
+                next_bday = datetime.datetime(now_utc.year + 1, month, day, tzinfo=datetime.timezone.utc)
+            else:
+                next_bday = this_bday
+            days_diff = (next_bday.date() - now_utc.date()).days
+            upcoming_list.append((days_diff, uid_str, month, day))
+        except Exception:
+            continue
+
+    upcoming_list.sort(key=lambda x: x[0])
+    lines = []
+    for days_diff, uid_str, m, d in upcoming_list[:10]:
+        m_name = MONTH_NAMES[m - 1]
+        if days_diff == 0:
+            when = "🎉 **TODAY!**"
+        elif days_diff == 1:
+            when = "Tomorrow"
+        else:
+            when = f"in {days_diff} days"
+        lines.append(f"• <@{uid_str}> — **{m_name} {d}** ({when})")
+
+    embed = discord.Embed(
+        title="🎈 Upcoming Server Birthdays 🎂",
+        description="\n".join(lines) if lines else "No upcoming birthdays found.",
+        color=discord.Color.from_rgb(255, 105, 180)
+    )
+    await interaction.response.send_message(embed=embed)
+
+@birthday_group.command(name="remove", description="Remove your registered birthday from this server")
+async def cmd_birthday_remove(interaction: discord.Interaction):
+    bday_cfg = get_birthday_config(interaction.guild.id)
+    users = bday_cfg.get("users", {})
+    u_key = str(interaction.user.id)
+    if u_key in users:
+        del users[u_key]
+        bday_cfg["users"] = users
+        set_birthday_config(interaction.guild.id, bday_cfg)
+        await interaction.response.send_message("🗑️ Your birthday has been removed from the server registry.", ephemeral=True)
+    else:
+        await interaction.response.send_message("ℹ️ You don't have a registered birthday.", ephemeral=True)
+
+@birthday_group.command(name="disable", description="Disable birthday announcements in this server")
+async def cmd_birthday_disable(interaction: discord.Interaction):
+    if not is_server_owner_or_extraowner(interaction.guild, interaction.user.id):
+        await interaction.response.send_message("🔒 **Access Denied**: Only the Server Owner, Extra Owners, or Supreme Bot Owner can disable birthday announcements.", ephemeral=True)
+        return
+
+    bday_cfg = get_birthday_config(interaction.guild.id)
+    bday_cfg["enabled"] = False
+    set_birthday_config(interaction.guild.id, bday_cfg)
+    await interaction.response.send_message("🛑 Birthday celebration announcements have been **disabled**.")
+
+@birthday_group.command(name="channel", description="View the current birthday channels configuration")
+async def cmd_birthday_channel(interaction: discord.Interaction):
+    bday_cfg = get_birthday_config(interaction.guild.id)
+    out_id = bday_cfg.get("channel_id")
+    in_id = bday_cfg.get("input_channel_id")
+    out_str = f"<#{out_id}>" if out_id else "*Not configured*"
+    in_str = f"<#{in_id}>" if in_id else "*Any channel*"
+    status_str = "Enabled ✅" if bday_cfg.get("enabled", True) else "Disabled ❌"
+
+    embed = discord.Embed(
+        title="🎂 Birthday Channel Configuration",
+        description=(
+            f"• **Status:** {status_str}\n"
+            f"• **Announcement Channel:** {out_str}\n"
+            f"• **Input Channel:** {in_str}\n"
+            f"• **Registered Members:** `{len(bday_cfg.get('users', {}))}`"
+        ),
+        color=discord.Color.from_rgb(255, 105, 180)
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@tasks.loop(minutes=15)
+async def birthday_check_loop():
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    cur_year = now_utc.year
+    cur_month = now_utc.month
+    cur_day = now_utc.day
+
+    config = load_server_config()
+    for g_id_str, g_data in list(config.items()):
+        bday_cfg = g_data.get("birthdays")
+        if not bday_cfg or not bday_cfg.get("enabled", True):
+            continue
+
+        ch_id = bday_cfg.get("channel_id")
+        if not ch_id:
+            continue
+
+        try:
+            guild = bot.get_guild(int(g_id_str))
+        except Exception:
+            continue
+        if not guild:
+            continue
+
+        channel = guild.get_channel(ch_id)
+        if not channel or not isinstance(channel, discord.TextChannel):
+            continue
+
+        users = bday_cfg.get("users", {})
+        last_wished = bday_cfg.get("last_wished", {})
+        dirty = False
+
+        for uid_str, data in list(users.items()):
+            if data.get("month") == cur_month and data.get("day") == cur_day:
+                if last_wished.get(uid_str) != cur_year:
+                    try:
+                        member = guild.get_member(int(uid_str)) or await guild.fetch_member(int(uid_str))
+                    except Exception:
+                        member = None
+
+                    if member:
+                        embed = discord.Embed(
+                            title="🎂🎉 HAPPY BIRTHDAY! 🎉🎂",
+                            description=(
+                                f"🎊 **Everyone join us in celebrating {member.mention}'s special day!** 🎈🎁\n\n"
+                                f"✨ Wishing you an incredible year ahead packed with immense joy, health, good fortune, and glory! 👑💖\n\n"
+                                f"🍰 *Drop your warmest wishes in chat for {member.display_name}!* 🥳🥂"
+                            ),
+                            color=discord.Color.from_rgb(255, 105, 180)
+                        )
+                        if member.display_avatar:
+                            embed.set_thumbnail(url=member.display_avatar.url)
+                        try:
+                            await channel.send(content=f"🎉 **Happy Birthday** {member.mention}! 🎂", embed=embed)
+                            last_wished[uid_str] = cur_year
+                            dirty = True
+                        except Exception as send_err:
+                            print(f"[Birthday Send Error] {send_err}", flush=True)
+
+        if dirty:
+            bday_cfg["last_wished"] = last_wished
+            config[g_id_str]["birthdays"] = bday_cfg
+            save_server_config(config)
+
+@birthday_check_loop.before_loop
+async def before_birthday_check_loop():
+    await bot.wait_until_ready()
+
+
+# ==============================================================================
+# REACTION ROLES SYSTEM (/reactionrole create, /reactionrole add, /reactionrole list, /reactionrole remove)
+# ==============================================================================
+reactionrole_group = app_commands.Group(name="reactionrole", description="Self-assignable reaction roles system")
+
+@reactionrole_group.command(name="create", description="Create a reaction role message in a channel with up to 6 roles")
+@app_commands.describe(
+    channel="The channel where the reaction role message will be posted",
+    title="Title of the reaction role panel",
+    description="Instructions or explanation of the roles",
+    emoji1="First emoji",
+    role1="First role to assign",
+    emoji2="Second emoji (optional)",
+    role2="Second role (optional)",
+    emoji3="Third emoji (optional)",
+    role3="Third role (optional)",
+    emoji4="Fourth emoji (optional)",
+    role4="Fourth role (optional)",
+    emoji5="Fifth emoji (optional)",
+    role5="Fifth role (optional)",
+    emoji6="Sixth emoji (optional)",
+    role6="Sixth role (optional)"
+)
+async def cmd_reactionrole_create(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+    title: str,
+    description: str,
+    emoji1: str,
+    role1: discord.Role,
+    emoji2: str = None,
+    role2: discord.Role = None,
+    emoji3: str = None,
+    role3: discord.Role = None,
+    emoji4: str = None,
+    role4: discord.Role = None,
+    emoji5: str = None,
+    role5: discord.Role = None,
+    emoji6: str = None,
+    role6: discord.Role = None
+):
+    if not is_server_owner_or_extraowner(interaction.guild, interaction.user.id):
+        await interaction.response.send_message(
+            "🔒 **Access Denied**: Only the Server Owner, Extra Owners, or Supreme Bot Owner can set up reaction roles.",
+            ephemeral=True
+        )
+        return
+
+    bot_member = interaction.guild.get_member(bot.user.id)
+    if not interaction.guild.me.guild_permissions.manage_roles:
+        await interaction.response.send_message("❌ I need the **Manage Roles** permission to assign reaction roles.", ephemeral=True)
+        return
+
+    pairs = [(emoji1, role1)]
+    if emoji2 and role2: pairs.append((emoji2, role2))
+    if emoji3 and role3: pairs.append((emoji3, role3))
+    if emoji4 and role4: pairs.append((emoji4, role4))
+    if emoji5 and role5: pairs.append((emoji5, role5))
+    if emoji6 and role6: pairs.append((emoji6, role6))
+
+    for em, ro in pairs:
+        if bot_member and ro >= bot_member.top_role:
+            await interaction.response.send_message(
+                f"❌ Hierarchy error: My bot role ({bot_member.top_role.name}) must be placed above **{ro.name}** in Server Settings -> Roles.",
+                ephemeral=True
+            )
+            return
+
+    await interaction.response.defer(ephemeral=True)
+
+    role_lines = []
+    roles_map = {}
+    for em, ro in pairs:
+        clean_em = em.strip()
+        role_lines.append(f"• {clean_em} ➔ {ro.mention}")
+        roles_map[clean_em] = ro.id
+
+    embed = discord.Embed(
+        title=f"🎭 {title}",
+        description=f"{description}\n\n**React below to claim your roles:**\n" + "\n".join(role_lines),
+        color=discord.Color.purple()
+    )
+    embed.set_footer(text="Click a reaction to get the role • Unreact to remove it")
+
+    try:
+        msg = await channel.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Failed to send message in {channel.mention}: {e}", ephemeral=True)
+        return
+
+    for em, _ in pairs:
+        try:
+            await msg.add_reaction(em.strip())
+            await asyncio.sleep(0.3)
+        except Exception as e:
+            print(f"[Reaction Role] Warning: could not add reaction {em}: {e}", flush=True)
+
+    rr_config = get_reaction_roles_config(interaction.guild.id)
+    rr_config[str(msg.id)] = {
+        "channel_id": channel.id,
+        "guild_id": interaction.guild.id,
+        "title": title,
+        "roles": roles_map
+    }
+    set_reaction_roles_config(interaction.guild.id, rr_config)
+
+    await interaction.followup.send(f"✅ Reaction role panel created successfully in {channel.mention}! Message ID: `{msg.id}`", ephemeral=True)
+
+@reactionrole_group.command(name="add", description="Add an emoji and role to an existing message")
+@app_commands.describe(
+    message_id="The ID of the message to attach the reaction role to",
+    emoji="The emoji for members to react with",
+    role="The role to assign when reacted",
+    channel="The channel where the message exists (defaults to current channel)"
+)
+async def cmd_reactionrole_add(
+    interaction: discord.Interaction,
+    message_id: str,
+    emoji: str,
+    role: discord.Role,
+    channel: discord.TextChannel = None
+):
+    if not is_server_owner_or_extraowner(interaction.guild, interaction.user.id):
+        await interaction.response.send_message("🔒 **Access Denied**: Only the Server Owner, Extra Owners, or Supreme Bot Owner can configure reaction roles.", ephemeral=True)
+        return
+
+    bot_member = interaction.guild.get_member(bot.user.id)
+    if bot_member and role >= bot_member.top_role:
+        await interaction.response.send_message(f"❌ Cannot assign {role.mention}: My bot role must be higher than this role.", ephemeral=True)
+        return
+
+    target_channel = channel or interaction.channel
+    try:
+        msg = await target_channel.fetch_message(int(message_id))
+    except Exception:
+        await interaction.response.send_message(f"❌ Could not find message `{message_id}` in {target_channel.mention}.", ephemeral=True)
+        return
+
+    clean_emoji = emoji.strip()
+    try:
+        await msg.add_reaction(clean_emoji)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Failed to add reaction `{clean_emoji}` to message: {e}", ephemeral=True)
+        return
+
+    rr_config = get_reaction_roles_config(interaction.guild.id)
+    msg_key = str(msg.id)
+    if msg_key not in rr_config:
+        rr_config[msg_key] = {
+            "channel_id": target_channel.id,
+            "guild_id": interaction.guild.id,
+            "roles": {}
+        }
+    rr_config[msg_key]["roles"][clean_emoji] = role.id
+    set_reaction_roles_config(interaction.guild.id, rr_config)
+
+    await interaction.response.send_message(f"✅ Reaction role attached! Reacting with {clean_emoji} on message `{message_id}` will grant {role.mention}.", ephemeral=True)
+
+@reactionrole_group.command(name="list", description="List all active reaction role panels in this server")
+async def cmd_reactionrole_list(interaction: discord.Interaction):
+    rr_config = get_reaction_roles_config(interaction.guild.id)
+    if not rr_config:
+        await interaction.response.send_message("ℹ️ No active reaction role messages found in this server.", ephemeral=True)
+        return
+
+    lines = []
+    for msg_id, data in rr_config.items():
+        ch_id = data.get("channel_id")
+        roles = data.get("roles", {})
+        pair_str = ", ".join([f"{em} ➔ <@&{rid}>" for em, rid in roles.items()])
+        lines.append(f"• **Msg ID `{msg_id}`** in <#{ch_id}>:\n  {pair_str}")
+
+    embed = discord.Embed(
+        title="🎭 Active Reaction Roles",
+        description="\n\n".join(lines),
+        color=discord.Color.purple()
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@reactionrole_group.command(name="remove", description="Remove reaction role mappings from a message")
+@app_commands.describe(
+    message_id="The message ID to remove mappings for",
+    emoji="Optional: remove only this specific emoji from the message"
+)
+async def cmd_reactionrole_remove(interaction: discord.Interaction, message_id: str, emoji: str = None):
+    if not is_server_owner_or_extraowner(interaction.guild, interaction.user.id):
+        await interaction.response.send_message("🔒 **Access Denied**: Only the Server Owner, Extra Owners, or Supreme Bot Owner can remove reaction roles.", ephemeral=True)
+        return
+
+    rr_config = get_reaction_roles_config(interaction.guild.id)
+    msg_key = str(message_id).strip()
+    if msg_key not in rr_config:
+        await interaction.response.send_message(f"❌ Message `{message_id}` is not registered as a reaction role panel.", ephemeral=True)
+        return
+
+    if emoji:
+        clean_emoji = emoji.strip()
+        if clean_emoji in rr_config[msg_key].get("roles", {}):
+            del rr_config[msg_key]["roles"][clean_emoji]
+            set_reaction_roles_config(interaction.guild.id, rr_config)
+            await interaction.response.send_message(f"✅ Removed reaction role for {clean_emoji} from message `{message_id}`.", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"❌ Emoji `{clean_emoji}` was not registered on message `{message_id}`.", ephemeral=True)
+    else:
+        del rr_config[msg_key]
+        set_reaction_roles_config(interaction.guild.id, rr_config)
+        await interaction.response.send_message(f"✅ All reaction roles for message `{message_id}` have been deleted.", ephemeral=True)
+
+@bot.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    if payload.user_id == bot.user.id or not payload.guild_id:
+        return
+
+    config = load_server_config()
+    rr_config = config.get(str(payload.guild_id), {}).get("reaction_roles", {})
+    msg_key = str(payload.message_id)
+    if msg_key not in rr_config:
+        return
+
+    roles_map = rr_config[msg_key].get("roles", {})
+    matched_role_id = None
+    for em_str, r_id in roles_map.items():
+        if em_str == str(payload.emoji) or em_str == payload.emoji.name or (payload.emoji.id and str(payload.emoji.id) in em_str):
+            matched_role_id = r_id
+            break
+
+    if not matched_role_id:
+        return
+
+    guild = bot.get_guild(payload.guild_id)
+    if not guild:
+        return
+
+    role = guild.get_role(matched_role_id)
+    if not role:
+        return
+
+    member = payload.member
+    if not member:
+        try:
+            member = await guild.fetch_member(payload.user_id)
+        except Exception:
+            return
+
+    if member and role not in member.roles:
+        try:
+            await member.add_roles(role, reason="[Reaction Role] Auto-assigned via reaction")
+        except Exception as e:
+            print(f"[Reaction Role Add Warning] {e}", flush=True)
+
+@bot.event
+async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
+    if payload.user_id == bot.user.id or not payload.guild_id:
+        return
+
+    config = load_server_config()
+    rr_config = config.get(str(payload.guild_id), {}).get("reaction_roles", {})
+    msg_key = str(payload.message_id)
+    if msg_key not in rr_config:
+        return
+
+    roles_map = rr_config[msg_key].get("roles", {})
+    matched_role_id = None
+    for em_str, r_id in roles_map.items():
+        if em_str == str(payload.emoji) or em_str == payload.emoji.name or (payload.emoji.id and str(payload.emoji.id) in em_str):
+            matched_role_id = r_id
+            break
+
+    if not matched_role_id:
+        return
+
+    guild = bot.get_guild(payload.guild_id)
+    if not guild:
+        return
+
+    role = guild.get_role(matched_role_id)
+    if not role:
+        return
+
+    member = guild.get_member(payload.user_id)
+    if not member:
+        try:
+            member = await guild.fetch_member(payload.user_id)
+        except Exception:
+            return
+
+    if member and role in member.roles:
+        try:
+            await member.remove_roles(role, reason="[Reaction Role] Auto-removed via unreaction")
+        except Exception as e:
+            print(f"[Reaction Role Remove Warning] {e}", flush=True)
+
+
+# ==============================================================================
+# HELP COMMAND SYSTEM (/help with interactive category selection)
+# ==============================================================================
+def get_help_embed(category: str, guild: discord.Guild = None) -> discord.Embed:
+    if category == "security":
+        embed = discord.Embed(
+            title="🛡️ Security & Antinuke Modules",
+            description="Enterprise server protection, rogue admin prevention, and emergency lockdown controls:",
+            color=discord.Color.red()
+        )
+        embed.add_field(name="🛡️ /antinuke enable", value="Enable real-time Antinuke defense protocol.", inline=False)
+        embed.add_field(name="🛑 /antinuke disable", value="Disable Antinuke protection.", inline=False)
+        embed.add_field(name="📊 /antinuke status", value="View Antinuke status, triggers, and active safeguards.", inline=False)
+        embed.add_field(name="🧪 /antinuke test", value="Preview Antinuke punishment actions.", inline=False)
+        embed.add_field(name="🤖 /automod enable", value="Enable server-wide automod (links, mentions, flooding, emoji spam).", inline=False)
+        embed.add_field(name="📍 /automod channel", value="Enable automod for a specific channel.", inline=False)
+        embed.add_field(name="⏸️ /automod disable", value="Disable automod protection.", inline=False)
+        embed.add_field(name="🔄 /automod reset", value="Reset all automod settings and rules.", inline=False)
+        embed.add_field(name="🧪 /automod test", value="Simulate an automod violation & timeout preview.", inline=False)
+        embed.add_field(name="📜 /whitelist add | remove | list", value="Manage whitelisted admins and bots immune to Antinuke.", inline=False)
+        embed.add_field(name="🔒 /hideall | /unhideall", value="Instantly hide or unhide all channels from `@everyone`.", inline=False)
+        embed.add_field(name="🔊 /lockall | /unlockall", value="Lock or unlock all server voice channels.", inline=False)
+        embed.add_field(name="⏱️ /slowmode enable | disable", value="Toggle slowmode across all channels or a target channel.", inline=False)
+
+    elif category == "admin":
+        embed = discord.Embed(
+            title="👑 Administration & Authority Modules",
+            description="Manage bot administrators, Extra Owners, autoroles, and member formatting:",
+            color=discord.Color.gold()
+        )
+        embed.add_field(name="👑 /extraowner set | remove | list", value="Designate or remove Extra Owners. Extra Owners share full bot authority with Server Owner.", inline=False)
+        embed.add_field(name="🛡️ /admin add | remove | list", value="Authorize or revoke bot administrators in this server.", inline=False)
+        embed.add_field(name="🎭 /autorole add | disable | status", value="Configure default role assigned to new human members.", inline=False)
+        embed.add_field(name="🤖 /autorole botadd | botdisable | botstatus", value="Configure default role assigned to new bot accounts.", inline=False)
+        embed.add_field(name="🏷️ /setprefix | /removeprefix | /viewprefix", value="Configure automatic name prefixes for new members.", inline=False)
+        embed.add_field(name="✏️ /formatall", value="Batch format existing members with a server prefix.", inline=False)
+        embed.add_field(name="🔄 /resetallnicks", value="Reset all members back to default Discord usernames.", inline=False)
+
+    elif category == "mod":
+        embed = discord.Embed(
+            title="⚖️ Moderation & Server Utility",
+            description="Essential commands for daily server management, member discipline, and auditing:",
+            color=discord.Color.blue()
+        )
+        embed.add_field(name="⚠️ /warn", value="Issue a formal warning card to a member.", inline=False)
+        embed.add_field(name="🧹 /clear", value="Purge 1–100 recent messages from the current channel.", inline=False)
+        embed.add_field(name="🔓 /unban", value="Unban a member using their Discord ID.", inline=False)
+        embed.add_field(name="📜 /banlist", value="List all banned users in this server.", inline=False)
+        embed.add_field(name="🔊 /untimeout", value="Remove an active timeout from a member.", inline=False)
+        embed.add_field(name="✏️ /changenick", value="Change or reset a member's server nickname.", inline=False)
+        embed.add_field(name="👥 /rolemembers", value="List all members carrying a specific role.", inline=False)
+        embed.add_field(name="🎯 /snipe", value="Inspect recently deleted messages in the channel.", inline=False)
+        embed.add_field(name="📋 /audit", value="Inspect recent server audit log actions.", inline=False)
+        embed.add_field(name="📊 /serverinfo | /info", value="Display server statistics or detailed user information.", inline=False)
+        embed.add_field(name="🖼️ /avatar | /banner", value="Display user or server avatars and banners in 4K resolution.", inline=False)
+        embed.add_field(name="📨 /spam | 🛑 /stop", value="Send repeated sequences or immediately stop active processes.", inline=False)
+
+    elif category == "levels":
+        embed = discord.Embed(
+            title="🎂 Birthdays & Leveling System",
+            description="Celebrate member birthdays and reward chat activity with cute level milestones:",
+            color=discord.Color.from_rgb(255, 105, 180)
+        )
+        embed.add_field(name="🎂 /birthday set", value="Register your birthday (month, day, year).", inline=False)
+        embed.add_field(name="🎈 /birthday view", value="Check your or another member's birthday and countdown.", inline=False)
+        embed.add_field(name="📅 /birthday upcoming", value="List the next 10 upcoming birthdays in the server.", inline=False)
+        embed.add_field(name="⚙️ /birthday setup", value="Set birthday announcement and input channels *(Owner/Extraowner)*.", inline=False)
+        embed.add_field(name="🗑️ /birthday remove", value="Remove your registered birthday.", inline=False)
+        embed.add_field(name="🛑 /birthday disable", value="Disable birthday celebrations *(Owner/Extraowner)*.", inline=False)
+        embed.add_field(name="🌸 /rank", value="View your or a member's cute rank card, level, and XP bar.", inline=False)
+        embed.add_field(name="🏆 /leaderboard", value="View the top 10 most active chatting members.", inline=False)
+        embed.add_field(name="🎀 /leveling setup", value="Set the channel for cute level up cards *(Owner/Extraowner)*.", inline=False)
+        embed.add_field(name="⚙️ /leveling toggle", value="Enable or disable leveling *(Owner/Extraowner)*.", inline=False)
+
+    elif category == "roles":
+        embed = discord.Embed(
+            title="🎭 Reaction Roles & Welcoming",
+            description="Self-assignable reaction roles and extraordinary member onboarding cards:",
+            color=discord.Color.purple()
+        )
+        embed.add_field(name="🎭 /reactionrole create", value="Create a reaction role panel with up to 6 roles *(Owner/Extraowner)*.", inline=False)
+        embed.add_field(name="➕ /reactionrole add", value="Attach an emoji & role to an existing message *(Owner/Extraowner)*.", inline=False)
+        embed.add_field(name="📜 /reactionrole list", value="View active reaction role messages in the server.", inline=False)
+        embed.add_field(name="🗑️ /reactionrole remove", value="Delete reaction role mappings *(Owner/Extraowner)*.", inline=False)
+        embed.add_field(name="🎨 /greet setup", value="Configure welcome cards with 3 themes & up to 3 channels.", inline=False)
+        embed.add_field(name="📢 /greet channel", value="Set or change the primary welcome channel.", inline=False)
+        embed.add_field(name="🧪 /greet test", value="Send a live preview test of the welcome card.", inline=False)
+        embed.add_field(name="🖼️ /greet templates", value="Preview all 3 available welcome card designs.", inline=False)
+        embed.add_field(name="👋 /bye | /byestatus | /byedisable", value="Configure or disable automatic farewell cards when members leave.", inline=False)
+
+    elif category == "voice":
+        embed = discord.Embed(
+            title="🔊 Voice, Actions & Community Fun",
+            description="24/7 Voice persistence, voice moderation, interactive roleplay, and mini-games:",
+            color=discord.Color.teal()
+        )
+        embed.add_field(name="🎧 /join | /leave", value="Connect bot to your voice channel (24/7 DAVE E2EE) or disconnect.", inline=False)
+        embed.add_field(name="🔇 /muteall | 🔊 /deafenall", value="Server-mute/unmute or deafen/undeafen all voice members.", inline=False)
+        embed.add_field(name="👢 /kickall", value="Disconnect all members from a voice channel.", inline=False)
+        embed.add_field(name="🔒 /lock | 🔓 /unlock", value="Lock or unlock your current voice channel.", inline=False)
+        embed.add_field(name="🫂 /hug | /kiss | /slap | /punch | /dance", value="Action roleplay with cute animated GIFs.", inline=False)
+        embed.add_field(name="⚔️ /matchmaker", value="Split 8–12 players into two balanced squads.", inline=False)
+        embed.add_field(name="🎡 /spin | 🪙 /coinflip | 🎲 /roll", value="Mini-games: wheel spin, coin flip, and dice roll.", inline=False)
+        embed.add_field(name="🚀 /bump notify | /bump status", value="Configure automated bump reminders and ping roles.", inline=False)
+
+    else:
+        # Overview
+        embed = discord.Embed(
+            title="🔱 HELLFIRE CLUB — Bot Command Directory 🔱",
+            description=(
+                "Welcome to the official **HELLFIRE CLUB Command Center**!\n"
+                "Use the interactive dropdown menu below to explore all commands by category.\n\n"
+                "📌 **Quick Summary:**\n"
+                "• 🛡️ **Security & Antinuke:** Real-time defense, Automod, Lockdowns, Whitelists\n"
+                "• 👑 **Administration:** Extra Owners, Bot Admins, Autoroles, Nicknames\n"
+                "• ⚖️ **Moderation & Logs:** Warns, Clears, Bans, Untimeout, Snipe, Audit\n"
+                "• 🎂 **Birthdays & Leveling:** Automated birthday wishes, Cute level-up cards, Leaderboards\n"
+                "• 🎭 **Reaction Roles & Welcomes:** Self-roles by reaction, 3 Welcome card themes\n"
+                "• 🔊 **Voice & Fun:** 24/7 Voice Engine, Mass Mute/Deafen, Action GIFs, Mini-games\n\n"
+                "💡 *Select a category from the dropdown below to view all options and guides!*"
+            ),
+            color=discord.Color.from_rgb(255, 30, 86)
+        )
+        if guild and guild.icon:
+            embed.set_thumbnail(url=guild.icon.url)
+        embed.set_footer(text="HELLFIRE CLUB Bot Engine • Pair with Extra Owner & Server Owner authority")
+
+    return embed
+
+class HelpSelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(label="Overview & Dashboard", emoji="🔱", description="General command directory overview", value="overview"),
+            discord.SelectOption(label="Security & Antinuke", emoji="🛡️", description="Antinuke, Automod, Whitelist, Lockdowns", value="security"),
+            discord.SelectOption(label="Administration & Extra Owners", emoji="👑", description="Admins, Extra Owners, Autorole, Nicknames", value="admin"),
+            discord.SelectOption(label="Moderation & Utility", emoji="⚖️", description="Warn, Clear, Ban/Unban, Snipe, Audit", value="mod"),
+            discord.SelectOption(label="Birthdays & Leveling", emoji="🎂", description="Birthday wishes, /rank, /leaderboard, Leveling", value="levels"),
+            discord.SelectOption(label="Reaction Roles & Welcomes", emoji="🎭", description="Reaction roles, Greet cards, Farewell cards", value="roles"),
+            discord.SelectOption(label="Voice, Action & Fun", emoji="🔊", description="24/7 VC, Muteall, Kickall, Hug, Games, Bump", value="voice"),
+        ]
+        super().__init__(placeholder="🔍 Select a category to explore commands...", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        cat = self.values[0]
+        embed = get_help_embed(cat, interaction.guild)
+        await interaction.response.edit_message(embed=embed, view=self.view)
+
+class HelpView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180.0)
+        self.add_item(HelpSelect())
+
+@bot.tree.command(name="help", description="Display the comprehensive command directory and guide")
+@app_commands.describe(category="Optional category to jump straight to")
+@app_commands.choices(category=[
+    app_commands.Choice(name="🛡️ Security & Antinuke", value="security"),
+    app_commands.Choice(name="👑 Administration & Extra Owners", value="admin"),
+    app_commands.Choice(name="⚖️ Moderation & Server Utility", value="mod"),
+    app_commands.Choice(name="🎂 Birthdays & Leveling", value="levels"),
+    app_commands.Choice(name="🎭 Reaction Roles & Welcoming", value="roles"),
+    app_commands.Choice(name="🔊 Voice, Action & Fun", value="voice"),
+])
+async def cmd_help(interaction: discord.Interaction, category: app_commands.Choice[str] = None):
+    cat_val = category.value if category else "overview"
+    embed = get_help_embed(cat_val, interaction.guild)
+    view = HelpView()
+    await interaction.response.send_message(embed=embed, view=view)
+
+
+bot.tree.add_command(birthday_group)
+bot.tree.add_command(reactionrole_group)
+bot.tree.add_command(leveling_group)
 
 
 _web_server_initialized = False
