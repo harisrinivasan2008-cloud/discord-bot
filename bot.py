@@ -743,6 +743,8 @@ async def on_ready():
         stay_vc_watchdog_loop.start()
     if not birthday_check_loop.is_running():
         birthday_check_loop.start()
+    if not voice_xp_loop.is_running():
+        voice_xp_loop.start()
 
     # Sync slash commands once per process lifecycle to prevent hitting Discord rate limits (429)
     if not _commands_synced:
@@ -3120,48 +3122,146 @@ async def clear_messages(
 # ==============================================================================
 # UNBAN & BANLIST COMMANDS (/unban, /banlist)
 # ==============================================================================
-@bot.tree.command(name="unban", description="Unban a user from this server using their Discord user ID")
+async def unban_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    if not interaction.guild:
+        return []
+    choices = []
+    try:
+        async for ban_entry in interaction.guild.bans(limit=50):
+            u = ban_entry.user
+            label = f"{u.name} (ID: {u.id})"
+            if current.lower() in label.lower() or current in str(u.id):
+                choices.append(app_commands.Choice(name=label[:100], value=str(u.id)))
+    except Exception:
+        pass
+    return choices[:25]
+
+class UnbanSelect(discord.ui.Select):
+    def __init__(self, banned_entries, reason: str, moderator: discord.Member):
+        options = []
+        for entry in banned_entries[:25]:
+            u = entry.user
+            b_reason = entry.reason or "No ban reason recorded"
+            if len(b_reason) > 60:
+                b_reason = b_reason[:57] + "..."
+            options.append(discord.SelectOption(
+                label=f"{u.name}"[:100],
+                description=f"ID: {u.id} • {b_reason}"[:100],
+                value=str(u.id),
+                emoji="🔓"
+            ))
+        super().__init__(placeholder="Select a banned member to unban...", min_values=1, max_values=1, options=options)
+        self.reason = reason
+        self.moderator = moderator
+
+    async def callback(self, interaction: discord.Interaction):
+        target_id = int(self.values[0])
+        guild = interaction.guild
+        try:
+            target_user = await bot.fetch_user(target_id)
+        except Exception:
+            target_user = discord.Object(id=target_id)
+
+        try:
+            await guild.unban(target_user, reason=f"{self.reason} (Moderator: {self.moderator.display_name})")
+            user_name = getattr(target_user, "name", f"User `{target_id}`")
+            embed = discord.Embed(
+                title="🔓 User Successfully Unbanned",
+                description=f"**{user_name}** (`{target_id}`) has been unbanned from **{guild.name}**.",
+                color=discord.Color.green()
+            )
+            embed.add_field(name="Responsible Moderator", value=self.moderator.mention, inline=True)
+            embed.add_field(name="Reason", value=self.reason, inline=False)
+            await interaction.response.edit_message(content=None, embed=embed, view=None)
+        except discord.Forbidden:
+            await interaction.response.send_message("❌ Missing Permissions: The bot requires the **Ban Members** permission to unban users.", ephemeral=True)
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Failed to unban user: {e}", ephemeral=True)
+
+class UnbanView(discord.ui.View):
+    def __init__(self, banned_entries, reason: str, moderator: discord.Member):
+        super().__init__(timeout=120.0)
+        self.add_item(UnbanSelect(banned_entries, reason, moderator))
+
+@bot.tree.command(name="unban", description="Unban a user by selecting from banned members or entering their ID")
 @app_commands.describe(
-    user_id="The Discord user ID of the banned user (e.g. 123456789012345678)",
+    user="Select a banned member from the autocomplete list or enter their user ID (leave empty to pick from menu)",
     reason="Optional reason for unbanning"
 )
+@app_commands.autocomplete(user=unban_autocomplete)
 @check_bot_admin()
-async def unban_user(interaction: discord.Interaction, user_id: str, reason: str = "Unbanned by moderator"):
+async def unban_user(interaction: discord.Interaction, user: str = None, reason: str = "Unbanned by moderator"):
     guild = interaction.guild
     if not guild:
         await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
         return
 
-    clean_id = re.sub(r"\D", "", user_id.strip())
-    if not clean_id:
-        await interaction.response.send_message("❌ Please provide a valid numeric user ID.", ephemeral=True)
+    # If user argument provided directly (via autocomplete or typed ID)
+    if user and user.strip():
+        clean_id = re.sub(r"\D", "", user.strip())
+        if not clean_id:
+            await interaction.response.send_message("❌ Please provide a valid numeric user ID or select from the list.", ephemeral=True)
+            return
+
+        target_id = int(clean_id)
+        await interaction.response.defer()
+
+        try:
+            target_user = await bot.fetch_user(target_id)
+        except Exception:
+            target_user = discord.Object(id=target_id)
+
+        try:
+            await guild.unban(target_user, reason=f"{reason} (Moderator: {interaction.user.display_name})")
+            user_name = getattr(target_user, "name", f"User ID `{target_id}`")
+            embed = discord.Embed(
+                title="🔓 User Successfully Unbanned",
+                description=f"**{user_name}** (`{target_id}`) has been unbanned from **{guild.name}**.",
+                color=discord.Color.green()
+            )
+            embed.add_field(name="Responsible Moderator", value=interaction.user.mention, inline=True)
+            embed.add_field(name="Reason", value=reason, inline=False)
+            await interaction.followup.send(embed=embed)
+            return
+        except discord.NotFound:
+            await interaction.followup.send(f"❌ User with ID `{target_id}` is not banned in this server.", ephemeral=True)
+            return
+        except discord.Forbidden:
+            await interaction.followup.send("❌ Missing Permissions: The bot requires the **Ban Members** permission to unban users.", ephemeral=True)
+            return
+        except Exception as e:
+            await interaction.followup.send(f"❌ Failed to unban user: {e}", ephemeral=True)
+            return
+
+    # If no user specified, fetch banned members and display interactive dropdown menu
+    await interaction.response.defer()
+    banned_entries = []
+    try:
+        async for ban_entry in guild.bans(limit=50):
+            banned_entries.append(ban_entry)
+    except discord.Forbidden:
+        await interaction.followup.send("❌ Missing Permissions: The bot requires the **Ban Members** permission to view the ban list.", ephemeral=True)
+        return
+    except Exception as e:
+        await interaction.followup.send(f"❌ Failed to fetch ban list: {e}", ephemeral=True)
         return
 
-    target_id = int(clean_id)
-    await interaction.response.defer()
-
-    try:
-        user = await bot.fetch_user(target_id)
-    except Exception:
-        user = discord.Object(id=target_id)
-
-    try:
-        await guild.unban(user, reason=f"{reason} (Moderator: {interaction.user.display_name})")
-        user_name = getattr(user, "name", f"User ID `{target_id}`")
+    if not banned_entries:
         embed = discord.Embed(
-            title="🔓 User Successfully Unbanned",
-            description=f"**{user_name}** (`{target_id}`) has been unbanned from **{guild.name}**.",
-            color=discord.Color.green()
+            title="🔓 Ban List Empty",
+            description="There are currently **no banned users** in this server.",
+            color=discord.Color.blue()
         )
-        embed.add_field(name="Responsible Moderator", value=interaction.user.mention, inline=True)
-        embed.add_field(name="Reason", value=reason, inline=False)
         await interaction.followup.send(embed=embed)
-    except discord.NotFound:
-        await interaction.followup.send(f"❌ User with ID `{target_id}` is not banned in this server.", ephemeral=True)
-    except discord.Forbidden:
-        await interaction.followup.send("❌ Missing Permissions: The bot requires the **Ban Members** permission to unban users.", ephemeral=True)
-    except Exception as e:
-        await interaction.followup.send(f"❌ Failed to unban user: {e}", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="🔓 Select a Member to Unban",
+        description=f"Found **{len(banned_entries)}** banned user(s). Select a member from the dropdown menu below to unban them from **{guild.name}**:",
+        color=discord.Color.gold()
+    )
+    view = UnbanView(banned_entries, reason, interaction.user)
+    await interaction.followup.send(embed=embed, view=view)
 
 
 @bot.tree.command(name="banlist", description="List all users currently banned from this server")
@@ -5789,6 +5889,114 @@ async def cmd_leveling_toggle(interaction: discord.Interaction, enabled: bool):
 
 
 # ==============================================================================
+# VOICE CHANNEL LEVELING ENGINE (Awards XP to active voice members)
+# ==============================================================================
+@tasks.loop(seconds=60)
+async def voice_xp_loop():
+    """Awards XP every minute to eligible regular server members who are active in voice channels."""
+    for guild in bot.guilds:
+        try:
+            lvl_cfg = get_leveling_config(guild.id)
+            if not lvl_cfg.get("enabled", True):
+                continue
+
+            users = lvl_cfg.get("users", {})
+            dirty = False
+
+            for vc in guild.voice_channels:
+                # Skip AFK voice channels
+                if guild.afk_channel and vc.id == guild.afk_channel.id:
+                    continue
+
+                for member in vc.members:
+                    # Regular members only: skip bots, server owner, extraowners, admins
+                    if is_exempt_from_leveling(member):
+                        continue
+
+                    # Must not be self-deafened or server-deafened (must be actively listening/participating)
+                    if member.voice and (member.voice.self_deaf or member.voice.deaf):
+                        continue
+
+                    u_key = str(member.id)
+                    u_data = users.get(u_key, {"xp": 0, "level": 0, "total_xp": 0})
+
+                    current_level = u_data.get("level", 0)
+                    current_xp = u_data.get("xp", 0)
+                    total_xp = u_data.get("total_xp", 0)
+
+                    # Award 10-15 XP per minute in VC
+                    earned = random.randint(10, 15)
+                    current_xp += earned
+                    total_xp += earned
+
+                    needed = xp_needed_for_level(current_level)
+                    leveled_up = False
+
+                    while current_xp >= needed:
+                        current_xp -= needed
+                        current_level += 1
+                        needed = xp_needed_for_level(current_level)
+                        leveled_up = True
+
+                    u_data["xp"] = current_xp
+                    u_data["level"] = current_level
+                    u_data["total_xp"] = total_xp
+                    users[u_key] = u_data
+                    dirty = True
+
+                    if leveled_up:
+                        cute_phrases = [
+                            "🌸 *Level up! Your voice is making the kingdom shine!* ✨",
+                            "🧁 *Yaaay! Chilling in VC leveled you up, sweetest chatter!* 💖",
+                            "🎀 *Ding ding! Super cute Voice milestone unlocked!* 🌷",
+                            "🍡 *Squishy sweet VC progress! Keep glowing bright!* 🌈",
+                            "🍓 *Berry amazing job! Voice level up achieved!* 🍰",
+                            "⭐ *Sparkle sparkle! You're leveling up so fast in VC!* 🍬"
+                        ]
+                        phrase = random.choice(cute_phrases)
+
+                        embed = discord.Embed(
+                            description=f"✨ **Yay {member.mention}!** You just reached **Level {current_level}** in Voice! 🌸🎙️\n{phrase}",
+                            color=discord.Color.from_rgb(255, 182, 193)
+                        )
+                        if member.display_avatar:
+                            embed.set_thumbnail(url=member.display_avatar.url)
+                        embed.set_footer(text=f"Total XP: {total_xp:,} 💖 • Voice Activity")
+
+                        # Send to configured leveling channel or active text channel
+                        target_ch = None
+                        channel_id = lvl_cfg.get("channel_id")
+                        if channel_id:
+                            ch = guild.get_channel(channel_id)
+                            if ch and isinstance(ch, discord.TextChannel):
+                                target_ch = ch
+
+                        if not target_ch:
+                            target_ch = guild.system_channel
+                            if not target_ch or not target_ch.permissions_for(guild.me).send_messages:
+                                for tc in guild.text_channels:
+                                    if tc.permissions_for(guild.me).send_messages:
+                                        target_ch = tc
+                                        break
+
+                        if target_ch:
+                            try:
+                                await target_ch.send(content=member.mention, embed=embed)
+                            except Exception as e:
+                                print(f"[VC Leveling Send Warning] {e}", flush=True)
+
+            if dirty:
+                lvl_cfg["users"] = users
+                set_leveling_config(guild.id, lvl_cfg)
+        except Exception as g_err:
+            print(f"[VC XP Loop Error] {g_err}", flush=True)
+
+@voice_xp_loop.before_loop
+async def before_voice_xp_loop():
+    await bot.wait_until_ready()
+
+
+# ==============================================================================
 # BIRTHDAY SYSTEM (/birthday set, /birthday setup, /birthday view, /birthday upcoming)
 # ==============================================================================
 birthday_group = app_commands.Group(name="birthday", description="Birthday celebration and automated wishes system")
@@ -6029,6 +6237,55 @@ async def cmd_birthday_channel(interaction: discord.Interaction):
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
+def build_hellfire_birthday_card(member: discord.Member) -> discord.Embed:
+    embed = discord.Embed(
+        title="🔱 🔥 𝐇𝐄𝐋𝐋𝐅𝐈𝐑𝐄 𝐁𝐈𝐑𝐓𝐇𝐃𝐀𝐘 𝐃𝐄𝐂𝐑𝐄𝐄 🔥 🔱",
+        description=(
+            f"👑 ═══════════════════════════════════ 👑\n"
+            f"🩸 **THE GATES OF HELLFIRE OPEN IN TRIBUTE!** 🩸\n\n"
+            f"🕯️ *On this sacred day, the sovereign inferno blazes in honor of our esteemed kin* {member.mention}!\n\n"
+            f"⚔️ **SACRED HELLFIRE BLESSINGS BESTOWED:**\n"
+            f"🔥 **Flames of Invincibility:** May your spirit remain unyielding against every adversary and dark obstacle.\n"
+            f"⚜️ **Crown of Sovereign Glory:** May supreme honor, boundless prosperity, and victory accompany your reign.\n"
+            f"🍷 **The Crimson Elixir:** May vitality, enduring strength, health, and dominion bless your path in the kingdom.\n\n"
+            f"👹 *The throne acknowledges your greatness. Rise, champion of Hellfire, and conquer the year ahead!* 🥂🕯️\n"
+            f"👑 ═══════════════════════════════════ 👑"
+        ),
+        color=discord.Color.from_rgb(178, 34, 34)  # Deep Hellfire Crimson Red
+    )
+    if member.display_avatar:
+        embed.set_thumbnail(url=member.display_avatar.url)
+    embed.set_image(url="https://cdn.discordapp.com/banners/1437070336335282258/a_9ee491ae60616f9ff0007b5382f210ca.gif?size=1024")
+    embed.set_footer(text="🩸 𝐇𝐄𝐋𝐋𝐅𝐈𝐑𝐄 𝐂𝐋𝐔𝐁 🩸 • Official Royal Birthday Decree & Sacred Blessings")
+    return embed
+
+@birthday_group.command(name="test", description="Send a test preview of the Hellfire birthday card with sacred blessings")
+@app_commands.describe(member="Member to preview for (defaults to yourself)", channel="Channel to test in (defaults to current)")
+async def cmd_birthday_test(interaction: discord.Interaction, member: discord.Member = None, channel: discord.TextChannel = None):
+    if not is_server_owner_or_extraowner(interaction.guild, interaction.user.id):
+        await interaction.response.send_message("🔒 **Access Denied**: Only the Server Owner, Extra Owners, or Supreme Bot Owner can send test previews.", ephemeral=True)
+        return
+
+    target = member or interaction.user
+    dest_ch = channel or interaction.channel
+    embed = build_hellfire_birthday_card(target)
+    await dest_ch.send(content=f"🎉 🔥 **Hail the Birthday Champion!** {target.mention} *(Test Preview)* 🕯️🥂", embed=embed)
+    await interaction.response.send_message(f"✅ Sent Hellfire Birthday card preview to {dest_ch.mention}!", ephemeral=True)
+
+@bot.tree.command(name="setbirthday", description="Register your birthday date for the server to celebrate your special day!")
+@app_commands.describe(
+    month="Your birth month (1-12)",
+    day="Your birth day (1-31)",
+    year="Optional: birth year (1920-2026)"
+)
+async def cmd_setbirthday_toplevel(
+    interaction: discord.Interaction,
+    month: app_commands.Range[int, 1, 12],
+    day: app_commands.Range[int, 1, 31],
+    year: app_commands.Range[int, 1920, 2026] = None
+):
+    await cmd_birthday_set(interaction, month, day, year)
+
 @tasks.loop(minutes=15)
 async def birthday_check_loop():
     now_utc = datetime.datetime.now(datetime.timezone.utc)
@@ -6070,19 +6327,9 @@ async def birthday_check_loop():
                         member = None
 
                     if member:
-                        embed = discord.Embed(
-                            title="🎂🎉 HAPPY BIRTHDAY! 🎉🎂",
-                            description=(
-                                f"🎊 **Everyone join us in celebrating {member.mention}'s special day!** 🎈🎁\n\n"
-                                f"✨ Wishing you an incredible year ahead packed with immense joy, health, good fortune, and glory! 👑💖\n\n"
-                                f"🍰 *Drop your warmest wishes in chat for {member.display_name}!* 🥳🥂"
-                            ),
-                            color=discord.Color.from_rgb(255, 105, 180)
-                        )
-                        if member.display_avatar:
-                            embed.set_thumbnail(url=member.display_avatar.url)
+                        embed = build_hellfire_birthday_card(member)
                         try:
-                            await channel.send(content=f"🎉 **Happy Birthday** {member.mention}! 🎂", embed=embed)
+                            await channel.send(content=f"🎉 🔥 **Hail the Birthday Champion!** {member.mention} 🕯️🥂", embed=embed)
                             last_wished[uid_str] = cur_year
                             dirty = True
                         except Exception as send_err:
