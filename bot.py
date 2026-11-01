@@ -16,6 +16,7 @@ from collections import defaultdict, deque
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
+import emoji
 from dotenv import load_dotenv
 from aiohttp import web
 
@@ -745,6 +746,12 @@ async def on_ready():
         birthday_check_loop.start()
     if not voice_xp_loop.is_running():
         voice_xp_loop.start()
+
+    # Register persistent views
+    try:
+        bot.add_view(BirthdayPanelView())
+    except Exception as e:
+        print(f"[Birthday View] Notice during persistent view registration: {e}", flush=True)
 
     # Sync slash commands once per process lifecycle to prevent hitting Discord rate limits (429)
     if not _commands_synced:
@@ -5997,25 +6004,261 @@ async def before_voice_xp_loop():
 
 
 # ==============================================================================
-# BIRTHDAY SYSTEM (/birthday set, /birthday setup, /birthday view, /birthday upcoming)
+# BIRTHDAY SYSTEM (/birthday set, /birthday setup, /birthday panel, /birthday view, /birthday upcoming)
 # ==============================================================================
 birthday_group = app_commands.Group(name="birthday", description="Birthday celebration and automated wishes system")
 
 MONTH_NAMES = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
 DAYS_IN_MONTH = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
 
-@birthday_group.command(name="setup", description="Configure birthday announcement and input channels")
+def build_birthday_panel_embed(guild: discord.Guild) -> discord.Embed:
+    embed = discord.Embed(
+        title="🎂  𝐁𝐈𝐑𝐓𝐇𝐃𝐀𝐘  𝐂𝐄𝐋𝐄𝐁𝐑𝐀𝐓𝐈𝐎𝐍  𝐏𝐀𝐍𝐄𝐋  🎂",
+        description=(
+            "✨ **Never miss a celebration in our server!** ✨\n\n"
+            "Register your special day below so the kingdom and bot can celebrate "
+            "your birthday with an official **Hellfire Birthday Decree**! 🎉🥂\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "👉 **How to Register:**\n"
+            "• Click **🎂 Set Birthday** below to enter your birth date.\n"
+            "• Click **🔍 My Birthday** to view your registered date & countdown.\n"
+            "• Click **🎈 Upcoming** to see birthdays arriving soon.\n"
+            "• Click **🗑️ Remove** if you want to unregister your birthday.\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "🔒 *Your birthday date is safely stored and announced automatically on your big day.*"
+        ),
+        color=discord.Color.from_rgb(255, 105, 180)
+    )
+    if guild and guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+    embed.set_image(url="https://cdn.discordapp.com/banners/1437070336335282258/a_9ee491ae60616f9ff0007b5382f210ca.gif?size=1024")
+    embed.set_footer(text="🎈 Server Birthday Registry • Click a button below")
+    return embed
+
+class BirthdayDateModal(discord.ui.Modal, title="🎂 Register Your Birthday"):
+    month_input = discord.ui.TextInput(
+        label="Birth Month (1-12 or Month Name)",
+        placeholder="e.g. August, Aug, or 8",
+        min_length=1,
+        max_length=20,
+        required=True
+    )
+    day_input = discord.ui.TextInput(
+        label="Birth Day (1-31)",
+        placeholder="e.g. 15",
+        min_length=1,
+        max_length=2,
+        required=True
+    )
+    year_input = discord.ui.TextInput(
+        label="Birth Year (Optional)",
+        placeholder="e.g. 2002 (Leave empty if preferred)",
+        min_length=4,
+        max_length=4,
+        required=False
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        m_str = self.month_input.value.strip().lower()
+        month = None
+        if m_str.isdigit():
+            m_val = int(m_str)
+            if 1 <= m_val <= 12:
+                month = m_val
+        else:
+            for idx, name in enumerate(MONTH_NAMES, start=1):
+                if name.lower() == m_str or name.lower().startswith(m_str):
+                    month = idx
+                    break
+
+        if not month:
+            await interaction.response.send_message(
+                "❌ **Invalid Month**: Please enter a valid month number (1-12) or name (e.g. August, Aug).",
+                ephemeral=True
+            )
+            return
+
+        d_str = self.day_input.value.strip()
+        if not d_str.isdigit():
+            await interaction.response.send_message("❌ **Invalid Day**: Please enter a valid number (1-31).", ephemeral=True)
+            return
+        day = int(d_str)
+        max_days = DAYS_IN_MONTH[month - 1]
+        if day < 1 or day > max_days:
+            await interaction.response.send_message(
+                f"❌ **Invalid Day**: **{MONTH_NAMES[month - 1]}** only has up to **{max_days}** days.",
+                ephemeral=True
+            )
+            return
+
+        year = None
+        if self.year_input.value:
+            y_str = self.year_input.value.strip()
+            if not y_str.isdigit():
+                await interaction.response.send_message("❌ **Invalid Year**: Please enter a valid 4-digit year or leave it blank.", ephemeral=True)
+                return
+            y_val = int(y_str)
+            cur_year = datetime.datetime.now(datetime.timezone.utc).year
+            if y_val < 1920 or y_val > cur_year:
+                await interaction.response.send_message(f"❌ **Invalid Year**: Year must be between 1920 and {cur_year}.", ephemeral=True)
+                return
+            year = y_val
+
+        guild = interaction.guild
+        if not guild:
+            await interaction.response.send_message("❌ This must be used inside a server.", ephemeral=True)
+            return
+
+        bday_cfg = get_birthday_config(guild.id)
+        users = bday_cfg.get("users", {})
+        users[str(interaction.user.id)] = {
+            "month": month,
+            "day": day,
+            "year": year
+        }
+        bday_cfg["users"] = users
+        set_birthday_config(guild.id, bday_cfg)
+
+        m_name = MONTH_NAMES[month - 1]
+        year_str = f", {year}" if year else ""
+        embed = discord.Embed(
+            title="🎂 Birthday Saved! 🎈",
+            description=(
+                f"✨ **{interaction.user.mention}**, your birthday has been saved as **{m_name} {day}{year_str}**!\n\n"
+                f"We can't wait to celebrate with you on your special day! 🥳🍰"
+            ),
+            color=discord.Color.from_rgb(255, 105, 180)
+        )
+        if interaction.user.display_avatar:
+            embed.set_thumbnail(url=interaction.user.display_avatar.url)
+        embed.set_footer(text="🎈 Automated Birthday Celebration System")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+class BirthdayPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Set Birthday", style=discord.ButtonStyle.success, emoji="🎂", custom_id="bday_panel:set")
+    async def set_birthday(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(BirthdayDateModal())
+
+    @discord.ui.button(label="My Birthday", style=discord.ButtonStyle.secondary, emoji="🔍", custom_id="bday_panel:view")
+    async def view_birthday(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = interaction.guild
+        if not guild:
+            await interaction.response.send_message("❌ Must be used in a server.", ephemeral=True)
+            return
+        bday_cfg = get_birthday_config(guild.id)
+        users = bday_cfg.get("users", {})
+        u_data = users.get(str(interaction.user.id))
+        if not u_data:
+            await interaction.response.send_message("🍰 You haven't registered your birthday yet! Click **🎂 Set Birthday** to register.", ephemeral=True)
+            return
+        m = u_data.get("month")
+        d = u_data.get("day")
+        y = u_data.get("year")
+        m_name = MONTH_NAMES[m - 1]
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        this_year_bday = datetime.datetime(now_utc.year, m, d, tzinfo=datetime.timezone.utc)
+        if this_year_bday.date() < now_utc.date():
+            next_bday = datetime.datetime(now_utc.year + 1, m, d, tzinfo=datetime.timezone.utc)
+        else:
+            next_bday = this_year_bday
+        days_left = (next_bday.date() - now_utc.date()).days
+        if days_left == 0:
+            countdown_str = "🎉 **IT IS TODAY! HAPPY BIRTHDAY!** 🎂🥳"
+        elif days_left == 1:
+            countdown_str = "⏳ **Tomorrow is your big day!** 🎈"
+        else:
+            countdown_str = f"⏳ **{days_left}** days remaining until your special day!"
+        embed = discord.Embed(
+            title=f"🎂 {interaction.user.display_name}'s Birthday",
+            description=f"🎈 **Date:** **{m_name} {d}**{f' ({y})' if y else ''}\n{countdown_str}",
+            color=discord.Color.from_rgb(255, 105, 180)
+        )
+        if interaction.user.display_avatar:
+            embed.set_thumbnail(url=interaction.user.display_avatar.url)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="Upcoming", style=discord.ButtonStyle.secondary, emoji="🎈", custom_id="bday_panel:upcoming")
+    async def upcoming_birthday(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = interaction.guild
+        if not guild:
+            await interaction.response.send_message("❌ Must be used in a server.", ephemeral=True)
+            return
+        bday_cfg = get_birthday_config(guild.id)
+        users = bday_cfg.get("users", {})
+        if not users:
+            await interaction.response.send_message("🎂 No birthdays registered in this server yet! Click **🎂 Set Birthday** to add yours.", ephemeral=True)
+            return
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        upcoming_list = []
+        for uid_str, data in users.items():
+            month = data.get("month")
+            day = data.get("day")
+            if not month or not day:
+                continue
+            try:
+                this_bday = datetime.datetime(now_utc.year, month, day, tzinfo=datetime.timezone.utc)
+                if this_bday.date() < now_utc.date():
+                    next_bday = datetime.datetime(now_utc.year + 1, month, day, tzinfo=datetime.timezone.utc)
+                else:
+                    next_bday = this_bday
+                days_diff = (next_bday.date() - now_utc.date()).days
+                upcoming_list.append((days_diff, uid_str, month, day))
+            except Exception:
+                continue
+        upcoming_list.sort(key=lambda x: x[0])
+        lines = []
+        for days_diff, uid_str, m, d in upcoming_list[:10]:
+            m_name = MONTH_NAMES[m - 1]
+            if days_diff == 0:
+                when = "🎉 **TODAY!**"
+            elif days_diff == 1:
+                when = "Tomorrow"
+            else:
+                when = f"in {days_diff} days"
+            lines.append(f"• <@{uid_str}> — **{m_name} {d}** ({when})")
+        embed = discord.Embed(
+            title="🎈 Upcoming Server Birthdays 🎂",
+            description="\n".join(lines) if lines else "No upcoming birthdays found.",
+            color=discord.Color.from_rgb(255, 105, 180)
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="Remove", style=discord.ButtonStyle.danger, emoji="🗑️", custom_id="bday_panel:remove")
+    async def remove_birthday(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = interaction.guild
+        if not guild:
+            await interaction.response.send_message("❌ Must be used in a server.", ephemeral=True)
+            return
+        bday_cfg = get_birthday_config(guild.id)
+        users = bday_cfg.get("users", {})
+        u_key = str(interaction.user.id)
+        if u_key in users:
+            del users[u_key]
+            bday_cfg["users"] = users
+            set_birthday_config(guild.id, bday_cfg)
+            await interaction.response.send_message("🗑️ Your birthday has been removed from the server registry.", ephemeral=True)
+        else:
+            await interaction.response.send_message("ℹ️ You don't have a registered birthday.", ephemeral=True)
+
+@birthday_group.command(name="setup", description="Configure birthday announcement and send clickable button panel to a channel")
 @app_commands.describe(
     announcement_channel="The channel where birthday celebrations and wishes will be posted",
-    input_channel="Optional: restrict /birthday set commands to this specific channel"
+    panel_channel="The particular text channel where the clickable Birthday Registration Button panel will be sent",
+    input_channel="Optional: restrict /birthday set slash commands to this specific channel"
 )
 async def cmd_birthday_setup(
     interaction: discord.Interaction,
     announcement_channel: discord.TextChannel,
+    panel_channel: discord.TextChannel = None,
     input_channel: discord.TextChannel = None
 ):
+    await interaction.response.defer(ephemeral=True)
+
     if not is_server_owner_or_extraowner(interaction.guild, interaction.user.id):
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "🔒 **Access Denied**: Only the Server Owner, Extra Owners, or Supreme Bot Owner can configure the Birthday System channels.",
             ephemeral=True
         )
@@ -6025,20 +6268,68 @@ async def cmd_birthday_setup(
     bday_cfg["enabled"] = True
     bday_cfg["channel_id"] = announcement_channel.id
     bday_cfg["input_channel_id"] = input_channel.id if input_channel else None
+
+    target_panel = panel_channel or announcement_channel
+    panel_embed = build_birthday_panel_embed(interaction.guild)
+    panel_view = BirthdayPanelView()
+
+    try:
+        panel_msg = await target_panel.send(embed=panel_embed, view=panel_view)
+        bday_cfg["panel_channel_id"] = target_panel.id
+        bday_cfg["panel_message_id"] = panel_msg.id
+    except Exception as e:
+        await interaction.followup.send(f"⚠️ Failed to send birthday panel message to {target_panel.mention}: {e}", ephemeral=True)
+        return
+
     set_birthday_config(interaction.guild.id, bday_cfg)
 
-    desc = f"🎉 **Birthday Announcement Channel:** {announcement_channel.mention}\n"
+    desc = (
+        f"🎉 **Birthday Announcement Channel:** {announcement_channel.mention}\n"
+        f"🔘 **Birthday Button Panel:** {target_panel.mention} ([Jump to Message]({panel_msg.jump_url}))\n"
+    )
     if input_channel:
-        desc += f"📝 **Birthday Input Channel:** {input_channel.mention} *(Members must register birthdays here)*\n"
+        desc += f"📝 **Birthday Slash Input Channel:** {input_channel.mention}\n"
     else:
-        desc += "📝 **Birthday Input Channel:** *Any server channel*\n"
+        desc += "📝 **Birthday Slash Input Channel:** *Any server channel*\n"
 
     embed = discord.Embed(
-        title="🎂 Birthday System Configured",
-        description=desc + "\nMembers can now register their special day using `/birthday set`!",
+        title="🎂 Birthday System Configured Successfully",
+        description=desc + "\nMembers can now click the **🎂 Set Birthday** button in " + target_panel.mention + " to select & register their birthday date!",
         color=discord.Color.from_rgb(255, 105, 180)
     )
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+@birthday_group.command(name="panel", description="Post or repost the clickable Birthday Registration Button panel to a channel")
+@app_commands.describe(channel="The channel where the clickable Birthday Registration panel will be posted (defaults to current channel)")
+async def cmd_birthday_panel(interaction: discord.Interaction, channel: discord.TextChannel = None):
+    await interaction.response.defer(ephemeral=True)
+
+    if not is_server_owner_or_extraowner(interaction.guild, interaction.user.id):
+        await interaction.followup.send(
+            "🔒 **Access Denied**: Only the Server Owner, Extra Owners, or Supreme Bot Owner can post the Birthday panel.",
+            ephemeral=True
+        )
+        return
+
+    dest_channel = channel or interaction.channel
+    panel_embed = build_birthday_panel_embed(interaction.guild)
+    panel_view = BirthdayPanelView()
+
+    try:
+        panel_msg = await dest_channel.send(embed=panel_embed, view=panel_view)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Failed to send Birthday panel message to {dest_channel.mention}: {e}", ephemeral=True)
+        return
+
+    bday_cfg = get_birthday_config(interaction.guild.id)
+    bday_cfg["panel_channel_id"] = dest_channel.id
+    bday_cfg["panel_message_id"] = panel_msg.id
+    set_birthday_config(interaction.guild.id, bday_cfg)
+
+    await interaction.followup.send(
+        f"✅ **Birthday Registration Panel** posted in {dest_channel.mention}! Members can now click the **🎂 Set Birthday** button to select and register their birthday date.",
+        ephemeral=True
+    )
 
 @birthday_group.command(name="set", description="Register your birthday so the server can celebrate your special day!")
 @app_commands.describe(
@@ -6221,8 +6512,10 @@ async def cmd_birthday_channel(interaction: discord.Interaction):
     bday_cfg = get_birthday_config(interaction.guild.id)
     out_id = bday_cfg.get("channel_id")
     in_id = bday_cfg.get("input_channel_id")
+    panel_id = bday_cfg.get("panel_channel_id")
     out_str = f"<#{out_id}>" if out_id else "*Not configured*"
     in_str = f"<#{in_id}>" if in_id else "*Any channel*"
+    panel_str = f"<#{panel_id}>" if panel_id else "*Not posted yet (use /birthday panel)*"
     status_str = "Enabled ✅" if bday_cfg.get("enabled", True) else "Disabled ❌"
 
     embed = discord.Embed(
@@ -6230,6 +6523,7 @@ async def cmd_birthday_channel(interaction: discord.Interaction):
         description=(
             f"• **Status:** {status_str}\n"
             f"• **Announcement Channel:** {out_str}\n"
+            f"• **Button Panel Channel:** {panel_str}\n"
             f"• **Input Channel:** {in_str}\n"
             f"• **Registered Members:** `{len(bday_cfg.get('users', {}))}`"
         ),
@@ -6350,12 +6644,105 @@ async def before_birthday_check_loop():
 # ==============================================================================
 reactionrole_group = app_commands.Group(name="reactionrole", description="Self-assignable reaction roles system")
 
+def resolve_reaction_emoji(guild: discord.Guild, emoji_input: str):
+    """
+    Resolves any emoji representation (custom <:name:id>, custom name :name: or name,
+    emoji id, unicode shortcode like :fire:, or raw unicode) into:
+    (display_str, reaction_target)
+    - display_str: string formatted for embeds (<:name:id>, <a:name:id>, or raw unicode)
+    - reaction_target: discord.Emoji, discord.PartialEmoji, or unicode string accepted by add_reaction()
+    """
+    if not emoji_input:
+        return None
+
+    raw = emoji_input.strip()
+
+    # 1. Full custom emoji format <:name:id> or <a:name:id>
+    m = re.match(r"^<(?P<anim>a)?:(?P<name>[a-zA-Z0-9_]+):(?P<id>\d+)>$", raw)
+    if m:
+        e_id = int(m.group("id"))
+        e_name = m.group("name")
+        is_anim = bool(m.group("anim"))
+        obj = (guild.get_emoji(e_id) if guild else None) or bot.get_emoji(e_id)
+        if obj:
+            return str(obj), obj
+        partial = discord.PartialEmoji(name=e_name, id=e_id, animated=is_anim)
+        return str(partial), partial
+
+    # 2. Raw digits ID (e.g. "123456789012345678")
+    if raw.isdigit():
+        e_id = int(raw)
+        obj = (guild.get_emoji(e_id) if guild else None) or bot.get_emoji(e_id)
+        if obj:
+            return str(obj), obj
+        partial = discord.PartialEmoji(name="custom", id=e_id)
+        return str(partial), partial
+
+    # 3. Custom emoji by name in guild or bot cache (e.g. ":pepe:" or "pepe")
+    clean_name = raw.strip(":")
+    if guild:
+        obj = discord.utils.find(lambda e: e.name.lower() == clean_name.lower(), guild.emojis)
+        if obj:
+            return str(obj), obj
+
+    obj = discord.utils.find(lambda e: e.name.lower() == clean_name.lower(), bot.emojis)
+    if obj:
+        return str(obj), obj
+
+    # 4. Standard Unicode emoji or Discord shortcode via emoji package
+    colon_name = f":{clean_name}:"
+    try:
+        converted = emoji.emojize(colon_name, language="alias")
+        if converted != colon_name:
+            return converted, converted
+    except Exception:
+        pass
+
+    # 5. Raw unicode emoji
+    try:
+        if emoji.is_emoji(raw):
+            return raw, raw
+    except Exception:
+        pass
+
+    # 6. Any unicode character
+    if any(ord(c) > 127 for c in raw):
+        return raw, raw
+
+    return None
+
+async def reaction_emoji_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    choices = []
+    guild = interaction.guild
+    cur = current.strip().lower().strip(":")
+
+    if guild:
+        for em in guild.emojis:
+            if not cur or cur in em.name.lower():
+                choices.append(app_commands.Choice(name=f":{em.name}: (Server Emoji)", value=str(em)))
+                if len(choices) >= 15:
+                    break
+
+    common_emojis = [
+        ("🎮", "gamer"), ("🔥", "fire"), ("⭐", "star"), ("👑", "crown"),
+        ("💎", "diamond"), ("🎉", "party"), ("✅", "check"), ("❤️", "heart"),
+        ("📢", "announcement"), ("🔴", "red"), ("🔵", "blue"), ("🟢", "green"),
+        ("🟡", "yellow"), ("🟣", "purple"), ("🛡️", "shield"), ("⚔️", "sword")
+    ]
+    for icon, label in common_emojis:
+        if len(choices) >= 25:
+            break
+        if not cur or cur in label or cur in icon:
+            choices.append(app_commands.Choice(name=f"{icon} :{label}:", value=icon))
+
+    return choices[:25]
+
 @reactionrole_group.command(name="create", description="Create a reaction role message in a channel with up to 6 roles")
 @app_commands.describe(
     channel="The channel where the reaction role message will be posted",
     title="Title of the reaction role panel",
     description="Instructions or explanation of the roles",
-    emoji1="First emoji",
+    emoji1="First emoji (custom or standard)",
     role1="First role to assign",
     emoji2="Second emoji (optional)",
     role2="Second role (optional)",
@@ -6367,6 +6754,14 @@ reactionrole_group = app_commands.Group(name="reactionrole", description="Self-a
     role5="Fifth role (optional)",
     emoji6="Sixth emoji (optional)",
     role6="Sixth role (optional)"
+)
+@app_commands.autocomplete(
+    emoji1=reaction_emoji_autocomplete,
+    emoji2=reaction_emoji_autocomplete,
+    emoji3=reaction_emoji_autocomplete,
+    emoji4=reaction_emoji_autocomplete,
+    emoji5=reaction_emoji_autocomplete,
+    emoji6=reaction_emoji_autocomplete
 )
 async def cmd_reactionrole_create(
     interaction: discord.Interaction,
@@ -6400,14 +6795,15 @@ async def cmd_reactionrole_create(
         await interaction.followup.send("❌ I need the **Manage Roles** permission to assign reaction roles.", ephemeral=True)
         return
 
-    pairs = [(emoji1, role1)]
-    if emoji2 and role2: pairs.append((emoji2, role2))
-    if emoji3 and role3: pairs.append((emoji3, role3))
-    if emoji4 and role4: pairs.append((emoji4, role4))
-    if emoji5 and role5: pairs.append((emoji5, role5))
-    if emoji6 and role6: pairs.append((emoji6, role6))
+    raw_pairs = [(emoji1, role1)]
+    if emoji2 and role2: raw_pairs.append((emoji2, role2))
+    if emoji3 and role3: raw_pairs.append((emoji3, role3))
+    if emoji4 and role4: raw_pairs.append((emoji4, role4))
+    if emoji5 and role5: raw_pairs.append((emoji5, role5))
+    if emoji6 and role6: raw_pairs.append((emoji6, role6))
 
-    for em, ro in pairs:
+    resolved_pairs = []
+    for raw_em, ro in raw_pairs:
         if bot_member and ro >= bot_member.top_role:
             await interaction.followup.send(
                 f"❌ Hierarchy error: My bot role ({bot_member.top_role.name}) must be placed above **{ro.name}** in Server Settings -> Roles.",
@@ -6415,12 +6811,21 @@ async def cmd_reactionrole_create(
             )
             return
 
+        res = resolve_reaction_emoji(interaction.guild, raw_em)
+        if not res:
+            await interaction.followup.send(
+                f"❌ Could not resolve emoji `{raw_em}`. Please use a valid server emoji or standard emoji (e.g. 🔥, :crown:, or select from autocomplete).",
+                ephemeral=True
+            )
+            return
+        display_str, reaction_obj = res
+        resolved_pairs.append((display_str, reaction_obj, ro))
+
     role_lines = []
     roles_map = {}
-    for em, ro in pairs:
-        clean_em = em.strip()
-        role_lines.append(f"• {clean_em} ➔ {ro.mention}")
-        roles_map[clean_em] = ro.id
+    for display_str, reaction_obj, ro in resolved_pairs:
+        role_lines.append(f"• {display_str} ➔ {ro.mention}")
+        roles_map[display_str] = ro.id
 
     embed = discord.Embed(
         title=f"🎭 {title}",
@@ -6435,25 +6840,12 @@ async def cmd_reactionrole_create(
         await interaction.followup.send(f"❌ Failed to send message in {channel.mention}: {e}", ephemeral=True)
         return
 
-    for em, _ in pairs:
-        clean_em = em.strip()
+    for _, reaction_obj, _ in resolved_pairs:
         try:
-            await msg.add_reaction(clean_em)
+            await msg.add_reaction(reaction_obj)
             await asyncio.sleep(0.3)
         except Exception as e:
-            resolved = False
-            custom_match = re.search(r":(\w+):(\d+)>?", clean_em)
-            if custom_match:
-                e_id = int(custom_match.group(2))
-                custom_obj = bot.get_emoji(e_id)
-                if custom_obj:
-                    try:
-                        await msg.add_reaction(custom_obj)
-                        resolved = True
-                    except Exception:
-                        pass
-            if not resolved:
-                print(f"[Reaction Role] Warning: could not add reaction {clean_em}: {e}", flush=True)
+            print(f"[Reaction Role] Warning: could not add reaction {reaction_obj}: {e}", flush=True)
 
     rr_config = get_reaction_roles_config(interaction.guild.id)
     rr_config[str(msg.id)] = {
@@ -6469,10 +6861,11 @@ async def cmd_reactionrole_create(
 @reactionrole_group.command(name="add", description="Add an emoji and role to an existing message")
 @app_commands.describe(
     message_id="The ID of the message to attach the reaction role to",
-    emoji="The emoji for members to react with",
+    emoji="The emoji for members to react with (custom or standard)",
     role="The role to assign when reacted",
     channel="The channel where the message exists (defaults to current channel)"
 )
+@app_commands.autocomplete(emoji=reaction_emoji_autocomplete)
 async def cmd_reactionrole_add(
     interaction: discord.Interaction,
     message_id: str,
@@ -6498,11 +6891,16 @@ async def cmd_reactionrole_add(
         await interaction.followup.send(f"❌ Could not find message `{message_id}` in {target_channel.mention}.", ephemeral=True)
         return
 
-    clean_emoji = emoji.strip()
+    res = resolve_reaction_emoji(interaction.guild, emoji)
+    if not res:
+        await interaction.followup.send(f"❌ Could not resolve emoji `{emoji}`. Please use a valid server emoji or standard emoji.", ephemeral=True)
+        return
+    display_str, reaction_obj = res
+
     try:
-        await msg.add_reaction(clean_emoji)
+        await msg.add_reaction(reaction_obj)
     except Exception as e:
-        await interaction.followup.send(f"❌ Failed to add reaction `{clean_emoji}` to message: {e}", ephemeral=True)
+        await interaction.followup.send(f"❌ Failed to add reaction {display_str} to message: {e}", ephemeral=True)
         return
 
     rr_config = get_reaction_roles_config(interaction.guild.id)
@@ -6513,10 +6911,10 @@ async def cmd_reactionrole_add(
             "guild_id": interaction.guild.id,
             "roles": {}
         }
-    rr_config[msg_key]["roles"][clean_emoji] = role.id
+    rr_config[msg_key]["roles"][display_str] = role.id
     set_reaction_roles_config(interaction.guild.id, rr_config)
 
-    await interaction.followup.send(f"✅ Reaction role attached! Reacting with {clean_emoji} on message `{message_id}` will grant {role.mention}.", ephemeral=True)
+    await interaction.followup.send(f"✅ Reaction role attached! Reacting with {display_str} on message `{message_id}` will grant {role.mention}.", ephemeral=True)
 
 @reactionrole_group.command(name="list", description="List all active reaction role panels in this server")
 async def cmd_reactionrole_list(interaction: discord.Interaction):
@@ -6558,13 +6956,19 @@ async def cmd_reactionrole_remove(interaction: discord.Interaction, message_id: 
         return
 
     if emoji:
-        clean_emoji = emoji.strip()
-        if clean_emoji in rr_config[msg_key].get("roles", {}):
-            del rr_config[msg_key]["roles"][clean_emoji]
+        res = resolve_reaction_emoji(interaction.guild, emoji)
+        clean_target = res[0] if res else emoji.strip()
+        matched_key = None
+        for k in rr_config[msg_key].get("roles", {}).keys():
+            if k == clean_target or clean_target in k or k.strip(":") == clean_target.strip(":"):
+                matched_key = k
+                break
+        if matched_key:
+            del rr_config[msg_key]["roles"][matched_key]
             set_reaction_roles_config(interaction.guild.id, rr_config)
-            await interaction.followup.send(f"✅ Removed reaction role for {clean_emoji} from message `{message_id}`.", ephemeral=True)
+            await interaction.followup.send(f"✅ Removed reaction role for {matched_key} from message `{message_id}`.", ephemeral=True)
         else:
-            await interaction.followup.send(f"❌ Emoji `{clean_emoji}` was not registered on message `{message_id}`.", ephemeral=True)
+            await interaction.followup.send(f"❌ Emoji `{emoji}` was not registered on message `{message_id}`.", ephemeral=True)
     else:
         del rr_config[msg_key]
         set_reaction_roles_config(interaction.guild.id, rr_config)
@@ -6584,7 +6988,20 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     roles_map = rr_config[msg_key].get("roles", {})
     matched_role_id = None
     for em_str, r_id in roles_map.items():
-        if em_str == str(payload.emoji) or em_str == payload.emoji.name or (payload.emoji.id and str(payload.emoji.id) in em_str):
+        # Match by custom emoji ID
+        if payload.emoji.id and str(payload.emoji.id) in em_str:
+            matched_role_id = r_id
+            break
+        # Match by exact str representation
+        if em_str == str(payload.emoji):
+            matched_role_id = r_id
+            break
+        # Match by name or stripped colon name
+        if em_str == payload.emoji.name or em_str.strip(":") == payload.emoji.name:
+            matched_role_id = r_id
+            break
+        # Match unicode character
+        if not payload.emoji.id and payload.emoji.name and (payload.emoji.name == em_str or payload.emoji.name in em_str):
             matched_role_id = r_id
             break
 
@@ -6626,7 +7043,20 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
     roles_map = rr_config[msg_key].get("roles", {})
     matched_role_id = None
     for em_str, r_id in roles_map.items():
-        if em_str == str(payload.emoji) or em_str == payload.emoji.name or (payload.emoji.id and str(payload.emoji.id) in em_str):
+        # Match by custom emoji ID
+        if payload.emoji.id and str(payload.emoji.id) in em_str:
+            matched_role_id = r_id
+            break
+        # Match by exact str representation
+        if em_str == str(payload.emoji):
+            matched_role_id = r_id
+            break
+        # Match by name or stripped colon name
+        if em_str == payload.emoji.name or em_str.strip(":") == payload.emoji.name:
+            matched_role_id = r_id
+            break
+        # Match unicode character
+        if not payload.emoji.id and payload.emoji.name and (payload.emoji.name == em_str or payload.emoji.name in em_str):
             matched_role_id = r_id
             break
 
@@ -6719,9 +7149,10 @@ def get_help_embed(category: str, guild: discord.Guild = None) -> discord.Embed:
             color=discord.Color.from_rgb(255, 105, 180)
         )
         embed.add_field(name="🎂 /birthday set", value="Register your birthday (month, day, year).", inline=False)
+        embed.add_field(name="🔘 /birthday panel", value="Send or repost the clickable birthday registration button panel *(Owner/Extraowner)*.", inline=False)
         embed.add_field(name="🎈 /birthday view", value="Check your or another member's birthday and countdown.", inline=False)
         embed.add_field(name="📅 /birthday upcoming", value="List the next 10 upcoming birthdays in the server.", inline=False)
-        embed.add_field(name="⚙️ /birthday setup", value="Set birthday announcement and input channels *(Owner/Extraowner)*.", inline=False)
+        embed.add_field(name="⚙️ /birthday setup", value="Set announcement channel and post birthday button panel *(Owner/Extraowner)*.", inline=False)
         embed.add_field(name="🗑️ /birthday remove", value="Remove your registered birthday.", inline=False)
         embed.add_field(name="🛑 /birthday disable", value="Disable birthday celebrations *(Owner/Extraowner)*.", inline=False)
         embed.add_field(name="🌸 /rank", value="View your or a member's cute rank card, level, and XP bar.", inline=False)

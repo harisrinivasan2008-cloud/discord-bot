@@ -41,6 +41,17 @@
     },
     "antinuke": {
       "enabled": true
+    },
+    "leveling": {
+      "enabled": true,
+      "channel_id": null,
+      "users": {
+        "1554370405903368228": {
+          "xp": 21,
+          "level": 0,
+          "total_xp": 21
+        }
+      }
     }
   },
   "1437070336335282258": {
@@ -76,10 +87,77 @@
     "autorole": {
       "human_role_id": 1547583132062973983,
       "bot_role_id": null
+    },
+    "leveling": {
+      "enabled": true,
+      "channel_id": null,
+      "users": {
+        "1538604090899304480": {
+          "xp": 22,
+          "level": 1,
+          "total_xp": 122
+        },
+        "1338098760240332810": {
+          "xp": 17,
+          "level": 0,
+          "total_xp": 17
+        },
+        "1558786057980354734": {
+          "xp": 69,
+          "level": 0,
+          "total_xp": 69
+        },
+        "1523235708729430166": {
+          "xp": 71,
+          "level": 0,
+          "total_xp": 71
+        },
+        "1436068387351429192": {
+          "xp": 26,
+          "level": 0,
+          "total_xp": 26
+        }
+      }
     }
   },
   "1070279574761517087": {
-    "default_prefix": "\ud835\ude3c\ud835\ude42\ud835\ude4a"
+    "default_prefix": "\ud835\ude3c\ud835\ude42\ud835\ude4a",
+    "leveling": {
+      "enabled": true,
+      "channel_id": null,
+      "users": {
+        "1283028816507310104": {
+          "xp": 41,
+          "level": 0,
+          "total_xp": 41
+        },
+        "1538604090899304480": {
+          "xp": 47,
+          "level": 1,
+          "total_xp": 147
+        },
+        "1540962970849517610": {
+          "xp": 129,
+          "level": 1,
+          "total_xp": 229
+        },
+        "1427598847114219600": {
+          "xp": 65,
+          "level": 1,
+          "total_xp": 165
+        },
+        "1436068387351429192": {
+          "xp": 47,
+          "level": 1,
+          "total_xp": 147
+        },
+        "1493580221469823119": {
+          "xp": 23,
+          "level": 0,
+          "total_xp": 23
+        }
+      }
+    }
   },
   "940491221493760040": {
     "stay_vc": {
