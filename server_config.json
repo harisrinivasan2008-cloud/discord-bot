@@ -8,7 +8,7 @@
       "interval_minutes": 120,
       "bump_text": "/bump",
       "ping_role_id": null,
-      "next_bump_timestamp": 1793460088.247069
+      "next_bump_timestamp": 1793651148.8173814
     },
     "stay_vc": {
       "enabled": false,
@@ -62,7 +62,7 @@
       "interval_minutes": 120,
       "bump_text": "/bump",
       "ping_role_id": null,
-      "next_bump_timestamp": 1793460088.247069
+      "next_bump_timestamp": 1793651166.647059
     },
     "admin_ids": [
       766916252828172308,
